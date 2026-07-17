@@ -22,5 +22,8 @@ win31x (0.1.0) unstable; urgency=medium
     Lock Now paths, with child-environment regression coverage.
   * Reinstall rebuilt packages during repeat QEMU provisioning even when the
     package version is unchanged.
+  * Fail fast when X11, libpng, or XTEST build dependencies are missing, keep
+    mandatory linker and sanitizer flags under common make overrides, and add
+    clean Debian CI coverage for those failure modes.
 
  -- Win31 X maintainers <maintainers@win31x.invalid>  Fri, 17 Jul 2026 12:00:00 +0800

@@ -2,7 +2,7 @@ Source: win31x
 Section: x11
 Maintainer: Win31 X maintainers <maintainers@win31x.invalid>
 Build-Depends: debhelper-compat (= 13), pkgconf, libx11-dev, libpng-dev,
- libxtst-dev, xvfb, xauth
+ libxtst-dev, xvfb, xauth, xfonts-base
 Standards-Version: 4.7.4
 Rules-Requires-Root: no
 

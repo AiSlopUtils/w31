@@ -2,6 +2,9 @@ CC ?= cc
 PKG_CONFIG ?= pkg-config
 BUILD_DIR ?= build
 
+override WIN31X_REQUIRED_PACKAGES := x11 libpng
+override WIN31X_XTST_PACKAGE := xtst
+
 prefix ?= /usr/local
 bindir ?= $(prefix)/bin
 datadir ?= $(prefix)/share
@@ -10,15 +13,23 @@ icondir ?= $(datadir)/win31x/icons
 appicon16dir ?= $(datadir)/icons/hicolor/16x16/apps
 appicon48dir ?= $(datadir)/icons/hicolor/48x48/apps
 
-CPPFLAGS += -Isrc -DWIN31X_ICON_DIR='"$(icondir)"' \
-	$(shell $(PKG_CONFIG) --cflags x11 libpng)
 CFLAGS ?= -O2 -g
-CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Wshadow
-LDLIBS += $(shell $(PKG_CONFIG) --libs x11 libpng)
+
+override WIN31X_CPPFLAGS = -Isrc -DWIN31X_ICON_DIR='"$(icondir)"' \
+	$(shell $(PKG_CONFIG) --cflags $(WIN31X_REQUIRED_PACKAGES))
+override WIN31X_CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -Wshadow
+override WIN31X_LDFLAGS =
+override WIN31X_LDLIBS = \
+	$(shell $(PKG_CONFIG) --libs $(WIN31X_REQUIRED_PACKAGES))
+override WIN31X_XTST_CPPFLAGS = \
+	$(shell $(PKG_CONFIG) --cflags $(WIN31X_XTST_PACKAGE))
+override WIN31X_XTST_LDLIBS = \
+	$(shell $(PKG_CONFIG) --libs $(WIN31X_XTST_PACKAGE))
 
 ifneq ($(SANITIZE),)
-CFLAGS += -O1 -fno-omit-frame-pointer -fsanitize=address,undefined
-LDFLAGS += -fsanitize=address,undefined
+override WIN31X_CFLAGS += -O1 -fno-omit-frame-pointer \
+	-fsanitize=address,undefined
+override WIN31X_LDFLAGS += -fsanitize=address,undefined
 endif
 
 WM_SOURCES = src/win31x.c src/applications.c src/auto_lock.c \
@@ -28,9 +39,42 @@ WM_HEADERS = src/applications.h src/auto_lock.h src/icon_assets.h src/settings.h
 ICON_FILES = $(notdir $(wildcard assets/icons/*.png))
 ICON_DIR_STAMP = $(BUILD_DIR)/.icon-dir
 
-.PHONY: all check smoke smoke-xvfb install uninstall clean FORCE
+.PHONY: all check check-build-deps check-xtst-deps check-xvfb-deps smoke \
+	smoke-xvfb install uninstall clean FORCE
 
 all: $(BUILD_DIR)/win31x
+
+check-build-deps:
+	@if ! $(PKG_CONFIG) --version >/dev/null 2>&1; then \
+		echo "win31x: pkg-config is required to locate X11 and libpng." >&2; \
+		echo "Debian/Ubuntu: sudo apt install build-essential pkg-config libx11-dev libpng-dev" >&2; \
+		exit 2; \
+	fi
+	@if ! $(PKG_CONFIG) --exists $(WIN31X_REQUIRED_PACKAGES); then \
+		$(PKG_CONFIG) --print-errors --exists \
+			$(WIN31X_REQUIRED_PACKAGES) 2>&1 || true; \
+		echo "win31x: required pkg-config modules are unavailable: $(WIN31X_REQUIRED_PACKAGES)" >&2; \
+		echo "Debian/Ubuntu: sudo apt install build-essential pkg-config libx11-dev libpng-dev" >&2; \
+		exit 2; \
+	fi
+
+check-xtst-deps: check-build-deps
+	@if ! $(PKG_CONFIG) --exists $(WIN31X_XTST_PACKAGE); then \
+		$(PKG_CONFIG) --print-errors --exists \
+			$(WIN31X_XTST_PACKAGE) 2>&1 || true; \
+		echo "win31x: XTEST development files are required for X11 smoke tests." >&2; \
+		echo "Debian/Ubuntu: sudo apt install libxtst-dev" >&2; \
+		exit 2; \
+	fi
+
+check-xvfb-deps: check-xtst-deps
+	@for program in xvfb-run xauth; do \
+		if ! command -v "$$program" >/dev/null 2>&1; then \
+			echo "win31x: $$program is required for headless X11 smoke tests." >&2; \
+			echo "Debian/Ubuntu: sudo apt install xvfb xauth xfonts-base" >&2; \
+			exit 2; \
+		fi; \
+	done
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -41,33 +85,48 @@ $(ICON_DIR_STAMP): FORCE | $(BUILD_DIR)
 	@tmp="$@.tmp"; printf '%s\n' "$(icondir)" >"$$tmp"; \
 	if ! cmp -s "$$tmp" "$@"; then mv "$$tmp" "$@"; else rm -f "$$tmp"; fi
 
-$(BUILD_DIR)/win31x: $(WM_SOURCES) $(WM_HEADERS) $(ICON_DIR_STAMP) | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(WM_SOURCES) -o $@ $(LDLIBS)
+$(BUILD_DIR)/win31x: $(WM_SOURCES) $(WM_HEADERS) $(ICON_DIR_STAMP) | \
+	$(BUILD_DIR) check-build-deps
+	$(CC) $(CPPFLAGS) $(WIN31X_CPPFLAGS) $(CFLAGS) $(WIN31X_CFLAGS) \
+		$(LDFLAGS) $(WIN31X_LDFLAGS) $(WM_SOURCES) -o $@ \
+		$(LDLIBS) $(WIN31X_LDLIBS)
 
 $(BUILD_DIR)/test-applications: tests/test_applications.c src/applications.c $(WM_HEADERS) | $(BUILD_DIR)
-	$(CC) -Isrc $(CFLAGS) $(LDFLAGS) tests/test_applications.c src/applications.c -o $@
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) $(WIN31X_CFLAGS) $(LDFLAGS) \
+		$(WIN31X_LDFLAGS) tests/test_applications.c src/applications.c -o $@
 
-$(BUILD_DIR)/test-icon-assets: tests/test_icon_assets.c src/icon_assets.c src/icon_assets.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/test_icon_assets.c src/icon_assets.c -o $@ $(LDLIBS)
+$(BUILD_DIR)/test-icon-assets: tests/test_icon_assets.c src/icon_assets.c src/icon_assets.h | \
+	$(BUILD_DIR) check-build-deps
+	$(CC) $(CPPFLAGS) $(WIN31X_CPPFLAGS) $(CFLAGS) $(WIN31X_CFLAGS) \
+		$(LDFLAGS) $(WIN31X_LDFLAGS) tests/test_icon_assets.c \
+		src/icon_assets.c -o $@ $(LDLIBS) $(WIN31X_LDLIBS)
 
 $(BUILD_DIR)/test-settings: tests/test_settings.c src/settings.c src/settings.h | $(BUILD_DIR)
-	$(CC) -Isrc $(CFLAGS) $(LDFLAGS) tests/test_settings.c src/settings.c -o $@
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) $(WIN31X_CFLAGS) $(LDFLAGS) \
+		$(WIN31X_LDFLAGS) tests/test_settings.c src/settings.c -o $@
 
-$(BUILD_DIR)/test-auto-lock: tests/test_auto_lock.c src/auto_lock.c src/auto_lock.h | $(BUILD_DIR)
-	$(CC) -Isrc $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/test_auto_lock.c \
-		src/auto_lock.c -o $@ $(LDLIBS)
+$(BUILD_DIR)/test-auto-lock: tests/test_auto_lock.c src/auto_lock.c src/auto_lock.h | \
+	$(BUILD_DIR) check-build-deps
+	$(CC) $(CPPFLAGS) $(WIN31X_CPPFLAGS) $(CFLAGS) $(WIN31X_CFLAGS) \
+		$(LDFLAGS) $(WIN31X_LDFLAGS) tests/test_auto_lock.c \
+		src/auto_lock.c -o $@ $(LDLIBS) $(WIN31X_LDLIBS)
 
 $(BUILD_DIR)/test-wifi-backend: tests/test_wifi_backend.c src/wifi_backend.c \
-	src/wifi_backend.h | $(BUILD_DIR)
-	$(CC) -Isrc $(CFLAGS) $(LDFLAGS) tests/test_wifi_backend.c \
-		src/wifi_backend.c -o $@
+		src/wifi_backend.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) $(WIN31X_CFLAGS) $(LDFLAGS) \
+		$(WIN31X_LDFLAGS) tests/test_wifi_backend.c src/wifi_backend.c -o $@
 
-$(BUILD_DIR)/wm-probe: tests/wm_probe.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(shell $(PKG_CONFIG) --cflags xtst) $(CFLAGS) $(LDFLAGS) \
-		tests/wm_probe.c -o $@ $(LDLIBS) $(shell $(PKG_CONFIG) --libs xtst)
+$(BUILD_DIR)/wm-probe: tests/wm_probe.c | $(BUILD_DIR) check-xtst-deps
+	$(CC) $(CPPFLAGS) $(WIN31X_CPPFLAGS) $(WIN31X_XTST_CPPFLAGS) \
+		$(CFLAGS) $(WIN31X_CFLAGS) $(LDFLAGS) $(WIN31X_LDFLAGS) \
+		tests/wm_probe.c -o $@ $(LDLIBS) $(WIN31X_LDLIBS) \
+		$(WIN31X_XTST_LDLIBS)
 
-$(BUILD_DIR)/preexisting-client: tests/preexisting_client.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/preexisting_client.c -o $@ $(LDLIBS)
+$(BUILD_DIR)/preexisting-client: tests/preexisting_client.c | \
+	$(BUILD_DIR) check-build-deps
+	$(CC) $(CPPFLAGS) $(WIN31X_CPPFLAGS) $(CFLAGS) $(WIN31X_CFLAGS) \
+		$(LDFLAGS) $(WIN31X_LDFLAGS) tests/preexisting_client.c \
+		-o $@ $(LDLIBS) $(WIN31X_LDLIBS)
 
 check: $(BUILD_DIR)/test-applications $(BUILD_DIR)/test-icon-assets \
 	$(BUILD_DIR)/test-settings $(BUILD_DIR)/test-auto-lock \
@@ -84,8 +143,8 @@ smoke: all $(BUILD_DIR)/wm-probe $(BUILD_DIR)/preexisting-client \
 	./tests/smoke-x11.sh
 
 smoke-xvfb: all $(BUILD_DIR)/wm-probe $(BUILD_DIR)/preexisting-client \
-	$(BUILD_DIR)/test-auto-lock $(BUILD_DIR)/test-wifi-backend
-	@command -v xvfb-run >/dev/null 2>&1 || { echo "xvfb-run is required" >&2; exit 2; }
+	$(BUILD_DIR)/test-auto-lock $(BUILD_DIR)/test-wifi-backend \
+	check-xvfb-deps
 	xvfb-run -a -s "-screen 0 1024x768x24" ./tests/smoke-x11.sh
 
 install: all

@@ -1,0 +1,69 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  debian:
+    runs-on: ubuntu-latest
+    container: debian:stable-slim
+    timeout-minutes: 15
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential ca-certificates git libpng-dev libx11-dev libxtst-dev \
+            pkg-config xauth xfonts-base xvfb
+
+      - uses: actions/checkout@v4
+
+      - name: Build and run all tests
+        run: make -j"$(nproc)" all check smoke-xvfb
+
+      - name: Test make-variable overrides
+        run: |
+          make clean
+          make -j"$(nproc)" CPPFLAGS= LDLIBS= all
+          make clean
+          env CPPFLAGS= LDLIBS= make -e -j"$(nproc)" all
+          make clean
+          make -j"$(nproc)" WIN31X_REQUIRED_PACKAGES=x11 \
+            WIN31X_XTST_PACKAGE=x11 all smoke-xvfb
+
+      - name: Test missing-dependency diagnostic
+        run: |
+          if make BUILD_DIR=/tmp/win31x-missing-deps PKG_CONFIG=false all \
+              >/tmp/win31x-missing-deps.log 2>&1; then
+            echo "build unexpectedly succeeded without pkg-config" >&2
+            exit 1
+          fi
+          grep -q "pkg-config is required" /tmp/win31x-missing-deps.log
+          if grep -q "undefined reference" /tmp/win31x-missing-deps.log; then
+            cat /tmp/win31x-missing-deps.log >&2
+            exit 1
+          fi
+          empty_pc_dir=$(mktemp -d)
+          if PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$empty_pc_dir" \
+              make BUILD_DIR=/tmp/win31x-missing-modules all \
+              >/tmp/win31x-missing-modules.log 2>&1; then
+            echo "build unexpectedly succeeded without X11/libpng modules" >&2
+            exit 1
+          fi
+          grep -q "required pkg-config modules are unavailable" \
+            /tmp/win31x-missing-modules.log
+          if grep -q "undefined reference" /tmp/win31x-missing-modules.log; then
+            cat /tmp/win31x-missing-modules.log >&2
+            exit 1
+          fi
+
+      - name: Run sanitizer tests
+        run: |
+          make clean
+          make -j"$(nproc)" SANITIZE=1 all check

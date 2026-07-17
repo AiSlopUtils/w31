@@ -44,6 +44,10 @@ make prefix=/usr
 make prefix=/usr check
 ```
 
+The Makefile verifies `pkg-config`, X11, and libpng before compiling and prints
+the required Debian/Ubuntu packages if anything is missing. You can run only
+that preflight with `make check-build-deps`.
+
 For every Control Panel feature, install the recommended runtime services too:
 
 ```sh
@@ -105,9 +109,9 @@ validation and private atomic persistence, NetworkManager output and command
 handling, auto-lock process supervision, all supplied PNG dimensions and
 decoding, exact supplied-asset checksums, and every icon category. The core
 tests do not require X; the auto-lock test exercises X saver policy as well when
-a display is available. For the X11 regression suite, install `xvfb` and
-`libxtst-dev`; `make smoke-xvfb` then uses real XTEST pointer input to exercise
-the actual window-manager state machine:
+a display is available. For the X11 regression suite, install `libxtst-dev`,
+`xvfb`, `xauth`, and `xfonts-base`; `make smoke-xvfb` then uses real XTEST
+pointer input to exercise the actual window-manager state machine:
 
 - manage a new client and reach `NormalState`;
 - adopt a client that was mapped before the window manager started;
