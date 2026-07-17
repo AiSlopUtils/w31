@@ -22,7 +22,7 @@ jobs:
             build-essential ca-certificates git libpng-dev libx11-dev libxtst-dev \
             pkg-config xauth xfonts-base xvfb
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build and run all tests
         run: make -j"$(nproc)" all check smoke-xvfb
