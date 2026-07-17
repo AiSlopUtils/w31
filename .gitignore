@@ -1,0 +1,8 @@
+/build/
+/.vm/
+*.o
+*.deb
+*.build
+*.buildinfo
+*.changes
+/*.plist

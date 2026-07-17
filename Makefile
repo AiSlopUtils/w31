@@ -1,0 +1,129 @@
+CC ?= cc
+PKG_CONFIG ?= pkg-config
+BUILD_DIR ?= build
+
+prefix ?= /usr/local
+bindir ?= $(prefix)/bin
+datadir ?= $(prefix)/share
+mandir ?= $(datadir)/man
+icondir ?= $(datadir)/win31x/icons
+appicon16dir ?= $(datadir)/icons/hicolor/16x16/apps
+appicon48dir ?= $(datadir)/icons/hicolor/48x48/apps
+
+CPPFLAGS += -Isrc -DWIN31X_ICON_DIR='"$(icondir)"' \
+	$(shell $(PKG_CONFIG) --cflags x11 libpng)
+CFLAGS ?= -O2 -g
+CFLAGS += -std=c11 -Wall -Wextra -Wpedantic -Wshadow
+LDLIBS += $(shell $(PKG_CONFIG) --libs x11 libpng)
+
+ifneq ($(SANITIZE),)
+CFLAGS += -O1 -fno-omit-frame-pointer -fsanitize=address,undefined
+LDFLAGS += -fsanitize=address,undefined
+endif
+
+WM_SOURCES = src/win31x.c src/applications.c src/auto_lock.c \
+	src/icon_assets.c src/settings.c src/wifi_backend.c
+WM_HEADERS = src/applications.h src/auto_lock.h src/icon_assets.h src/settings.h \
+	src/wifi_backend.h
+ICON_FILES = $(notdir $(wildcard assets/icons/*.png))
+ICON_DIR_STAMP = $(BUILD_DIR)/.icon-dir
+
+.PHONY: all check smoke smoke-xvfb install uninstall clean FORCE
+
+all: $(BUILD_DIR)/win31x
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+FORCE:
+
+$(ICON_DIR_STAMP): FORCE | $(BUILD_DIR)
+	@tmp="$@.tmp"; printf '%s\n' "$(icondir)" >"$$tmp"; \
+	if ! cmp -s "$$tmp" "$@"; then mv "$$tmp" "$@"; else rm -f "$$tmp"; fi
+
+$(BUILD_DIR)/win31x: $(WM_SOURCES) $(WM_HEADERS) $(ICON_DIR_STAMP) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(WM_SOURCES) -o $@ $(LDLIBS)
+
+$(BUILD_DIR)/test-applications: tests/test_applications.c src/applications.c $(WM_HEADERS) | $(BUILD_DIR)
+	$(CC) -Isrc $(CFLAGS) $(LDFLAGS) tests/test_applications.c src/applications.c -o $@
+
+$(BUILD_DIR)/test-icon-assets: tests/test_icon_assets.c src/icon_assets.c src/icon_assets.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/test_icon_assets.c src/icon_assets.c -o $@ $(LDLIBS)
+
+$(BUILD_DIR)/test-settings: tests/test_settings.c src/settings.c src/settings.h | $(BUILD_DIR)
+	$(CC) -Isrc $(CFLAGS) $(LDFLAGS) tests/test_settings.c src/settings.c -o $@
+
+$(BUILD_DIR)/test-auto-lock: tests/test_auto_lock.c src/auto_lock.c src/auto_lock.h | $(BUILD_DIR)
+	$(CC) -Isrc $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/test_auto_lock.c \
+		src/auto_lock.c -o $@ $(LDLIBS)
+
+$(BUILD_DIR)/test-wifi-backend: tests/test_wifi_backend.c src/wifi_backend.c \
+	src/wifi_backend.h | $(BUILD_DIR)
+	$(CC) -Isrc $(CFLAGS) $(LDFLAGS) tests/test_wifi_backend.c \
+		src/wifi_backend.c -o $@
+
+$(BUILD_DIR)/wm-probe: tests/wm_probe.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(shell $(PKG_CONFIG) --cflags xtst) $(CFLAGS) $(LDFLAGS) \
+		tests/wm_probe.c -o $@ $(LDLIBS) $(shell $(PKG_CONFIG) --libs xtst)
+
+$(BUILD_DIR)/preexisting-client: tests/preexisting_client.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) tests/preexisting_client.c -o $@ $(LDLIBS)
+
+check: $(BUILD_DIR)/test-applications $(BUILD_DIR)/test-icon-assets \
+	$(BUILD_DIR)/test-settings $(BUILD_DIR)/test-auto-lock \
+	$(BUILD_DIR)/test-wifi-backend
+	$(BUILD_DIR)/test-applications
+	WIN31X_ICON_DIR=assets/icons $(BUILD_DIR)/test-icon-assets
+	$(BUILD_DIR)/test-settings
+	$(BUILD_DIR)/test-auto-lock
+	$(BUILD_DIR)/test-wifi-backend
+	./tests/check-icon-provenance.sh
+
+smoke: all $(BUILD_DIR)/wm-probe $(BUILD_DIR)/preexisting-client \
+	$(BUILD_DIR)/test-auto-lock $(BUILD_DIR)/test-wifi-backend
+	./tests/smoke-x11.sh
+
+smoke-xvfb: all $(BUILD_DIR)/wm-probe $(BUILD_DIR)/preexisting-client \
+	$(BUILD_DIR)/test-auto-lock $(BUILD_DIR)/test-wifi-backend
+	@command -v xvfb-run >/dev/null 2>&1 || { echo "xvfb-run is required" >&2; exit 2; }
+	xvfb-run -a -s "-screen 0 1024x768x24" ./tests/smoke-x11.sh
+
+install: all
+	install -d "$(DESTDIR)$(bindir)"
+	install -m 0755 $(BUILD_DIR)/win31x "$(DESTDIR)$(bindir)/win31x"
+	install -m 0755 scripts/win31x-session "$(DESTDIR)$(bindir)/win31x-session"
+	install -d "$(DESTDIR)$(datadir)/xsessions"
+	install -m 0644 data/win31x.desktop "$(DESTDIR)$(datadir)/xsessions/win31x.desktop"
+	install -d "$(DESTDIR)$(icondir)"
+	install -m 0644 assets/icons/*.png "$(DESTDIR)$(icondir)/"
+	install -d "$(DESTDIR)$(appicon16dir)"
+	install -m 0644 assets/icons/applications-16.png \
+		"$(DESTDIR)$(appicon16dir)/win31x.png"
+	install -d "$(DESTDIR)$(appicon48dir)"
+	install -m 0644 assets/icons/applications-48.png \
+		"$(DESTDIR)$(appicon48dir)/win31x.png"
+	@if [ -z "$(DESTDIR)" ] && command -v gtk-update-icon-cache >/dev/null 2>&1; then \
+		gtk-update-icon-cache -q "$(datadir)/icons/hicolor" || true; \
+	fi
+	install -d "$(DESTDIR)$(mandir)/man1"
+	install -m 0644 man/win31x.1 "$(DESTDIR)$(mandir)/man1/win31x.1"
+	install -m 0644 man/win31x-session.1 "$(DESTDIR)$(mandir)/man1/win31x-session.1"
+
+uninstall:
+	rm -f "$(DESTDIR)$(bindir)/win31x"
+	rm -f "$(DESTDIR)$(bindir)/win31x-session"
+	rm -f "$(DESTDIR)$(datadir)/xsessions/win31x.desktop"
+	@for icon in $(ICON_FILES); do \
+		rm -f "$(DESTDIR)$(icondir)/$$icon"; \
+	done
+	rmdir "$(DESTDIR)$(icondir)" 2>/dev/null || true
+	rm -f "$(DESTDIR)$(appicon16dir)/win31x.png"
+	rm -f "$(DESTDIR)$(appicon48dir)/win31x.png"
+	@if [ -z "$(DESTDIR)" ] && command -v gtk-update-icon-cache >/dev/null 2>&1; then \
+		gtk-update-icon-cache -q "$(datadir)/icons/hicolor" || true; \
+	fi
+	rm -f "$(DESTDIR)$(mandir)/man1/win31x.1"
+	rm -f "$(DESTDIR)$(mandir)/man1/win31x-session.1"
+
+clean:
+	rm -rf "$(BUILD_DIR)"

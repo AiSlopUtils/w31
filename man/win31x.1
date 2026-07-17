@@ -1,0 +1,138 @@
+.TH WIN31X 1 "July 17, 2026" "win31x 0.1.0" "User Commands"
+.SH NAME
+win31x \- a minimal Windows 3.1-inspired window manager for X11
+.SH SYNOPSIS
+.B win31x
+.RI [ --display " display" ]
+.RI [ --help ]
+.RI [ --version ]
+.SH DESCRIPTION
+.B Win31 X
+is a small reparenting window manager intended to run as the only window
+manager in an Xorg session.  It draws classic beveled frames, places minimized
+applications on the desktop as clickable icons, and provides an Applications
+desktop icon backed by installed freedesktop desktop entries.  A Control Panel
+desktop icon provides Wi-Fi, color-scheme, and automatic screen-lock settings.
+.SH OPTIONS
+.TP
+.BR --display " " DISPLAY
+Connect to DISPLAY instead of the value in the
+.B DISPLAY
+environment variable.
+.TP
+.BR -h , " --help"
+Show command-line help.
+.TP
+.BR -v , " --version"
+Show the program version.
+.SH DESKTOP CONTROLS
+Click the Applications icon once to open the launcher.  Select an application
+with the pointer or arrow keys and double-click it, or press Enter, to start it.
+Escape closes the launcher.  The mouse wheel and Page Up/Page Down scroll it.
+.PP
+Click the Control Panel icon once to open it.  Wi-Fi can refresh the visible
+NetworkManager networks, connect to a selected open or personal WPA/SAE
+network, and disconnect the active network.  Colors applies one of five desktop
+and active-title schemes immediately.  Auto Lock can enable or disable idle
+locking, select a 1, 5, 10, 15, 30, 60, or 120 minute preset, or lock
+immediately.  Color and auto-lock changes are saved automatically.
+.PP
+Use the underscore button in a title bar to minimize a window.  Its desktop
+icon restores it with one click.  Drag a title bar to move a window, drag an
+outer border to resize it, and use the X button to request that it close.
+Clicking any inactive application focuses and raises it; transient dialogs
+remain above their owning application.  The activating pointer press is also
+delivered to the application.
+.SH KEY BINDINGS
+.TP
+.B Alt+Tab
+Focus and raise the next visible application.
+.TP
+.B Alt+F2
+Open the Applications window.
+.TP
+.B Alt+F4
+Close the active application.
+.SH ENVIRONMENT
+.TP
+.B DISPLAY
+X server to use.
+.TP
+.B XDG_DATA_HOME, XDG_DATA_DIRS
+Locations searched for application desktop entries.
+.TP
+.B WIN31X_TERMINAL
+Executable used to launch desktop entries marked Terminal=true.  It must
+accept the conventional \-e option.  If unset, Win31 X searches for
+x-terminal-emulator, xterm, uxterm, foot, or kitty.
+.TP
+.B WIN31X_ICON_DIR
+Directory containing the required supplied PNG icon set.  This is primarily
+useful for development and tests; installed sessions use the packaged icon
+directory.
+.TP
+.B WIN31X_NMCLI
+Absolute path to the nmcli executable.  The installed default is
+.IR /usr/bin/nmcli .
+This override is primarily useful for tests or nonstandard local installations.
+.TP
+.B WIN31X_XSS_LOCK
+Absolute path to the xss-lock executable.  The installed default is
+.IR /usr/bin/xss-lock .
+.TP
+.B WIN31X_LOCKER
+Absolute path to the screen-locker executable.  The installed default is
+.IR /usr/bin/xsecurelock .
+.TP
+.B XDG_CONFIG_HOME, HOME
+Determine the location of the per-user Win31 X settings file.
+.SH FILES
+.TP
+.I /usr/share/applications/*.desktop
+System application entries.
+.TP
+.I ~/.local/share/applications/*.desktop
+Per-user application entries.
+.TP
+.I /usr/share/win31x/icons/*.png
+User-supplied application icon assets installed with Win31 X.
+.TP
+.I /usr/share/icons/hicolor/*/apps/win31x.png
+Supplied Applications artwork used by display managers for the Win31 X session.
+.TP
+.I $XDG_CONFIG_HOME/win31x/settings.conf
+Private per-user color and auto-lock settings.  When
+.B XDG_CONFIG_HOME
+is unset, the path is
+.IR ~/.config/win31x/settings.conf .
+.SH CONTROL PANEL SERVICES
+Wi-Fi requires NetworkManager and
+.BR nmcli (1).
+Supported connection types are open, OWE, WPA-PSK, and SAE personal networks;
+enterprise and legacy WEP setup is left to NetworkManager's other front ends.
+Wi-Fi passwords are masked on screen, are not included in process arguments or
+log messages, and are supplied to nmcli through a private file descriptor.
+.PP
+Automatic locking requires
+.BR xss-lock (1)
+and a locker; Debian installations use
+.BR xsecurelock (1).
+Win31 X owns the X server idle timeout while running and restores the previous
+X saver policy when it exits.  xss-lock also integrates locking with the login
+session and system suspend path.
+.PP
+When the configured locker is xsecurelock, its password prompt displays one
+asterisk for each entered character on both idle and immediate locks.  This
+confirms keyboard input but intentionally reveals password length.
+Authentication remains entirely within xsecurelock and PAM; Win31 X does not
+handle the lock-screen password.
+.SH DISPLAY REQUIREMENTS
+The supplied-color icon renderer requires a TrueColor X visual.  Standard
+modern Xorg configurations provide one.
+.SH SEE ALSO
+.BR Xorg (1),
+.BR nmcli (1),
+.BR xss-lock (1),
+.BR xsecurelock (1),
+.BR startx (1),
+.BR xterm (1)

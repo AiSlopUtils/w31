@@ -1,0 +1,4 @@
+tar-ignore = ".vm"
+tar-ignore = "build"
+tar-ignore = "*.plist"
+extend-diff-ignore = "(^|/)(\.vm|build)(/|$)"

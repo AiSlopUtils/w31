@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+export XDG_CURRENT_DESKTOP=Win31X
+export XDG_SESSION_DESKTOP=win31x
+export DESKTOP_SESSION=win31x
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+wm_binary=${WIN31X_BINARY:-"$script_dir/win31x"}
+
+if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] &&
+   command -v dbus-run-session >/dev/null 2>&1; then
+    exec dbus-run-session -- "$wm_binary" "$@"
+fi
+
+exec "$wm_binary" "$@"

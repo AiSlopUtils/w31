@@ -1,0 +1,74 @@
+#cloud-config
+hostname: win31x-debian
+manage_etc_hosts: true
+ssh_pwauth: true
+
+users:
+  - name: win31x
+    gecos: Win31 X
+    groups: [adm, audio, autologin, cdrom, dialout, plugdev, sudo, video]
+    shell: /bin/bash
+    lock_passwd: false
+    passwd: $6$lLEx4Vt0SkmaQRx0$jnmDOR7pAnHUcxbzDVUyRWph0qdJc3/vdzRnt9FmKOo5v7sNRG0jeR3ckqMVSf1YxcZHbNEoFQKl016Pkre05.
+    sudo: ALL=(ALL) NOPASSWD:ALL
+
+groups:
+  - autologin
+
+package_update: true
+packages:
+  - build-essential
+  - debhelper
+  - pkg-config
+  - libx11-dev
+  - libpng-dev
+  - libxtst-dev
+  - network-manager
+  - xss-lock
+  - xsecurelock
+  - xorg
+  - lightdm
+  - lightdm-gtk-greeter
+  - dbus-x11
+  - xterm
+  - x11-apps
+  - xvfb
+  - xauth
+  - xfonts-base
+  - openssh-server
+  - sudo
+
+write_files:
+  - path: /etc/lightdm/lightdm.conf.d/50-win31x.conf
+    permissions: '0644'
+    content: |
+      [Seat:*]
+      autologin-user=win31x
+      autologin-user-timeout=0
+      user-session=win31x
+
+runcmd:
+  - |
+      set -eux
+      mkdir -p /mnt/cidata
+      mountpoint -q /mnt/cidata || mount -o ro /dev/disk/by-label/cidata /mnt/cidata
+      rm -rf /opt/win31x
+      mkdir -p /opt/win31x
+      rm -f /opt/win31x_*.deb /opt/win31x-dbgsym_*.deb
+      tar -xzf /mnt/cidata/source.tgz -C /opt/win31x
+      cd /opt/win31x
+      dpkg-buildpackage -us -uc -b
+      main_deb=$(find /opt -maxdepth 1 -type f -name 'win31x_*.deb' ! -name '*-dbgsym_*.deb' -print -quit)
+      test -n "$main_deb"
+      apt-get install -y --reinstall "$main_deb"
+      test "$(readlink -f /usr/bin/x-window-manager)" = /usr/bin/win31x
+      test -f /usr/share/xsessions/win31x.desktop
+      cd /
+      WIN31X_WM_BINARY=/usr/bin/win31x xvfb-run -a -s '-screen 0 1024x768x24' /opt/win31x/tests/smoke-x11.sh
+      chown -R win31x:win31x /opt/win31x
+      systemctl enable lightdm.service
+      systemctl set-default graphical.target
+      systemctl restart lightdm.service
+      touch /var/lib/win31x-provisioned
+
+final_message: "Cloud-init finished; Win31 X provisioning status is in /var/lib/win31x-provisioned."

@@ -1,0 +1,26 @@
+win31x (0.1.0) unstable; urgency=medium
+
+  * Initial release.
+  * Use categorized high-resolution artwork from the user-supplied Windows 98
+    icon archive for the desktop, launcher, minimized clients, and title bars.
+  * Make click-to-focus reliably raise clients, including applications with
+    their own passive button grabs, and harden focus and transient lifecycle
+    handling.
+  * Correct desktop-entry escaping, working directories, deep discovery, and
+    resize-increment handling; expand real-pointer and provenance tests.
+  * Correct bordered-client geometry, window gravity, stack requests, root
+    resizing, launcher resizing, and shift-free client withdrawal.
+  * Install the supplied session icon through hicolor, enable full hardening,
+    and run the Xvfb/XTEST suite during package and QEMU provisioning.
+  * Add a desktop Control Panel using the supplied settings, network, display,
+    and clock artwork. Configure NetworkManager Wi-Fi, persistent live color
+    schemes, and xss-lock/xsecurelock idle locking without exposing passwords
+    in process arguments or logs.
+  * Extend the XTEST regression suite through the Control Panel and retain
+    reliable click-to-focus/raise behavior when its internal window is open.
+  * Show visible asterisk feedback for xsecurelock passwords on both idle and
+    Lock Now paths, with child-environment regression coverage.
+  * Reinstall rebuilt packages during repeat QEMU provisioning even when the
+    package version is unchanged.
+
+ -- Win31 X maintainers <maintainers@win31x.invalid>  Fri, 17 Jul 2026 12:00:00 +0800

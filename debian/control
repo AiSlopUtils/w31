@@ -1,0 +1,20 @@
+Source: win31x
+Section: x11
+Maintainer: Win31 X maintainers <maintainers@win31x.invalid>
+Build-Depends: debhelper-compat (= 13), pkgconf, libx11-dev, libpng-dev,
+ libxtst-dev, xvfb, xauth
+Standards-Version: 4.7.4
+Rules-Requires-Root: no
+
+Package: win31x
+Architecture: any
+Provides: x-window-manager
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: default-dbus-session-bus | dbus-session-bus, network-manager,
+ xss-lock, xsecurelock, xterm, xfonts-base
+Description: minimal Windows 3.1-style window manager for X11
+ Win31 X is a small reparenting window manager with classic beveled frames,
+ desktop icons for minimized applications, and an installed-application
+ launcher. Its Control Panel configures Wi-Fi, color schemes, and automatic
+ screen locking. It supports the essential ICCCM lifecycle and a focused EWMH
+ subset.

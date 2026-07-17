@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Name=Win31 X
+Comment=Minimal Windows 3.1-style desktop for X11
+Exec=win31x-session
+TryExec=win31x
+Icon=win31x
+Type=Application
+DesktopNames=Win31X
+Keywords=window manager;desktop;retro;
