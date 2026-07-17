@@ -15,10 +15,31 @@
 static Display *display;
 static Window root;
 static Atom wm_state_atom;
+static Atom net_wm_state_atom;
+static Atom hidden_atom;
+static Atom maximized_horz_atom;
+static Atom maximized_vert_atom;
 static Atom role_atom;
 static Atom client_atom;
 
 static int wait_until_unmanaged(Window window);
+
+enum {
+    TEST_NET_WM_STATE_REMOVE = 0,
+    TEST_FRAME_RIGHT = 3,
+    TEST_TITLE_BUTTON = 17,
+    TEST_TITLE_BUTTON_GAP = 3,
+    TEST_TITLE_BUTTON_RIGHT_INSET = 2,
+    TEST_INTERNAL_CLOSE_INSET = 6,
+    TEST_TITLE_BUTTON_Y = 4
+};
+
+typedef struct {
+    int x;
+    int y;
+    int width;
+    int height;
+} FrameGeometry;
 
 static Window root_window_property(Atom property)
 {
@@ -61,6 +82,54 @@ static long window_state(Window window)
     if (data != NULL)
         XFree(data);
     return state;
+}
+
+static int window_atom_property_contains(Window window, Atom property,
+                                         Atom expected)
+{
+    Atom type;
+    int format;
+    unsigned long count;
+    unsigned long after;
+    unsigned char *data = NULL;
+    unsigned long index;
+    int found = 0;
+
+    if (XGetWindowProperty(display, window, property, 0, 128, False, XA_ATOM,
+                           &type, &format, &count, &after, &data) == Success &&
+        type == XA_ATOM && format == 32 && data != NULL) {
+        Atom *atoms = (Atom *)data;
+
+        for (index = 0; index < count; ++index) {
+            if (atoms[index] == expected) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    if (data != NULL)
+        XFree(data);
+    return found;
+}
+
+static int wait_for_maximized_state(Window window, int expected)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 150; ++attempt) {
+        int has_horizontal;
+        int has_vertical;
+
+        XSync(display, False);
+        has_horizontal = window_atom_property_contains(
+            window, net_wm_state_atom, maximized_horz_atom);
+        has_vertical = window_atom_property_contains(
+            window, net_wm_state_atom, maximized_vert_atom);
+        if (has_horizontal == expected && has_vertical == expected)
+            return 0;
+        wait_a_bit();
+    }
+    return -1;
 }
 
 static int wait_for_state(Window window, long expected)
@@ -203,6 +272,34 @@ static int internal_window_is_hidden(Window window)
             return 1;
         wait_a_bit();
     }
+    return 0;
+}
+
+static int internal_window_remains_viewable(Window window)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 20; ++attempt) {
+        XWindowAttributes attributes;
+
+        XSync(display, False);
+        if (!XGetWindowAttributes(display, window, &attributes) ||
+            attributes.map_state != IsViewable)
+            return 0;
+        wait_a_bit();
+    }
+    return 1;
+}
+
+static int click_internal_close_button(Window window)
+{
+    XWindowAttributes attributes;
+
+    if (!XGetWindowAttributes(display, window, &attributes) ||
+        attributes.width < TEST_TITLE_BUTTON + 16)
+        return -1;
+    send_button_one_at(window, attributes.width - 14,
+                       TEST_TITLE_BUTTON_Y + TEST_TITLE_BUTTON / 2);
     return 0;
 }
 
@@ -351,6 +448,228 @@ static int fake_click_at(int x, int y)
     return 0;
 }
 
+static int fake_drag_at(int start_x, int start_y, int end_x, int end_y)
+{
+    int event_base;
+    int error_base;
+    int major_version;
+    int minor_version;
+    int intermediate_x = start_x;
+    int intermediate_y = start_y;
+    int final_x = end_x;
+    int final_y = end_y;
+
+    if (!XTestQueryExtension(display, &event_base, &error_base,
+                             &major_version, &minor_version)) {
+        fprintf(stderr, "wm-probe: XTEST extension is unavailable\n");
+        return -1;
+    }
+    if (!XTestFakeMotionEvent(display, DefaultScreen(display), start_x,
+                              start_y, CurrentTime)) {
+        fprintf(stderr, "wm-probe: could not position a drag pointer\n");
+        return -1;
+    }
+    XSync(display, False);
+    wait_a_bit();
+    if (!XTestFakeButtonEvent(display, Button1, True, CurrentTime)) {
+        fprintf(stderr, "wm-probe: could not begin a pointer drag\n");
+        return -1;
+    }
+    XSync(display, False);
+    wait_a_bit();
+    if (end_y > start_y) {
+        ++intermediate_y;
+        ++final_y;
+    } else if (end_y < start_y) {
+        --intermediate_y;
+        --final_y;
+    } else if (end_x > start_x) {
+        ++intermediate_x;
+        ++final_x;
+    } else if (end_x < start_x) {
+        --intermediate_x;
+        --final_x;
+    }
+    if (!XTestFakeMotionEvent(display, DefaultScreen(display), intermediate_x,
+                              intermediate_y, CurrentTime)) {
+        (void)XTestFakeButtonEvent(display, Button1, False, CurrentTime);
+        XFlush(display);
+        fprintf(stderr, "wm-probe: could not begin pointer motion\n");
+        return -1;
+    }
+    XSync(display, False);
+    wait_a_bit();
+    if (!XTestFakeMotionEvent(display, DefaultScreen(display), final_x, final_y,
+                              CurrentTime)) {
+        (void)XTestFakeButtonEvent(display, Button1, False, CurrentTime);
+        XFlush(display);
+        fprintf(stderr, "wm-probe: could not move a dragged pointer\n");
+        return -1;
+    }
+    XSync(display, False);
+    wait_a_bit();
+    if (!XTestFakeButtonEvent(display, Button1, False, CurrentTime)) {
+        fprintf(stderr, "wm-probe: could not release a pointer drag\n");
+        return -1;
+    }
+    XFlush(display);
+    return 0;
+}
+
+static int get_frame_geometry(Window frame, FrameGeometry *geometry)
+{
+    XWindowAttributes attributes;
+
+    if (geometry == NULL || !XGetWindowAttributes(display, frame, &attributes))
+        return -1;
+    geometry->x = attributes.x;
+    geometry->y = attributes.y;
+    geometry->width = attributes.width;
+    geometry->height = attributes.height;
+    return 0;
+}
+
+static int frame_geometry_equals(const FrameGeometry *left,
+                                 const FrameGeometry *right)
+{
+    return left->x == right->x && left->y == right->y &&
+           left->width == right->width && left->height == right->height;
+}
+
+static int wait_for_frame_geometry(Window frame,
+                                   const FrameGeometry *expected)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 150; ++attempt) {
+        FrameGeometry actual;
+
+        XSync(display, False);
+        if (get_frame_geometry(frame, &actual) == 0 &&
+            frame_geometry_equals(&actual, expected))
+            return 0;
+        wait_a_bit();
+    }
+    return -1;
+}
+
+static int frame_geometry_remains(Window frame,
+                                  const FrameGeometry *expected)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 30; ++attempt) {
+        FrameGeometry actual;
+
+        XSync(display, False);
+        if (get_frame_geometry(frame, &actual) < 0 ||
+            !frame_geometry_equals(&actual, expected))
+            return -1;
+        wait_a_bit();
+    }
+    return 0;
+}
+
+static int wait_for_restored_frame(Window frame,
+                                   const FrameGeometry *original,
+                                   int require_new_position)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 150; ++attempt) {
+        FrameGeometry actual;
+
+        XSync(display, False);
+        if (get_frame_geometry(frame, &actual) == 0 &&
+            actual.width == original->width &&
+            actual.height == original->height &&
+            (!require_new_position ||
+             (actual.x != original->x || actual.y != original->y)))
+            return 0;
+        wait_a_bit();
+    }
+    return -1;
+}
+
+static int click_frame_maximize_button(Window frame)
+{
+    FrameGeometry geometry;
+    int close_x;
+    int maximize_x;
+
+    if (get_frame_geometry(frame, &geometry) < 0)
+        return -1;
+    close_x = geometry.width - TEST_FRAME_RIGHT - TEST_TITLE_BUTTON -
+              TEST_TITLE_BUTTON_RIGHT_INSET;
+    maximize_x = close_x - TEST_TITLE_BUTTON - TEST_TITLE_BUTTON_GAP;
+    return fake_click_at(geometry.x + maximize_x + TEST_TITLE_BUTTON / 2,
+                         geometry.y + TEST_TITLE_BUTTON_Y +
+                             TEST_TITLE_BUTTON / 2);
+}
+
+static int click_internal_maximize_button(Window window)
+{
+    FrameGeometry geometry;
+    int close_x;
+    int maximize_x;
+
+    if (get_frame_geometry(window, &geometry) < 0)
+        return -1;
+    close_x = geometry.width - TEST_TITLE_BUTTON -
+              TEST_INTERNAL_CLOSE_INSET;
+    maximize_x = close_x - TEST_TITLE_BUTTON - TEST_TITLE_BUTTON_GAP;
+    return fake_click_at(geometry.x + maximize_x + TEST_TITLE_BUTTON / 2,
+                         geometry.y + TEST_TITLE_BUTTON_Y +
+                             TEST_TITLE_BUTTON / 2);
+}
+
+static int drag_frame_title_to(Window frame, int root_x, int root_y)
+{
+    FrameGeometry geometry;
+
+    if (get_frame_geometry(frame, &geometry) < 0)
+        return -1;
+    return fake_drag_at(geometry.x + geometry.width / 2,
+                        geometry.y + TEST_TITLE_BUTTON_Y +
+                            TEST_TITLE_BUTTON / 2,
+                        root_x, root_y);
+}
+
+static int drag_internal_back_to_geometry(Window window,
+                                          const FrameGeometry *original)
+{
+    FrameGeometry arranged;
+    int pointer_offset_x;
+    int destination_x;
+
+    if (get_frame_geometry(window, &arranged) < 0 || arranged.width < 1)
+        return -1;
+    pointer_offset_x = arranged.width / 2;
+    destination_x = original->x +
+                    (int)((long long)pointer_offset_x * original->width /
+                          arranged.width);
+    if (fake_drag_at(arranged.x + pointer_offset_x,
+                     arranged.y + TEST_TITLE_BUTTON_Y +
+                         TEST_TITLE_BUTTON / 2,
+                     destination_x,
+                     original->y + TEST_TITLE_BUTTON_Y +
+                         TEST_TITLE_BUTTON / 2) < 0)
+        return -1;
+    return wait_for_restored_frame(window, original, 0);
+}
+
+static void report_frame_geometry(const char *message, Window frame)
+{
+    FrameGeometry geometry;
+
+    if (get_frame_geometry(frame, &geometry) == 0) {
+        fprintf(stderr, "wm-probe: %s (actual %d,%d %dx%d)\n", message,
+                geometry.x, geometry.y, geometry.width, geometry.height);
+    } else {
+        fprintf(stderr, "wm-probe: %s (geometry unavailable)\n", message);
+    }
+}
+
 static int wait_for_conflicting_client_click(Window client, Window frame,
                                              Window other_frame)
 {
@@ -397,6 +716,25 @@ static void send_iconify(Window client, Atom change_state)
     event.xclient.message_type = change_state;
     event.xclient.format = 32;
     event.xclient.data.l[0] = IconicState;
+    XSendEvent(display, root, False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &event);
+    XFlush(display);
+}
+
+static void send_net_wm_state(Window client, long action, Atom first,
+                              Atom second)
+{
+    XEvent event;
+
+    memset(&event, 0, sizeof(event));
+    event.xclient.type = ClientMessage;
+    event.xclient.display = display;
+    event.xclient.window = client;
+    event.xclient.message_type = net_wm_state_atom;
+    event.xclient.format = 32;
+    event.xclient.data.l[0] = action;
+    event.xclient.data.l[1] = (long)first;
+    event.xclient.data.l[2] = (long)second;
     XSendEvent(display, root, False,
                SubstructureRedirectMask | SubstructureNotifyMask, &event);
     XFlush(display);
@@ -1124,6 +1462,134 @@ static int verify_synthetic_configure_geometry(void)
     return -1;
 }
 
+static int verify_maximize_and_snap(void)
+{
+    int screen = DefaultScreen(display);
+    int screen_width = DisplayWidth(display, screen);
+    int screen_height = DisplayHeight(display, screen);
+    Atom net_supported = XInternAtom(display, "_NET_SUPPORTED", False);
+    Window window;
+    Window frame;
+    FrameGeometry original;
+    FrameGeometry maximized = {0, 0, screen_width, screen_height};
+    FrameGeometry left = {0, 0, screen_width / 2, screen_height};
+    FrameGeometry right = {
+        screen_width / 2,
+        0,
+        screen_width - screen_width / 2,
+        screen_height
+    };
+    unsigned long black = BlackPixel(display, screen);
+    unsigned long white = WhitePixel(display, screen);
+
+    if (!window_atom_property_contains(root, net_supported,
+                                       maximized_horz_atom) ||
+        !window_atom_property_contains(root, net_supported,
+                                       maximized_vert_atom)) {
+        fprintf(stderr,
+                "wm-probe: EWMH maximize atoms were not advertised\n");
+        return -1;
+    }
+
+    window = XCreateSimpleWindow(display, root, 180, 120, 320, 180, 0,
+                                 black, white);
+    XStoreName(display, window, "Win31 X Maximize and Snap Probe");
+    XMapWindow(display, window);
+    XFlush(display);
+    if (wait_for_state(window, NormalState) < 0) {
+        fprintf(stderr, "wm-probe: maximize client was not managed\n");
+        return -1;
+    }
+    frame = client_frame(window);
+    if (frame == None || get_frame_geometry(frame, &original) < 0) {
+        fprintf(stderr, "wm-probe: maximize client frame was unavailable\n");
+        return -1;
+    }
+
+    if (click_frame_maximize_button(frame) < 0 ||
+        wait_for_frame_geometry(frame, &maximized) < 0) {
+        report_frame_geometry("maximize button did not fill the work area", frame);
+        return -1;
+    }
+    if (wait_for_maximized_state(window, 1) < 0) {
+        fprintf(stderr,
+                "wm-probe: maximize did not publish both EWMH state atoms\n");
+        return -1;
+    }
+    if (click_frame_maximize_button(frame) < 0 ||
+        wait_for_frame_geometry(frame, &original) < 0) {
+        report_frame_geometry("maximize toggle did not restore exact geometry",
+                              frame);
+        return -1;
+    }
+    if (wait_for_maximized_state(window, 0) < 0) {
+        fprintf(stderr,
+                "wm-probe: restore did not clear both EWMH maximize atoms\n");
+        return -1;
+    }
+
+    if (click_frame_maximize_button(frame) < 0 ||
+        wait_for_frame_geometry(frame, &maximized) < 0 ||
+        drag_frame_title_to(frame, screen_width / 2, screen_height / 3) < 0 ||
+        wait_for_restored_frame(frame, &original, 1) < 0) {
+        report_frame_geometry("dragging a maximized title did not restore it",
+                              frame);
+        return -1;
+    }
+    if (wait_for_maximized_state(window, 0) < 0) {
+        fprintf(stderr,
+                "wm-probe: dragging out of maximize retained EWMH state\n");
+        return -1;
+    }
+
+    if (drag_frame_title_to(frame, 0, screen_height / 3) < 0 ||
+        wait_for_frame_geometry(frame, &left) < 0) {
+        report_frame_geometry("left-edge title drag did not snap left", frame);
+        return -1;
+    }
+    if (wait_for_maximized_state(window, 0) < 0) {
+        fprintf(stderr, "wm-probe: left snap incorrectly claimed maximize state\n");
+        return -1;
+    }
+    send_net_wm_state(window, TEST_NET_WM_STATE_REMOVE, maximized_horz_atom,
+                      maximized_vert_atom);
+    if (frame_geometry_remains(frame, &left) < 0) {
+        report_frame_geometry(
+            "removing maximize state from a snapped client unsnapped it", frame);
+        return -1;
+    }
+    if (click_frame_maximize_button(frame) < 0 ||
+        wait_for_frame_geometry(frame, &maximized) < 0 ||
+        wait_for_maximized_state(window, 1) < 0 ||
+        click_frame_maximize_button(frame) < 0 ||
+        wait_for_frame_geometry(frame, &left) < 0 ||
+        wait_for_maximized_state(window, 0) < 0) {
+        report_frame_geometry(
+            "maximizing a snapped client did not restore its prior snap", frame);
+        return -1;
+    }
+    if (drag_frame_title_to(frame, screen_width - 1, screen_height / 3) < 0 ||
+        wait_for_frame_geometry(frame, &right) < 0) {
+        report_frame_geometry("right-edge title drag did not snap right", frame);
+        return -1;
+    }
+    if (wait_for_maximized_state(window, 0) < 0) {
+        fprintf(stderr, "wm-probe: right snap incorrectly claimed maximize state\n");
+        return -1;
+    }
+    if (drag_frame_title_to(frame, screen_width / 2,
+                            screen_height / 2) < 0 ||
+        wait_for_restored_frame(frame, &original, 0) < 0) {
+        report_frame_geometry("dragging a snapped title did not restore its size",
+                              frame);
+        return -1;
+    }
+
+    XDestroyWindow(display, window);
+    XSync(display, False);
+    return 0;
+}
+
 static int wait_for_active_client(Window client)
 {
     Atom active_window = XInternAtom(display, "_NET_ACTIVE_WINDOW", False);
@@ -1142,7 +1608,7 @@ static int wait_for_active_client(Window client)
     return -1;
 }
 
-static int verify_map_dismisses_launcher(void)
+static int verify_map_preserves_launcher(void)
 {
     Window applications_icon;
     Window launcher;
@@ -1188,10 +1654,10 @@ static int verify_map_dismisses_launcher(void)
     XMapWindow(display, client);
     XFlush(display);
     if (wait_for_state(client, NormalState) < 0 ||
-        !internal_window_is_hidden(launcher) ||
-        wait_for_active_client(client) < 0) {
+        wait_for_active_client(client) < 0 ||
+        !internal_window_remains_viewable(launcher)) {
         fprintf(stderr,
-                "wm-probe: mapping client did not dismiss launcher and activate it\n");
+                "wm-probe: mapping/focusing a client dismissed Applications\n");
         return -1;
     }
     XDestroyWindow(display, client);
@@ -1244,7 +1710,8 @@ static void send_escape(Window window)
     XFlush(display);
 }
 
-static void send_key_sym(Window window, KeySym symbol)
+static void send_key_sym_with_state(Window window, KeySym symbol,
+                                    unsigned int state)
 {
     XEvent event;
 
@@ -1254,9 +1721,15 @@ static void send_key_sym(Window window, KeySym symbol)
     event.xkey.window = window;
     event.xkey.root = root;
     event.xkey.keycode = XKeysymToKeycode(display, symbol);
+    event.xkey.state = state;
     event.xkey.same_screen = True;
     XSendEvent(display, window, False, KeyPressMask, &event);
     XFlush(display);
+}
+
+static void send_key_sym(Window window, KeySym symbol)
+{
+    send_key_sym_with_state(window, symbol, 0U);
 }
 
 static void send_text(Window window, const char *text)
@@ -1284,6 +1757,320 @@ static int wait_for_focus_window(Window expected)
         wait_a_bit();
     }
     return -1;
+}
+
+static int focus_window_remains(Window expected)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 30; ++attempt) {
+        Window focused = None;
+        int revert_to;
+
+        XSync(display, False);
+        XGetInputFocus(display, &focused, &revert_to);
+        if (focused != expected)
+            return -1;
+        wait_a_bit();
+    }
+    return 0;
+}
+
+static int wait_for_external_active_focus(Window launcher, Window panel)
+{
+    Atom active_window = XInternAtom(display, "_NET_ACTIVE_WINDOW", False);
+    int attempt;
+
+    for (attempt = 0; attempt < 150; ++attempt) {
+        Window focused = None;
+        Window active;
+        int revert_to;
+
+        XSync(display, False);
+        XGetInputFocus(display, &focused, &revert_to);
+        active = root_window_property(active_window);
+        if (active != None && focused == active && focused != launcher &&
+            focused != panel && focused != root)
+            return 0;
+        wait_a_bit();
+    }
+    return -1;
+}
+
+static int wait_for_non_input_focus_with_active(Window client,
+                                                Window launcher, Window panel)
+{
+    Atom active_window = XInternAtom(display, "_NET_ACTIVE_WINDOW", False);
+    int attempt;
+
+    for (attempt = 0; attempt < 150; ++attempt) {
+        Window focused = None;
+        int revert_to;
+
+        XSync(display, False);
+        XGetInputFocus(display, &focused, &revert_to);
+        if (root_window_property(active_window) == client &&
+            focused != client && focused != launcher && focused != panel)
+            return 0;
+        wait_a_bit();
+    }
+    return -1;
+}
+
+static int verify_no_input_client_focus(Window applications_icon,
+                                        Window launcher, Window panel)
+{
+    int screen = DefaultScreen(display);
+    int screen_width = DisplayWidth(display, screen);
+    int client_x = screen_width > 150 ? screen_width - 150 : 0;
+    Window client;
+    Window frame;
+    FrameGeometry geometry;
+    XWMHints hints;
+    int click_x;
+    int click_y;
+    unsigned long black = BlackPixel(display, screen);
+    unsigned long white = WhitePixel(display, screen);
+
+    client = XCreateSimpleWindow(display, root, client_x, 32, 120, 72, 0,
+                                 black, white);
+    XStoreName(display, client, "Win31 X No Input Focus Probe");
+    memset(&hints, 0, sizeof(hints));
+    hints.flags = InputHint;
+    hints.input = False;
+    XSetWMHints(display, client, &hints);
+    XMapWindow(display, client);
+    XFlush(display);
+    if (wait_for_state(client, NormalState) < 0) {
+        fprintf(stderr, "wm-probe: no-input client was not managed\n");
+        return -1;
+    }
+    frame = client_frame(client);
+    if (frame == None || get_frame_geometry(frame, &geometry) < 0) {
+        fprintf(stderr, "wm-probe: no-input client frame was unavailable\n");
+        return -1;
+    }
+    click_x = geometry.x + geometry.width / 2;
+    click_y = geometry.y + geometry.height / 2;
+
+    send_button_one(applications_icon);
+    if (wait_for_focus_window(launcher) < 0) {
+        fprintf(stderr,
+                "wm-probe: Applications did not refocus before no-input click\n");
+        return -1;
+    }
+    if (fake_click_at(click_x, click_y) < 0) {
+        fprintf(stderr, "wm-probe: could not inject no-input client click\n");
+        return -1;
+    }
+    if (wait_for_non_input_focus_with_active(client, launcher, panel) < 0 ||
+        !internal_window_remains_viewable(launcher) ||
+        !internal_window_remains_viewable(panel)) {
+        Atom active_window =
+            XInternAtom(display, "_NET_ACTIVE_WINDOW", False);
+        Window focused = None;
+        int revert_to;
+
+        XGetInputFocus(display, &focused, &revert_to);
+        fprintf(stderr,
+                "wm-probe: no-input client click violated focus persistence "
+                "(focus=0x%lx active=0x%lx client=0x%lx frame=0x%lx "
+                "launcher=0x%lx panel=0x%lx click=%d,%d)\n",
+                (unsigned long)focused,
+                (unsigned long)root_window_property(active_window),
+                (unsigned long)client, (unsigned long)frame,
+                (unsigned long)launcher, (unsigned long)panel,
+                click_x, click_y);
+        return -1;
+    }
+
+    XDestroyWindow(display, client);
+    XFlush(display);
+    wait_a_bit();
+    return 0;
+}
+
+static int verify_internal_focus_state_regressions(
+    Window client, Window applications_icon, Window launcher, Window panel)
+{
+    Atom change_state = XInternAtom(display, "WM_CHANGE_STATE", False);
+    Window minimized_icon;
+
+    send_button_one(applications_icon);
+    if (wait_for_focus_window(launcher) < 0 ||
+        window_state(client) != NormalState ||
+        window_atom_property_contains(client, net_wm_state_atom, hidden_atom)) {
+        fprintf(stderr,
+                "wm-probe: no-op hidden-state preconditions were not met\n");
+        return -1;
+    }
+    send_net_wm_state(client, TEST_NET_WM_STATE_REMOVE, hidden_atom, None);
+    if (focus_window_remains(launcher) < 0 ||
+        window_state(client) != NormalState ||
+        window_atom_property_contains(client, net_wm_state_atom, hidden_atom) ||
+        !internal_window_remains_viewable(launcher) ||
+        !internal_window_remains_viewable(panel)) {
+        fprintf(stderr,
+                "wm-probe: removing absent hidden state stole internal focus\n");
+        return -1;
+    }
+
+    if (fake_click_at(150, 140) < 0 || wait_for_active_client(client) < 0) {
+        fprintf(stderr,
+                "wm-probe: could not activate client for background minimize test\n");
+        return -1;
+    }
+    send_button_one(applications_icon);
+    if (wait_for_focus_window(launcher) < 0) {
+        fprintf(stderr,
+                "wm-probe: Applications did not focus before background minimize\n");
+        return -1;
+    }
+    send_iconify(client, change_state);
+    if (wait_for_state(client, IconicState) < 0 ||
+        focus_window_remains(launcher) < 0 ||
+        !internal_window_remains_viewable(launcher) ||
+        !internal_window_remains_viewable(panel)) {
+        fprintf(stderr,
+                "wm-probe: minimizing the background active client stole internal focus\n");
+        return -1;
+    }
+    minimized_icon = wait_for_role("minimized-icon", client, 1);
+    if (minimized_icon == None) {
+        fprintf(stderr,
+                "wm-probe: background minimized client did not create an icon\n");
+        return -1;
+    }
+    send_button_one(minimized_icon);
+    if (wait_for_state(client, NormalState) < 0 ||
+        wait_for_active_client(client) < 0 ||
+        !internal_window_remains_viewable(launcher) ||
+        !internal_window_remains_viewable(panel)) {
+        fprintf(stderr,
+                "wm-probe: background minimized client did not restore cleanly\n");
+        return -1;
+    }
+
+    send_button_one(applications_icon);
+    if (wait_for_focus_window(launcher) < 0) {
+        fprintf(stderr, "wm-probe: Applications did not refocus for Alt+Tab\n");
+        return -1;
+    }
+    send_key_sym_with_state(launcher, XK_Tab, Mod1Mask);
+    if (wait_for_external_active_focus(launcher, panel) < 0 ||
+        !internal_window_remains_viewable(launcher) ||
+        !internal_window_remains_viewable(panel)) {
+        fprintf(stderr,
+                "wm-probe: Applications Alt+Tab did not focus a client while staying open\n");
+        return -1;
+    }
+
+    if (verify_no_input_client_focus(applications_icon, launcher, panel) < 0)
+        return -1;
+    return 0;
+}
+
+static int verify_internal_window_layouts(Window applications_icon,
+                                          Window control_icon,
+                                          Window launcher, Window panel)
+{
+    int screen = DefaultScreen(display);
+    int screen_width = DisplayWidth(display, screen);
+    int screen_height = DisplayHeight(display, screen);
+    FrameGeometry launcher_original;
+    FrameGeometry panel_original;
+    FrameGeometry maximized = {0, 0, screen_width, screen_height};
+    FrameGeometry left = {0, 0, screen_width / 2, screen_height};
+    FrameGeometry right = {
+        screen_width / 2,
+        0,
+        screen_width - screen_width / 2,
+        screen_height
+    };
+
+    if (get_frame_geometry(launcher, &launcher_original) < 0 ||
+        get_frame_geometry(panel, &panel_original) < 0) {
+        fprintf(stderr, "wm-probe: internal window geometry was unavailable\n");
+        return -1;
+    }
+
+    send_button_one(applications_icon);
+    if (wait_for_focus_window(launcher) < 0 ||
+        click_internal_maximize_button(launcher) < 0 ||
+        wait_for_frame_geometry(launcher, &maximized) < 0 ||
+        click_internal_maximize_button(launcher) < 0 ||
+        wait_for_frame_geometry(launcher, &launcher_original) < 0) {
+        report_frame_geometry(
+            "Applications maximize toggle did not restore exact geometry",
+            launcher);
+        return -1;
+    }
+
+    send_button_one(control_icon);
+    if (wait_for_focus_window(panel) < 0 ||
+        click_internal_maximize_button(panel) < 0 ||
+        wait_for_frame_geometry(panel, &maximized) < 0 ||
+        click_internal_maximize_button(panel) < 0 ||
+        wait_for_frame_geometry(panel, &panel_original) < 0) {
+        report_frame_geometry(
+            "Control Panel maximize toggle did not restore exact geometry",
+            panel);
+        return -1;
+    }
+
+    send_button_one(applications_icon);
+    if (wait_for_focus_window(launcher) < 0 ||
+        drag_frame_title_to(launcher, 0, screen_height / 3) < 0 ||
+        wait_for_frame_geometry(launcher, &left) < 0) {
+        report_frame_geometry("Applications did not snap left", launcher);
+        return -1;
+    }
+    if (click_internal_maximize_button(launcher) < 0 ||
+        wait_for_frame_geometry(launcher, &maximized) < 0 ||
+        click_internal_maximize_button(launcher) < 0 ||
+        wait_for_frame_geometry(launcher, &left) < 0) {
+        report_frame_geometry(
+            "maximizing snapped Applications did not restore its prior snap",
+            launcher);
+        return -1;
+    }
+    send_button_one(control_icon);
+    if (wait_for_focus_window(panel) < 0 ||
+        drag_frame_title_to(panel, screen_width - 1,
+                            screen_height / 3) < 0 ||
+        wait_for_frame_geometry(panel, &right) < 0) {
+        report_frame_geometry("Control Panel did not snap right", panel);
+        return -1;
+    }
+    if (click_internal_maximize_button(panel) < 0 ||
+        wait_for_frame_geometry(panel, &maximized) < 0 ||
+        click_internal_maximize_button(panel) < 0 ||
+        wait_for_frame_geometry(panel, &right) < 0) {
+        report_frame_geometry(
+            "maximizing snapped Control Panel did not restore its prior snap",
+            panel);
+        return -1;
+    }
+
+    if (drag_internal_back_to_geometry(panel, &panel_original) < 0) {
+        report_frame_geometry(
+            "dragging Control Panel out of snap did not restore it", panel);
+        return -1;
+    }
+    send_button_one(applications_icon);
+    if (wait_for_focus_window(launcher) < 0 ||
+        drag_internal_back_to_geometry(launcher, &launcher_original) < 0) {
+        report_frame_geometry(
+            "dragging Applications out of snap did not restore it", launcher);
+        return -1;
+    }
+    if (!internal_window_remains_viewable(launcher) ||
+        !internal_window_remains_viewable(panel)) {
+        fprintf(stderr,
+                "wm-probe: internal layout operations closed a window\n");
+        return -1;
+    }
+    return 0;
 }
 
 static unsigned long root_pixel_at(int x, int y)
@@ -1362,21 +2149,26 @@ static int verify_control_panel(Window client, const char *wifi_marker,
 
     send_button_one(applications_icon);
     launcher = wait_for_role("applications-window", None, 1);
-    if (launcher == None || !internal_window_is_hidden(panel)) {
+    if (launcher == None || !internal_window_remains_viewable(panel) ||
+        !internal_window_remains_viewable(launcher)) {
         fprintf(stderr,
-                "wm-probe: Applications and Control Panel were visible together\n");
+                "wm-probe: Applications and Control Panel did not coexist\n");
         return -1;
     }
     send_escape(launcher);
-    if (!internal_window_is_hidden(launcher)) {
-        fprintf(stderr, "wm-probe: Applications did not close during panel test\n");
+    if (!internal_window_remains_viewable(launcher) ||
+        !internal_window_remains_viewable(panel)) {
+        fprintf(stderr,
+                "wm-probe: Escape closed an internal window during panel test\n");
         return -1;
     }
-
-    send_button_one(control_icon);
-    panel = wait_for_role("control-panel-window", None, 1);
-    if (panel == None)
+    if (verify_internal_focus_state_regressions(
+            client, applications_icon, launcher, panel) < 0)
         return -1;
+    if (verify_internal_window_layouts(applications_icon, control_icon,
+                                       launcher, panel) < 0)
+        return -1;
+
     original_pixel = root_pixel_at(sample_x, sample_y);
     send_button_one_at(panel, 50, 155);
     send_button_one_at(panel, 205, 165);
@@ -1404,19 +2196,17 @@ static int verify_control_panel(Window client, const char *wifi_marker,
         return -1;
     }
 
-    if (fake_click_at(150, 100) < 0 ||
-        !internal_window_is_hidden(panel) || wait_for_active_client(client) < 0) {
+    if (fake_click_at(150, 100) < 0 || wait_for_active_client(client) < 0 ||
+        !internal_window_remains_viewable(panel) ||
+        !internal_window_remains_viewable(launcher)) {
         fprintf(stderr,
-                "wm-probe: clicking a client did not dismiss and lower Control Panel\n");
+                "wm-probe: focusing a client dismissed an internal window\n");
         return -1;
     }
-    send_button_one(control_icon);
-    panel = wait_for_role("control-panel-window", None, 1);
-    if (panel == None)
-        return -1;
     send_escape(panel);
-    if (!internal_window_is_hidden(panel)) {
-        fprintf(stderr, "wm-probe: Escape did not close Control Panel\n");
+    if (!internal_window_remains_viewable(panel) ||
+        !internal_window_remains_viewable(launcher)) {
+        fprintf(stderr, "wm-probe: Escape closed Control Panel\n");
         return -1;
     }
     return 0;
@@ -1428,6 +2218,7 @@ int main(void)
     Window icon;
     Window applications_icon;
     Window launcher;
+    Window control_panel;
     Atom supporting;
     Atom delete_window;
     Atom change_state;
@@ -1443,6 +2234,12 @@ int main(void)
     }
     root = DefaultRootWindow(display);
     wm_state_atom = XInternAtom(display, "WM_STATE", False);
+    net_wm_state_atom = XInternAtom(display, "_NET_WM_STATE", False);
+    hidden_atom = XInternAtom(display, "_NET_WM_STATE_HIDDEN", False);
+    maximized_horz_atom =
+        XInternAtom(display, "_NET_WM_STATE_MAXIMIZED_HORZ", False);
+    maximized_vert_atom =
+        XInternAtom(display, "_NET_WM_STATE_MAXIMIZED_VERT", False);
     role_atom = XInternAtom(display, "_WIN31X_ROLE", False);
     client_atom = XInternAtom(display, "_WIN31X_CLIENT", False);
     supporting = XInternAtom(display, "_NET_SUPPORTING_WM_CHECK", False);
@@ -1462,13 +2259,15 @@ int main(void)
         return 1;
     if (verify_client_stack_requests() < 0)
         return 1;
-    if (verify_map_dismisses_launcher() < 0)
+    if (verify_map_preserves_launcher() < 0)
         return 1;
     if (verify_resize_increment_minimum() < 0)
         return 1;
     if (verify_window_gravity() < 0)
         return 1;
     if (verify_synthetic_configure_geometry() < 0)
+        return 1;
+    if (verify_maximize_and_snap() < 0)
         return 1;
     if (verify_click_to_raise(change_state) < 0)
         return 1;
@@ -1517,10 +2316,11 @@ int main(void)
         fprintf(stderr, "wm-probe: Applications desktop icon was not found\n");
         return 1;
     }
-    send_button_one(applications_icon);
     launcher = wait_for_role("applications-window", None, 1);
-    if (launcher == None) {
-        fprintf(stderr, "wm-probe: Applications window did not open\n");
+    control_panel = wait_for_role("control-panel-window", None, 1);
+    if (launcher == None || control_panel == None) {
+        fprintf(stderr,
+                "wm-probe: internal windows did not remain open for launch test\n");
         return 1;
     }
     send_button_one_at(launcher, 50, 50);
@@ -1529,19 +2329,43 @@ int main(void)
         fprintf(stderr, "wm-probe: launcher did not start its selected application\n");
         return 1;
     }
-    if (!internal_window_is_hidden(launcher)) {
-        fprintf(stderr, "wm-probe: Applications window stayed open after launch\n");
+    if (!internal_window_remains_viewable(launcher) ||
+        !internal_window_remains_viewable(control_panel)) {
+        fprintf(stderr,
+                "wm-probe: launching an application closed an internal window\n");
+        return 1;
+    }
+    send_escape(launcher);
+    send_escape(control_panel);
+    if (!internal_window_remains_viewable(launcher) ||
+        !internal_window_remains_viewable(control_panel)) {
+        fprintf(stderr, "wm-probe: Escape closed an internal window\n");
+        return 1;
+    }
+
+    if (click_internal_close_button(launcher) < 0 ||
+        !internal_window_is_hidden(launcher) ||
+        !internal_window_remains_viewable(control_panel)) {
+        fprintf(stderr,
+                "wm-probe: Applications X did not close only Applications\n");
         return 1;
     }
     send_button_one(applications_icon);
     launcher = wait_for_role("applications-window", None, 1);
-    if (launcher == None) {
-        fprintf(stderr, "wm-probe: Applications window did not reopen\n");
+    if (launcher == None || !internal_window_remains_viewable(control_panel)) {
+        fprintf(stderr, "wm-probe: Applications window did not reopen alone\n");
         return 1;
     }
-    send_escape(launcher);
-    if (!internal_window_is_hidden(launcher)) {
-        fprintf(stderr, "wm-probe: Escape did not close Applications window\n");
+    if (click_internal_close_button(control_panel) < 0 ||
+        !internal_window_is_hidden(control_panel) ||
+        !internal_window_remains_viewable(launcher)) {
+        fprintf(stderr,
+                "wm-probe: Control Panel X did not close only Control Panel\n");
+        return 1;
+    }
+    if (click_internal_close_button(launcher) < 0 ||
+        !internal_window_is_hidden(launcher)) {
+        fprintf(stderr, "wm-probe: Applications X did not close Applications\n");
         return 1;
     }
 

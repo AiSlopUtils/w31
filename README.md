@@ -7,13 +7,17 @@ window manager in a Debian Xorg session.
 The current implementation includes:
 
 - Windows 3.1-inspired beveled frames, title bars, move/resize, click-to-focus
-  and raise, close, and minimize controls. Transient dialogs stay above their
-  owning application.
+  and raise, close, minimize, and maximize/restore controls. Dragging a title
+  bar to the left or right screen edge snaps the window to that half of the
+  desktop. Transient dialogs stay above their owning application.
 - A real desktop icon for every minimized client. One click maps, raises, and
   focuses that application again.
 - A permanent **Applications** desktop icon. It opens a keyboard- and
   mouse-driven window containing the visible applications installed through
-  freedesktop `.desktop` entries.
+  freedesktop `.desktop` entries. Applications and Control Panel are persistent
+  windows: they can coexist, remain open when focus moves or a program starts,
+  maximize or snap like application windows, and close explicitly with their
+  `X` button or Alt+F4.
 - A permanent **Control Panel** desktop icon with three sections:
   **Wi-Fi** scans, connects, and disconnects through NetworkManager;
   **Colors** applies and remembers one of five desktop/title-bar schemes; and
@@ -85,18 +89,21 @@ The desktop starts with Classic Teal unless another saved scheme exists. Click
 **Applications** once, then double-click a program to start it. Minimize a
 program with the underscore button; its icon appears along the bottom of the
 desktop and restores it with one click. Click **Control Panel** once to manage
-Wi-Fi, colors, and screen locking.
+Wi-Fi, colors, and screen locking. Applications and Control Panel remain open
+when you focus another window or start a program, and they can be open at the
+same time; close either one with its `X` button or Alt+F4.
 
 Controls:
 
 | Action | Control |
 | --- | --- |
 | Move / resize | Drag a title bar / outer frame edge |
-| Minimize / close | `_` / `X` title-bar button |
+| Snap left / right | Drag a title bar to the left / right screen edge |
+| Minimize / maximize or restore / close | `_` / maximize-restore / `X` title-bar button |
 | Restore minimized app | Click its desktop icon |
 | Applications | Click its desktop icon or press Alt+F2 |
 | Control Panel | Click its desktop icon |
-| Launcher navigation | Arrows, Page Up/Down, Enter, Escape, mouse wheel |
+| Launcher navigation | Arrows, Page Up/Down, Enter, mouse wheel |
 | Wi-Fi | Refresh, select a network, enter its password if required, then Connect |
 | Change colors | Select Colors, then click a color scheme |
 | Auto lock | Select Auto Lock, toggle it, choose a timeout, or click Lock Now |
@@ -121,6 +128,8 @@ pointer input to exercise the actual window-manager state machine:
 - keep transient dialogs above their owners and minimize/restore the family
   through one desktop icon;
 - honor client Above/Below stack requests without breaking transient order;
+- maximize and restore a client without losing its previous geometry, and snap
+  title-bar drags to the left and right halves of the screen;
 - enforce minimum sizes even with pathological resize increments;
 - validate default, centered, southeast, static, and dynamically changed
   window gravity, bordered synthetic geometry, and shift-free withdrawal;
@@ -128,16 +137,19 @@ pointer input to exercise the actual window-manager state machine:
   `_NET_CLIENT_LIST` ordering;
 - minimize through `WM_CHANGE_STATE`, find the mapped desktop icon, and restore
   by clicking;
-- open the Applications window and actually launch a test desktop entry;
-- open the Control Panel and verify that it and Applications are mutually
-  exclusive;
+- open the Applications window and actually launch a test desktop entry while
+  keeping the launcher open;
+- keep Applications and Control Panel mapped together across focus changes and
+  newly mapped clients, ignore Escape, and close only the selected internal
+  window through its `X` button;
 - change and persist a color scheme, scan and connect to a simulated secured
   Wi-Fi network, and invoke Lock Now;
 - verify that both idle and Lock Now locker processes receive asterisk password
   feedback without changing the window manager's environment;
 - verify that Wi-Fi passwords are masked, passed outside the process argument
   list, and absent from window-manager logs;
-- dismiss the launcher and activate a newly mapped client;
+- activate and raise a newly mapped client without dismissing Applications or
+  Control Panel;
 - withdraw and correctly unmanage a client; and
 - reject a second window manager on the same display.
 
@@ -206,7 +218,9 @@ Their exact archive paths, chosen resolutions, checksums, and licensing caveat
 are recorded in [`assets/icons/README.md`](assets/icons/README.md); Win31 X does
 not draw a replacement application icon when those assets are unavailable.
 
-This first version intentionally does not implement maximization, virtual
-desktops, tiling, compositing, multi-monitor placement, a taskbar, file-manager
-desktop items, or restoration of client windows across login sessions. Those
-can be layered on without changing the core minimized-icon model.
+This first version provides maximize/restore and left/right screen-edge snap,
+but intentionally does not implement virtual desktops, general-purpose tiling
+or layout automation, compositing, multi-monitor placement, a taskbar,
+file-manager desktop items, or restoration of client windows across login
+sessions. Those can be layered on without changing the core minimized-icon
+model.

@@ -13,6 +13,8 @@ manager in an Xorg session.  It draws classic beveled frames, places minimized
 applications on the desktop as clickable icons, and provides an Applications
 desktop icon backed by installed freedesktop desktop entries.  A Control Panel
 desktop icon provides Wi-Fi, color-scheme, and automatic screen-lock settings.
+Managed applications have maximize/restore controls and can be snapped to the
+left or right half of the screen by dragging their title bar to that edge.
 .SH OPTIONS
 .TP
 .BR --display " " DISPLAY
@@ -28,7 +30,8 @@ Show the program version.
 .SH DESKTOP CONTROLS
 Click the Applications icon once to open the launcher.  Select an application
 with the pointer or arrow keys and double-click it, or press Enter, to start it.
-Escape closes the launcher.  The mouse wheel and Page Up/Page Down scroll it.
+The mouse wheel and Page Up/Page Down scroll it.  Starting an application does
+not close the launcher.
 .PP
 Click the Control Panel icon once to open it.  Wi-Fi can refresh the visible
 NetworkManager networks, connect to a selected open or personal WPA/SAE
@@ -37,9 +40,18 @@ and active-title schemes immediately.  Auto Lock can enable or disable idle
 locking, select a 1, 5, 10, 15, 30, 60, or 120 minute preset, or lock
 immediately.  Color and auto-lock changes are saved automatically.
 .PP
+Applications and Control Panel can remain open at the same time.  They stay
+mapped when another window takes focus or a new application starts; Escape does
+not close them.  Use the window's X button, or the standard Alt+F4 binding, to
+close the active one explicitly.  Their maximize/restore buttons and title-bar
+edge snapping work like those on managed applications.
+.PP
 Use the underscore button in a title bar to minimize a window.  Its desktop
-icon restores it with one click.  Drag a title bar to move a window, drag an
-outer border to resize it, and use the X button to request that it close.
+icon restores it with one click.  Use the maximize/restore title-bar button to
+fill the screen and return to the window's previous geometry.  Drag a title bar
+to move a window, or release it at the left or right screen edge to snap it to
+that half of the screen.  Drag an outer border to resize it, and use the X
+button to request that it close.
 Clicking any inactive application focuses and raises it; transient dialogs
 remain above their owning application.  The activating pointer press is also
 delivered to the application.
@@ -52,7 +64,7 @@ Focus and raise the next visible application.
 Open the Applications window.
 .TP
 .B Alt+F4
-Close the active application.
+Close the active application, Applications window, or Control Panel.
 .SH ENVIRONMENT
 .TP
 .B DISPLAY

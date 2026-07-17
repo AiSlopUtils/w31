@@ -25,5 +25,9 @@ win31x (0.1.0) unstable; urgency=medium
   * Fail fast when X11, libpng, or XTEST build dependencies are missing, keep
     mandatory linker and sanitizer flags under common make overrides, and add
     clean Debian CI coverage for those failure modes.
+  * Add maximize/restore controls and left/right screen-edge snap for managed
+    clients, Applications, and Control Panel, including EWMH maximize state.
+  * Keep Applications and Control Panel mapped independently across focus
+    changes and launches until explicitly closed with X or Alt+F4.
 
  -- Win31 X maintainers <maintainers@win31x.invalid>  Fri, 17 Jul 2026 12:00:00 +0800
