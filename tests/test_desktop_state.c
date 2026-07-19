@@ -203,6 +203,7 @@ static void check_default_state(const Win31xDesktopState *state,
     CHECK(!state->launcher.valid);
     CHECK(!state->control_panel.valid);
     CHECK(!state->run_dialog.valid);
+    CHECK(!state->task_manager.valid);
     CHECK(state->applications_icon.layout ==
           WIN31X_DESKTOP_LAYOUT_NORMAL);
     CHECK(state->control_panel_icon.layout ==
@@ -210,6 +211,7 @@ static void check_default_state(const Win31xDesktopState *state,
     CHECK(state->launcher.layout == WIN31X_DESKTOP_LAYOUT_NORMAL);
     CHECK(state->control_panel.layout == WIN31X_DESKTOP_LAYOUT_NORMAL);
     CHECK(state->run_dialog.layout == WIN31X_DESKTOP_LAYOUT_NORMAL);
+    CHECK(state->task_manager.layout == WIN31X_DESKTOP_LAYOUT_NORMAL);
     CHECK(state->applications_icon.layout_before_maximize ==
           WIN31X_DESKTOP_LAYOUT_NORMAL);
     CHECK(state->control_panel_icon.layout_before_maximize ==
@@ -219,6 +221,8 @@ static void check_default_state(const Win31xDesktopState *state,
     CHECK(state->control_panel.layout_before_maximize ==
           WIN31X_DESKTOP_LAYOUT_NORMAL);
     CHECK(state->run_dialog.layout_before_maximize ==
+          WIN31X_DESKTOP_LAYOUT_NORMAL);
+    CHECK(state->task_manager.layout_before_maximize ==
           WIN31X_DESKTOP_LAYOUT_NORMAL);
     CHECK(state->client_count == 0U);
     CHECK(state->write_enabled == write_enabled);
@@ -304,6 +308,10 @@ static void test_round_trip_and_permissions(const char *root)
         WIN31X_DESKTOP_LAYOUT_SNAPPED_RIGHT;
     saved.run_dialog = placement("DP-3", 2000, 600, -155, 77, 420, 180,
                                  WIN31X_DESKTOP_LAYOUT_NORMAL);
+    saved.task_manager = placement("DP-4", 3000, -100, 123, -45, 700, 520,
+                                   WIN31X_DESKTOP_LAYOUT_MAXIMIZED);
+    saved.task_manager.layout_before_maximize =
+        WIN31X_DESKTOP_LAYOUT_SNAPPED_LEFT;
     CHECK(win31x_desktop_state_upsert_client(
               &saved, first_identity,
               &(Win31xDesktopPlacement){
@@ -336,8 +344,12 @@ static void test_round_trip_and_permissions(const char *root)
     CHECK(win31x_desktop_state_save(&saved) == 0);
     CHECK(read_text(state_path, serialized_contents,
                     sizeof(serialized_contents)) == 0);
-    CHECK(strstr(serialized_contents, "\nversion 2\n") != NULL);
+    CHECK(strstr(serialized_contents, "\nversion 3\n") != NULL);
+    CHECK(strstr(serialized_contents, "\nversion 2\n") == NULL);
     CHECK(strstr(serialized_contents, "\nversion 1\n") == NULL);
+    CHECK(strstr(serialized_contents,
+                 "\ntask_manager 1 44502d34 3000 -100 123 -45 "
+                 "700 520 1 2\n") != NULL);
     CHECK(stat(state_directory, &status) == 0);
     CHECK((status.st_mode & (mode_t)0777) == (mode_t)0700);
     CHECK(stat(state_path, &status) == 0);
@@ -351,6 +363,7 @@ static void test_round_trip_and_permissions(const char *root)
     CHECK(placement_equal(&loaded.launcher, &saved.launcher));
     CHECK(placement_equal(&loaded.control_panel, &saved.control_panel));
     CHECK(placement_equal(&loaded.run_dialog, &saved.run_dialog));
+    CHECK(placement_equal(&loaded.task_manager, &saved.task_manager));
     CHECK(loaded.write_enabled);
     CHECK(loaded.client_count == 2U);
     client = win31x_desktop_state_find_client(&loaded, first_identity);
@@ -402,6 +415,70 @@ static void test_missing_legacy_layout(const char *root)
     CHECK(rmdir(config_root) == 0);
 }
 
+static void test_schema_migration(const char *root)
+{
+    char config_root[TEST_PATH_CAPACITY];
+    char state_directory[TEST_PATH_CAPACITY];
+    char state_path[TEST_PATH_CAPACITY];
+    char disk_contents[TEST_CONTENT_CAPACITY];
+    Win31xDesktopState state;
+    static const char version_one_contents[] =
+        "version 1\n"
+        "launcher 1 44502d31 640 400 11 22 600 450 2\n";
+    static const char version_two_contents[] =
+        "version 2\n"
+        "run_dialog 1 44502d32 1280 720 -31 42 420 180 3 2\n";
+
+    CHECK(create_area(root, "schema-migration", config_root,
+                      state_directory, state_path) == 0);
+
+    CHECK(write_text(state_path, version_one_contents) == 0);
+    CHECK(win31x_desktop_state_load(&state) == 0);
+    CHECK(state.write_enabled);
+    CHECK(state.launcher.valid);
+    CHECK(strcmp(state.launcher.monitor_name, "DP-1") == 0);
+    CHECK(state.launcher.relative_x == 11);
+    CHECK(state.launcher.layout == WIN31X_DESKTOP_LAYOUT_SNAPPED_LEFT);
+    CHECK(state.launcher.layout_before_maximize ==
+          WIN31X_DESKTOP_LAYOUT_NORMAL);
+    CHECK(!state.task_manager.valid);
+    CHECK(state.task_manager.layout == WIN31X_DESKTOP_LAYOUT_NORMAL);
+    CHECK(state.task_manager.layout_before_maximize ==
+          WIN31X_DESKTOP_LAYOUT_NORMAL);
+    CHECK(win31x_desktop_state_save(&state) == 0);
+    CHECK(read_text(state_path, disk_contents, sizeof(disk_contents)) == 0);
+    CHECK(strstr(disk_contents, "\nversion 3\n") != NULL);
+    CHECK(strstr(disk_contents, "\nversion 2\n") == NULL);
+    CHECK(strstr(disk_contents, "\nversion 1\n") == NULL);
+    CHECK(strstr(disk_contents,
+                 "\ntask_manager 0 - 0 0 0 0 0 0 0 0\n") != NULL);
+
+    CHECK(write_text(state_path, version_two_contents) == 0);
+    CHECK(win31x_desktop_state_load(&state) == 0);
+    CHECK(state.write_enabled);
+    CHECK(state.run_dialog.valid);
+    CHECK(strcmp(state.run_dialog.monitor_name, "DP-2") == 0);
+    CHECK(state.run_dialog.relative_x == -31);
+    CHECK(state.run_dialog.layout ==
+          WIN31X_DESKTOP_LAYOUT_SNAPPED_RIGHT);
+    CHECK(state.run_dialog.layout_before_maximize ==
+          WIN31X_DESKTOP_LAYOUT_SNAPPED_LEFT);
+    CHECK(!state.task_manager.valid);
+    CHECK(state.task_manager.layout == WIN31X_DESKTOP_LAYOUT_NORMAL);
+    CHECK(state.task_manager.layout_before_maximize ==
+          WIN31X_DESKTOP_LAYOUT_NORMAL);
+    CHECK(win31x_desktop_state_save(&state) == 0);
+    CHECK(read_text(state_path, disk_contents, sizeof(disk_contents)) == 0);
+    CHECK(strstr(disk_contents, "\nversion 3\n") != NULL);
+    CHECK(strstr(disk_contents, "\nversion 2\n") == NULL);
+    CHECK(strstr(disk_contents,
+                 "\ntask_manager 0 - 0 0 0 0 0 0 0 0\n") != NULL);
+
+    CHECK(unlink(state_path) == 0);
+    CHECK(rmdir(state_directory) == 0);
+    CHECK(rmdir(config_root) == 0);
+}
+
 static void test_malformed_independent_records_and_version(const char *root)
 {
     char config_root[TEST_PATH_CAPACITY];
@@ -411,8 +488,8 @@ static void test_malformed_independent_records_and_version(const char *root)
     Win31xDesktopState state;
     const Win31xDesktopClientRecord *client;
     static const char future_contents[] =
-        "version 3\n"
-        "applications_icon 1 - 0 0 1 2 48 48 0\n"
+        "version 4\n"
+        "task_manager 1 44502d39 100 200 1 2 700 500 0 0\n"
         "future_only_record do-not-discard-this\n";
     static const char supported_contents[] =
         "# records before or after version are accepted\n"
@@ -468,7 +545,8 @@ static void test_malformed_independent_records_and_version(const char *root)
     }
     CHECK(win31x_desktop_state_save(&state) == 0);
     CHECK(read_text(state_path, disk_contents, sizeof(disk_contents)) == 0);
-    CHECK(strstr(disk_contents, "\nversion 2\n") != NULL);
+    CHECK(strstr(disk_contents, "\nversion 3\n") != NULL);
+    CHECK(strstr(disk_contents, "\nversion 2\n") == NULL);
     CHECK(strstr(disk_contents, "\nversion 1\n") == NULL);
 
     CHECK(write_text(state_path,
@@ -787,6 +865,7 @@ int main(void)
     test_defaults_and_validation();
     test_round_trip_and_permissions(root);
     test_missing_legacy_layout(root);
+    test_schema_migration(root);
     test_malformed_independent_records_and_version(root);
     test_overflow_dimensions_and_encoded_lengths(root);
     test_client_upsert_replace_and_capacity();

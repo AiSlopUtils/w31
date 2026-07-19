@@ -24,6 +24,7 @@
 #define DESKTOP_STATE_TEMP_ATTEMPTS 128U
 #define DESKTOP_STATE_TOKEN_MAX 12U
 #define DESKTOP_STATE_LEGACY_VERSION 1U
+#define DESKTOP_STATE_PREVIOUS_VERSION 2U
 
 static unsigned long desktop_state_temp_sequence;
 
@@ -59,6 +60,7 @@ void win31x_desktop_state_defaults(Win31xDesktopState *state)
     state->launcher.layout = WIN31X_DESKTOP_LAYOUT_NORMAL;
     state->control_panel.layout = WIN31X_DESKTOP_LAYOUT_NORMAL;
     state->run_dialog.layout = WIN31X_DESKTOP_LAYOUT_NORMAL;
+    state->task_manager.layout = WIN31X_DESKTOP_LAYOUT_NORMAL;
     state->write_enabled = true;
 }
 
@@ -374,6 +376,7 @@ static bool unsigned_decimal_syntax(const char *text)
 static bool desktop_state_version_is_supported(uintmax_t version)
 {
     return version == (uintmax_t)DESKTOP_STATE_LEGACY_VERSION ||
+           version == (uintmax_t)DESKTOP_STATE_PREVIOUS_VERSION ||
            version == (uintmax_t)WIN31X_DESKTOP_STATE_VERSION;
 }
 
@@ -634,6 +637,9 @@ static void parse_desktop_state(Win31xDesktopState *state, char *contents)
             } else if (strcmp(tokens[0], "run_dialog") == 0) {
                 parse_fixed_record(&candidate.run_dialog, tokens,
                                    token_count);
+            } else if (strcmp(tokens[0], "task_manager") == 0) {
+                parse_fixed_record(&candidate.task_manager, tokens,
+                                   token_count);
             } else if (strcmp(tokens[0], "client") == 0) {
                 parse_client_record(&candidate, tokens, token_count);
             }
@@ -840,7 +846,9 @@ static int serialize_desktop_state(const Win31xDesktopState *state,
         append_placement(contents, capacity, &used, "control_panel",
                          &state->control_panel) < 0 ||
         append_placement(contents, capacity, &used, "run_dialog",
-                         &state->run_dialog) < 0)
+                         &state->run_dialog) < 0 ||
+        append_placement(contents, capacity, &used, "task_manager",
+                         &state->task_manager) < 0)
         return -1;
     for (client_index = 0U; client_index < state->client_count;
          ++client_index) {

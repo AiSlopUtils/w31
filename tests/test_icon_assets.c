@@ -56,6 +56,8 @@ static void test_loaded_assets(void)
                           ICON_SIZE_LARGE)->width == 48);
     CHECK(icon_assets_get(&assets, ICON_CATEGORY_CLOCK,
                           ICON_SIZE_LARGE)->width == 32);
+    CHECK(icon_assets_get(&assets, ICON_CATEGORY_TASK_MANAGER,
+                          ICON_SIZE_LARGE)->width == 32);
     icon_assets_free(&assets);
     CHECK(icon_assets_directory(&assets) == NULL);
 }
@@ -90,6 +92,8 @@ static void test_classification(void)
           ICON_CATEGORY_NETWORK);
     CHECK(icon_assets_classify("Control Panel", "preferences", "settings") ==
           ICON_CATEGORY_SETTINGS);
+    CHECK(icon_assets_classify("Task Manager", "computer_taskmgr", NULL) ==
+          ICON_CATEGORY_TASK_MANAGER);
     CHECK(icon_assets_classify("Manual", "help", "yelp") ==
           ICON_CATEGORY_HELP);
     CHECK(icon_assets_classify("Unknown program", "unknown", "/bin/true") ==

@@ -34,10 +34,10 @@ endif
 
 WM_SOURCES = src/win31x.c src/applications.c src/app_icons.c src/auto_lock.c \
 	src/desktop_state.c src/icon_assets.c src/session_actions.c src/settings.c \
-	src/wifi_backend.c
+	src/task_manager_data.c src/wifi_backend.c
 WM_HEADERS = src/applications.h src/app_icons.h src/auto_lock.h \
 	src/desktop_state.h src/icon_assets.h src/session_actions.h src/settings.h \
-	src/wifi_backend.h
+	src/task_manager_data.h src/wifi_backend.h
 ICON_FILES = $(notdir $(wildcard assets/icons/*.png))
 ICON_DIR_STAMP = $(BUILD_DIR)/.icon-dir
 
@@ -131,6 +131,12 @@ $(BUILD_DIR)/test-session-actions: tests/test_session_actions.c \
 		$(WIN31X_LDFLAGS) tests/test_session_actions.c \
 		src/session_actions.c src/applications.c -o $@
 
+$(BUILD_DIR)/test-task-manager-data: tests/test_task_manager_data.c \
+		src/task_manager_data.c src/task_manager_data.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) $(WIN31X_CFLAGS) $(LDFLAGS) \
+		$(WIN31X_LDFLAGS) tests/test_task_manager_data.c \
+		src/task_manager_data.c -o $@
+
 $(BUILD_DIR)/test-wifi-backend: tests/test_wifi_backend.c src/wifi_backend.c \
 		src/wifi_backend.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) $(WIN31X_CFLAGS) $(LDFLAGS) \
@@ -160,6 +166,7 @@ check: $(BUILD_DIR)/test-applications $(BUILD_DIR)/test-app-icons \
 	$(BUILD_DIR)/test-settings $(BUILD_DIR)/test-desktop-state \
 	$(BUILD_DIR)/test-auto-lock \
 	$(BUILD_DIR)/test-session-actions \
+	$(BUILD_DIR)/test-task-manager-data \
 	$(BUILD_DIR)/test-wifi-backend
 	$(BUILD_DIR)/test-applications
 	$(BUILD_DIR)/test-app-icons
@@ -168,18 +175,19 @@ check: $(BUILD_DIR)/test-applications $(BUILD_DIR)/test-app-icons \
 	$(BUILD_DIR)/test-desktop-state
 	$(BUILD_DIR)/test-auto-lock
 	$(BUILD_DIR)/test-session-actions
+	$(BUILD_DIR)/test-task-manager-data
 	$(BUILD_DIR)/test-wifi-backend
 	./tests/check-icon-provenance.sh
 
 smoke: all $(BUILD_DIR)/wm-probe $(BUILD_DIR)/preexisting-client \
 	$(BUILD_DIR)/test-auto-lock $(BUILD_DIR)/test-session-actions \
-	$(BUILD_DIR)/test-wifi-backend
+	$(BUILD_DIR)/test-task-manager-data $(BUILD_DIR)/test-wifi-backend
 	./tests/smoke-x11.sh
 
 smoke-xvfb: all $(BUILD_DIR)/wm-probe $(BUILD_DIR)/preexisting-client \
 	$(BUILD_DIR)/persistence-probe \
 	$(BUILD_DIR)/test-auto-lock $(BUILD_DIR)/test-session-actions \
-	$(BUILD_DIR)/test-wifi-backend \
+	$(BUILD_DIR)/test-task-manager-data $(BUILD_DIR)/test-wifi-backend \
 	check-xvfb-deps
 	xvfb-run -a -s "-screen 0 1024x768x24" ./tests/smoke-x11.sh
 	WIN31X_TEST_MONITORS='800x600+0+0,800x600+800+100' \
@@ -188,7 +196,7 @@ smoke-xvfb: all $(BUILD_DIR)/wm-probe $(BUILD_DIR)/preexisting-client \
 
 smoke-multimon-xvfb: all $(BUILD_DIR)/wm-probe \
 	$(BUILD_DIR)/test-auto-lock $(BUILD_DIR)/test-session-actions \
-	$(BUILD_DIR)/test-wifi-backend \
+	$(BUILD_DIR)/test-task-manager-data $(BUILD_DIR)/test-wifi-backend \
 	check-xvfb-deps
 	WIN31X_TEST_MONITORS='800x600+0+0,800x600+800+100' \
 		xvfb-run -a -s "-screen 0 1600x700x24" ./tests/smoke-x11.sh

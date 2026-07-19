@@ -1,4 +1,4 @@
-.TH WIN31X 1 "July 18, 2026" "win31x 0.1.0" "User Commands"
+.TH WIN31X 1 "July 19, 2026" "win31x 0.1.0" "User Commands"
 .SH NAME
 win31x \- a minimal Windows 3.1-inspired window manager for X11
 .SH SYNOPSIS
@@ -13,6 +13,8 @@ manager in an Xorg session.  It draws classic beveled frames, places minimized
 applications on the desktop as clickable icons, and provides an Applications
 desktop icon backed by installed freedesktop desktop entries.  A Control Panel
 desktop icon provides Wi-Fi, color-scheme, and automatic screen-lock settings.
+Ctrl+Shift+Esc opens a Windows 98-style Task Manager with applications,
+processes, live performance graphs, and system information.
 Managed applications have maximize/restore controls and can be snapped to the
 left or right half of a monitor by dragging their title bar to that edge.
 Title-bar moves show a classic rubber-band outline and move the real window
@@ -21,7 +23,7 @@ and QEMU.
 Application entries and minimized clients use their real program icons when a
 usable desktop-entry Icon or _NET_WM_ICON value is available.
 Applications and Control Panel icon positions, Applications, Control Panel,
-and Run geometry,
+Task Manager, and Run geometry,
 managed application geometry, colors, and the selected Control Panel section
 are restored between logins.
 Right-clicking unused desktop space opens a session menu for locking, logging
@@ -84,6 +86,19 @@ vector directly; shell operators, redirection, pipelines, and substitutions
 are treated as literal text rather than evaluated.  Escape, Cancel, the X
 button, or Alt+F4 closes Run without affecting Applications or Control Panel.
 .PP
+Press Ctrl+Shift+Esc to open and focus Task Manager.  Repeating the shortcut
+raises the same window rather than creating another copy.  Its Applications
+tab lists managed X11 windows, including minimized applications, and provides
+New Task, Switch To, and End Task actions.  Processes shows live PID, CPU,
+resident-memory, and ownership information from Linux procfs.  Performance
+plots CPU and memory histories, while System shows the operating system,
+kernel, host, processor, logical CPU count, memory, uptime, load averages, and
+process count.  The view refreshes once per second; F5 refreshes it immediately.
+Use Ctrl+Tab or Left/Right to change tabs, arrows and Page Up/Page Down to move
+through a list, Enter to switch to an application, and Delete to invoke the
+current list's end action.  Escape cancels a pending End Process confirmation;
+close Task Manager with its X button or Alt+F4.
+.PP
 Use the underscore button in a title bar to minimize a window.  Its desktop
 icon appears on that window's monitor and restores it with one click.  Use the
 maximize/restore title-bar button to fill the window's current monitor and
@@ -105,7 +120,11 @@ Focus and raise the next visible application.
 Open the Applications window.
 .TP
 .B Alt+F4
-Close the active application, Applications window, Control Panel, or Run.
+Close the active application, Applications window, Control Panel, Task
+Manager, or Run.
+.TP
+.B Ctrl+Shift+Esc
+Open and focus Task Manager.
 .TP
 .B Windows+R, Super+R
 Open and focus the Run dialog.
@@ -154,6 +173,12 @@ an invalid override disables both actions.
 Determine the location of the per-user Win31 X settings and layout files.
 .SH FILES
 .TP
+.I /proc
+Linux kernel and process statistics used by Task Manager.
+.TP
+.I /etc/os-release
+Operating-system label shown by Task Manager when available.
+.TP
 .I /usr/share/applications/*.desktop
 System application entries.
 .TP
@@ -184,6 +209,33 @@ is unset, the path is
 Managed windows are identified by application ID, desktop-file ID, or
 WM_CLASS, with WM_WINDOW_ROLE used when available.  Otherwise-identical
 concurrent windows use best-effort ordinal slots.
+.SH TASK MANAGER
+Task Manager reads Linux
+.I /proc
+directly and does not invoke
+.BR ps (1)
+or a shell.  Aggregate CPU use and per-process CPU use are calculated between
+successive samples.  Processes are matched by both PID and kernel start time,
+so a reused PID does not inherit another process's history or selection.  The
+sampler reads only the required per-process stat and status data and stops at
+16,384 accepted rows; the status bar labels that bounded result as truncated.
+.PP
+End Task asks the selected X11 application to close normally when it supports
+the ICCCM close protocol.  End Process is restricted to processes owned by the
+real user running Win31 X.  PID 1, non-positive PIDs, the window manager itself,
+and processes belonging to another user cannot be signaled.  The backend
+rereads procfs immediately before signaling and verifies the PID's owner and
+kernel start time.  It sends SIGTERM and SIGKILL through a stable Linux pidfd;
+it never falls back to signaling a possibly reused numeric PID.  Process
+control is disabled with a clear in-window error when pidfds are unavailable
+or when sampling an alternate proc root.
+.PP
+The first End Process activation displays a warning.  Repeating it on the same
+process within the confirmation interval sends SIGTERM.  If that exact process
+remains alive after the grace period, Force End becomes available and repeats
+the identity and ownership checks before SIGKILL.  Force End can cause data
+loss and should be used only when normal termination does not work.  Neither
+operation elevates privileges or executes a shell.
 .SH CONTROL PANEL SERVICES
 Wi-Fi requires NetworkManager and
 .BR nmcli (1).
@@ -227,7 +279,8 @@ treats the root window as one monitor.
 .PP
 An action started with the pointer uses the monitor under its click or release.
 A keyboard action uses the monitor containing the focused Applications,
-Control Panel, Run, or managed-client window.  If none supplies that context,
+Control Panel, Task Manager, Run, or managed-client window.  If none supplies
+that context,
 the last active monitor is retained, followed by pointer and primary-monitor
 fallbacks.  The permanent Applications and Control Panel desktop icons begin
 on the primary monitor, but can be dragged to another monitor and retain that
@@ -237,24 +290,43 @@ monitor where that client was minimized.
 Maximize fills only the monitor containing the window.  Releasing a title bar
 at a monitor's left or right edge snaps the window to that monitor's
 corresponding half; restore returns its exact previous geometry.  Applications,
-Control Panel, and Run initially open centered on the active monitor; their
+Control Panel, Task Manager, and Run initially open centered on the active
+monitor; their
 saved geometry takes precedence on later logins.  The desktop menu
 is constrained to the monitor where it was opened, and its Log Out, Restart,
 or Shut Down confirmation is centered on that monitor.
 .PP
 RandR hotplug and screen-layout notifications refresh the monitor list.
 Maximized and snapped windows are reapplied, ordinary windows are kept
-reachable, and desktop icons, internal windows, Run, and an open confirmation
-are reflowed.  An item anchored to a disconnected monitor moves to the nearest
-surviving monitor, with the primary monitor as the final fallback.
+reachable, and desktop icons, internal windows, Task Manager, Run, and an open
+confirmation are reflowed.  An item anchored to a disconnected monitor moves
+to the nearest surviving monitor, with the primary monitor as the final
+fallback.
 This automatic rescue does not overwrite the saved preferred monitor.
 .SH DISPLAY REQUIREMENTS
 Multi-monitor discovery uses the XRandR and Xinerama extensions as described
 above.  The supplied-color icon renderer requires a TrueColor X visual.
 Standard modern Xorg configurations provide one.
+.PP
+Task Manager requires Linux procfs mounted at
+.IR /proc .
+Debian provides it by default; no additional Task Manager runtime package is
+required.  End Process and Force End additionally require Linux 5.3 or newer
+with usable
+.BR pidfd_open (2)
+and
+.BR pidfd_send_signal (2)
+support.  Monitoring remains available on older or restricted kernels.  System
+naming normally comes from
+.IR /etc/os-release .
 .SH SEE ALSO
 .BR Xorg (1),
 .BR xrandr (1),
+.BR proc (5),
+.BR os-release (5),
+.BR pidfd_open (2),
+.BR pidfd_send_signal (2),
+.BR signal (7),
 .BR nmcli (1),
 .BR xss-lock (1),
 .BR xsecurelock (1),

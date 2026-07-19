@@ -17,5 +17,7 @@ Description: minimal Windows 3.1-style window manager for X11
  Win31 X is a small reparenting window manager with classic beveled frames,
  desktop icons for minimized applications, and an installed-application
  launcher. Its Control Panel configures Wi-Fi, color schemes, and automatic
- screen locking, while Windows+R opens a shell-free Run dialog. It supports the
- essential ICCCM lifecycle and a focused EWMH subset.
+ screen locking, while Windows+R opens a shell-free Run dialog. Ctrl+Shift+Esc
+ opens a Windows 98-style Task Manager with live procfs performance data,
+ process control, and system information. It supports the essential ICCCM
+ lifecycle and a focused EWMH subset.

@@ -19,6 +19,7 @@ The PNG files below are byte-for-byte copies of the named archive members:
 | `mail-48.png`, `mail-16.png` | `windows98-icons/png/mailbox_world-2.png`, `mailbox_world-1.png` |
 | `graphics-48.png`, `graphics-16.png` | `windows98-icons/png/paint_file-5.png`, `paint_file-1.png` |
 | `media-48.png`, `media-16.png` | `windows98-icons/png/media_player_file-2.png`, `media_player_file-1.png` |
+| `task-manager-32.png`, `task-manager-16.png` | `windows98-icons/png/computer_taskmgr-0.png`, `computer_taskmgr-1.png` |
 | `settings-48.png`, `settings-16.png` | `windows98-icons/png/settings_gear-4.png`, `settings_gear-5.png` |
 | `network-48.png`, `network-16.png` | `windows98-icons/png/network_normal_two_pcs-4.png`, `network_normal_two_pcs-3.png` |
 | `games-48.png`, `games-16.png` | `windows98-icons/png/joystick-5.png`, `joystick-1.png` |

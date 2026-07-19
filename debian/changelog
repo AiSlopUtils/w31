@@ -50,5 +50,9 @@ win31x (0.1.0) unstable; urgency=medium
     Run geometry, managed application geometry, colors, and the selected
     Control Panel section in private, versioned per-user configuration files;
     preserve future schemas and safely bound malformed coordinates.
+  * Add a singleton Windows 98-style Task Manager on Ctrl+Shift+Esc with
+    Applications, Processes, Performance and System tabs, direct procfs CPU
+    and memory sampling, persistent monitor-aware geometry, and guarded
+    same-user process termination with explicit SIGTERM/SIGKILL escalation.
 
- -- Win31 X maintainers <maintainers@win31x.invalid>  Sat, 18 Jul 2026 12:00:00 +0800
+ -- Win31 X maintainers <maintainers@win31x.invalid>  Sun, 19 Jul 2026 12:00:00 +0800

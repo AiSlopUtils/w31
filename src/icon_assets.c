@@ -80,6 +80,10 @@ static const IconAssetDescriptor descriptors[ICON_CATEGORY_COUNT]
         [ICON_SIZE_SMALL] = {"media-16.png", 16, 16},
         [ICON_SIZE_LARGE] = {"media-48.png", 48, 48},
     },
+    [ICON_CATEGORY_TASK_MANAGER] = {
+        [ICON_SIZE_SMALL] = {"task-manager-16.png", 16, 16},
+        [ICON_SIZE_LARGE] = {"task-manager-32.png", 32, 32},
+    },
     [ICON_CATEGORY_SETTINGS] = {
         [ICON_SIZE_SMALL] = {"settings-16.png", 16, 16},
         [ICON_SIZE_LARGE] = {"settings-48.png", 48, 48},
@@ -1159,6 +1163,9 @@ typedef struct {
 static const ClassificationRule classification_rules[] = {
     {ICON_CATEGORY_APPLICATIONS,
      {"application-menu", "appfinder", "program group", NULL}},
+    {ICON_CATEGORY_TASK_MANAGER,
+     {"task manager", "task-manager", "taskmgr", "computer_taskmgr",
+      "system monitor", "system-monitor", NULL}},
     {ICON_CATEGORY_TERMINAL,
      {"terminal", "xterm", "uxterm", "console", "konsole", "alacritty",
       "kitty", "rxvt", "tilix", "shell", NULL}},

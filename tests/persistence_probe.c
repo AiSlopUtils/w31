@@ -44,6 +44,7 @@ static const Geometry control_icon_dual = {
 static const Geometry launcher_dual = {800, 100, 400, 600};
 static const Geometry panel_dual = {1200, 100, 400, 600};
 static const Geometry run_dual = {950, 180, 470, 176};
+static const Geometry task_manager_dual = {870, 160, 720, 520};
 static const Geometry client_dual = {
     1030, 330, 310 + FRAME_LEFT + FRAME_RIGHT,
     170 + FRAME_TOP + FRAME_BOTTOM
@@ -57,6 +58,7 @@ static const Geometry control_icon_single = {
 static const Geometry launcher_single = {0, 0, 320, 480};
 static const Geometry panel_single = {320, 0, 320, 480};
 static const Geometry run_single = {150, 80, 470, 176};
+static const Geometry task_manager_single = {0, 0, 640, 480};
 static const Geometry client_single = {
     230, 230, 310 + FRAME_LEFT + FRAME_RIGHT,
     170 + FRAME_TOP + FRAME_BOTTOM
@@ -95,6 +97,41 @@ static Display *display;
 static Window root;
 static Atom role_atom;
 static Atom supporting_atom;
+static int trapped_x_error;
+
+static int record_x_error(Display *error_display, XErrorEvent *event)
+{
+    (void)error_display;
+    trapped_x_error = event->error_code;
+    return 0;
+}
+
+static void reject_unexpected_x_error(void)
+{
+    char message[128];
+
+    if (trapped_x_error == 0 || trapped_x_error == BadWindow)
+        return;
+    XGetErrorText(display, trapped_x_error, message, (int)sizeof(message));
+    fprintf(stderr, "persistence-probe: unexpected X error: %s\n", message);
+    exit(EXIT_FAILURE);
+}
+
+static int get_window_attributes_safely(Window window,
+                                        XWindowAttributes *attributes)
+{
+    int (*previous_handler)(Display *, XErrorEvent *);
+    int result;
+
+    XSync(display, False);
+    trapped_x_error = 0;
+    previous_handler = XSetErrorHandler(record_x_error);
+    result = XGetWindowAttributes(display, window, attributes);
+    XSync(display, False);
+    (void)XSetErrorHandler(previous_handler);
+    reject_unexpected_x_error();
+    return trapped_x_error == 0 ? result : 0;
+}
 
 static void wait_a_bit(void)
 {
@@ -127,8 +164,8 @@ static int get_geometry(Window window, Geometry *geometry)
 {
     XWindowAttributes attributes;
 
-    if (geometry == NULL || !XGetWindowAttributes(display, window,
-                                                   &attributes))
+    if (geometry == NULL ||
+        !get_window_attributes_safely(window, &attributes))
         return -1;
     geometry->x = attributes.x;
     geometry->y = attributes.y;
@@ -177,10 +214,22 @@ static int role_matches(Window window, const char *role)
     unsigned long after;
     unsigned char *value = NULL;
     int matches = 0;
+    int property_status;
+    int (*previous_handler)(Display *, XErrorEvent *);
 
-    if (XGetWindowProperty(display, window, role_atom, 0, 128, False,
-                           AnyPropertyType, &type, &format, &count, &after,
-                           &value) == Success &&
+    /* Root children can disappear between XQueryTree and this property read.
+     * Treat that expected BadWindow race as a non-match without weakening the
+     * process-wide X error handler used by the rest of the probe. */
+    XSync(display, False);
+    trapped_x_error = 0;
+    previous_handler = XSetErrorHandler(record_x_error);
+    property_status = XGetWindowProperty(
+        display, window, role_atom, 0, 128, False, AnyPropertyType, &type,
+        &format, &count, &after, &value);
+    XSync(display, False);
+    (void)XSetErrorHandler(previous_handler);
+    reject_unexpected_x_error();
+    if (trapped_x_error == 0 && property_status == Success &&
         format == 8 && value != NULL && strlen(role) == count &&
         memcmp(value, role, count) == 0)
         matches = 1;
@@ -207,7 +256,7 @@ static Window find_role(const char *role, bool viewable)
         if (!role_matches(children[index], role))
             continue;
         if (viewable &&
-            (!XGetWindowAttributes(display, children[index], &attributes) ||
+            (!get_window_attributes_safely(children[index], &attributes) ||
              attributes.map_state != IsViewable))
             continue;
         result = children[index];
@@ -309,6 +358,25 @@ static int fake_key_chord(KeySym modifier, KeySym key)
         !XTestFakeKeyEvent(display, key_code, True, CurrentTime) ||
         !XTestFakeKeyEvent(display, key_code, False, CurrentTime) ||
         !XTestFakeKeyEvent(display, modifier_code, False, CurrentTime))
+        return -1;
+    XSync(display, False);
+    return 0;
+}
+
+static int fake_three_key_chord(KeySym first_modifier,
+                                KeySym second_modifier, KeySym key)
+{
+    KeyCode first_code = XKeysymToKeycode(display, first_modifier);
+    KeyCode second_code = XKeysymToKeycode(display, second_modifier);
+    KeyCode key_code = XKeysymToKeycode(display, key);
+
+    if (first_code == 0 || second_code == 0 || key_code == 0 ||
+        !XTestFakeKeyEvent(display, first_code, True, CurrentTime) ||
+        !XTestFakeKeyEvent(display, second_code, True, CurrentTime) ||
+        !XTestFakeKeyEvent(display, key_code, True, CurrentTime) ||
+        !XTestFakeKeyEvent(display, key_code, False, CurrentTime) ||
+        !XTestFakeKeyEvent(display, second_code, False, CurrentTime) ||
+        !XTestFakeKeyEvent(display, first_code, False, CurrentTime))
         return -1;
     XSync(display, False);
     return 0;
@@ -917,6 +985,13 @@ static Window open_run_dialog(void)
     return wait_for_role("run-window", true);
 }
 
+static Window open_task_manager(void)
+{
+    if (fake_three_key_chord(XK_Control_L, XK_Shift_L, XK_Escape) < 0)
+        return None;
+    return wait_for_role("task-manager-window", true);
+}
+
 static int verify_root_geometry(void)
 {
     Geometry actual;
@@ -937,6 +1012,7 @@ static int seed_state(void)
     Window launcher = None;
     Window panel = None;
     Window run = None;
+    Window task_manager = None;
     Window client;
     Window frame;
 
@@ -1014,6 +1090,19 @@ static int seed_state(void)
         else
             fprintf(stderr,
                     "persistence-probe: Windows+R did not open Run\n");
+        return -1;
+    }
+
+    task_manager = open_task_manager();
+    if (task_manager == None ||
+        drag_title_to_geometry(task_manager, &task_manager_dual) < 0 ||
+        wait_for_geometry(task_manager, &task_manager_dual) < 0) {
+        if (task_manager != None)
+            report_geometry("Task Manager move was not committed",
+                            task_manager, &task_manager_dual);
+        else
+            fprintf(stderr,
+                    "persistence-probe: Ctrl+Shift+Escape did not open Task Manager\n");
         return -1;
     }
 
@@ -1118,6 +1207,7 @@ static int verify_dual_state(bool verify_section)
     Window launcher = None;
     Window panel = None;
     Window run = None;
+    Window task_manager = None;
 
     if (wait_for_root_color("#1f4e79", 30, 580) < 0) {
         fprintf(stderr,
@@ -1162,6 +1252,14 @@ static int verify_dual_state(bool verify_section)
                             &run_dual);
         return -1;
     }
+    task_manager = open_task_manager();
+    if (task_manager == None ||
+        wait_for_geometry(task_manager, &task_manager_dual) < 0) {
+        if (task_manager != None)
+            report_geometry("saved Task Manager position was not restored",
+                            task_manager, &task_manager_dual);
+        return -1;
+    }
     if (verify_client(&client_dual, &dual_bounds, false) < 0)
         return -1;
     if (exercise_duplicate_clients(&duplicate_first_dual,
@@ -1191,6 +1289,7 @@ static int verify_single_state(void)
     Window launcher = None;
     Window panel = None;
     Window run = None;
+    Window task_manager = None;
 
     if (wait_for_root_color("#1f4e79", 20, 450) < 0) {
         fprintf(stderr,
@@ -1223,6 +1322,14 @@ static int verify_single_state(void)
                             &run_single);
         return -1;
     }
+    task_manager = open_task_manager();
+    if (task_manager == None ||
+        wait_for_geometry(task_manager, &task_manager_single) < 0) {
+        if (task_manager != None)
+            report_geometry("Task Manager was not clamped on one monitor",
+                            task_manager, &task_manager_single);
+        return -1;
+    }
     if (verify_client(&client_single, &single_bounds, true) < 0)
         return -1;
     if (exercise_duplicate_clients(&duplicate_first_single,
@@ -1238,6 +1345,7 @@ static int verify_extreme_state(void)
 {
     Window applications = wait_for_role("applications-icon", true);
     Window control = wait_for_role("control-panel-icon", true);
+    Window task_manager;
     Geometry geometry;
 
     if (applications == None || control == None ||
@@ -1247,6 +1355,13 @@ static int verify_extreme_state(void)
         !geometry_inside(&geometry, &dual_bounds)) {
         fprintf(stderr,
                 "persistence-probe: extreme saved coordinates were not safely clamped\n");
+        return -1;
+    }
+    task_manager = open_task_manager();
+    if (task_manager == None || get_geometry(task_manager, &geometry) < 0 ||
+        !geometry_inside(&geometry, &dual_bounds)) {
+        fprintf(stderr,
+                "persistence-probe: extreme Task Manager coordinates were not safely clamped\n");
         return -1;
     }
     return 0;

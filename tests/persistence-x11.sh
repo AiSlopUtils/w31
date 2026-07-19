@@ -108,6 +108,12 @@ if [ ! -s "$layout_file" ]; then
     show_log
     exit 1
 fi
+if ! grep -q '^version 3$' "$layout_file" ||
+   ! grep -q '^task_manager 1 ' "$layout_file"; then
+    echo "persistence-x11: Task Manager placement or schema version was not saved" >&2
+    show_log
+    exit 1
+fi
 if ! grep -q '^color_scheme=ocean-blue$' "$settings_file" ||
    ! grep -q '^control_panel_section=colors$' "$settings_file"; then
     echo "persistence-x11: color or Control Panel section was not saved" >&2
@@ -136,9 +142,10 @@ stop_wm
 
 printf '%s\n' \
     '# Win31 X hostile-coordinate regression fixture' \
-    'version 2' \
+    'version 3' \
     'applications_icon 1 - 1200 400 -2147483648 2147483647 112 80 0 0' \
     'control_panel_icon 1 - 1200 400 2147483647 -2147483648 112 80 0 0' \
+    'task_manager 1 - 1200 400 -2147483648 2147483647 720 520 0 0' \
     >"$layout_file"
 start_wm verify-extreme "$dual_monitors"
 run_probe --verify-extreme

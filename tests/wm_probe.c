@@ -6,9 +6,12 @@
 #include <X11/extensions/XTest.h>
 #include <X11/keysym.h>
 
+#include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -130,6 +133,67 @@ static int window_atom_property_contains(Window window, Atom property,
     return found;
 }
 
+static int window_cardinal_property(Window window, Atom property,
+                                    unsigned long *value)
+{
+    Atom type;
+    int format;
+    unsigned long count;
+    unsigned long after;
+    unsigned char *data = NULL;
+    int found = 0;
+
+    if (value != NULL &&
+        XGetWindowProperty(display, window, property, 0, 1, False,
+                           XA_CARDINAL, &type, &format, &count, &after,
+                           &data) == Success &&
+        type == XA_CARDINAL && format == 32 && count == 1 && data != NULL) {
+        *value = *(unsigned long *)data;
+        found = 1;
+    }
+    if (data != NULL)
+        XFree(data);
+    return found;
+}
+
+static int wait_for_cardinal_value(Window window, Atom property,
+                                   unsigned long expected)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 150; ++attempt) {
+        unsigned long value = 0;
+
+        XSync(display, False);
+        if (window_cardinal_property(window, property, &value) &&
+            value == expected)
+            return 0;
+        wait_a_bit();
+    }
+    return -1;
+}
+
+static int wait_for_cardinal_change(Window window, Atom property,
+                                    unsigned long previous,
+                                    unsigned long *updated)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 150; ++attempt) {
+        unsigned long value = 0;
+
+        XSync(display, False);
+        if (window_cardinal_property(window, property, &value) &&
+            value > previous) {
+            if (updated != NULL)
+                *updated = value;
+            return 0;
+        }
+        wait_a_bit();
+    }
+    return -1;
+}
+
 static int wait_for_maximized_state(Window window, int expected)
 {
     int attempt;
@@ -241,6 +305,27 @@ static Window wait_for_role(const char *role, Window expected_client,
         wait_a_bit();
     }
     return None;
+}
+
+static unsigned int count_windows_with_role(const char *role)
+{
+    Window root_return;
+    Window parent_return;
+    Window *children = NULL;
+    unsigned int count = 0;
+    unsigned int index;
+    unsigned int matches = 0;
+
+    if (!XQueryTree(display, root, &root_return, &parent_return, &children,
+                    &count))
+        return 0;
+    for (index = 0; index < count; ++index) {
+        if (role_matches(children[index], role))
+            ++matches;
+    }
+    if (children != NULL)
+        XFree(children);
+    return matches;
 }
 
 static void send_button_one_at(Window window, int x, int y)
@@ -674,6 +759,27 @@ static int fake_key_chord(KeySym modifier, KeySym key)
     return 0;
 }
 
+static int fake_three_key_chord(KeySym first_modifier,
+                                KeySym second_modifier, KeySym key)
+{
+    KeyCode first_code = XKeysymToKeycode(display, first_modifier);
+    KeyCode second_code = XKeysymToKeycode(display, second_modifier);
+    KeyCode key_code = XKeysymToKeycode(display, key);
+
+    if (first_code == 0 || second_code == 0 || key_code == 0 ||
+        !XTestFakeKeyEvent(display, first_code, True, CurrentTime) ||
+        !XTestFakeKeyEvent(display, second_code, True, CurrentTime) ||
+        !XTestFakeKeyEvent(display, key_code, True, CurrentTime) ||
+        !XTestFakeKeyEvent(display, key_code, False, CurrentTime) ||
+        !XTestFakeKeyEvent(display, second_code, False, CurrentTime) ||
+        !XTestFakeKeyEvent(display, first_code, False, CurrentTime)) {
+        fprintf(stderr, "wm-probe: could not inject three-key chord\n");
+        return -1;
+    }
+    XSync(display, False);
+    return 0;
+}
+
 static int fake_key(KeySym key)
 {
     KeyCode code = XKeysymToKeycode(display, key);
@@ -687,6 +793,38 @@ static int fake_key(KeySym key)
     wait_a_bit();
     if (!XTestFakeKeyEvent(display, code, False, CurrentTime)) {
         fprintf(stderr, "wm-probe: could not release keyboard key\n");
+        return -1;
+    }
+    XSync(display, False);
+    wait_a_bit();
+    return 0;
+}
+
+static int fake_key_state(KeySym key, Bool pressed)
+{
+    KeyCode code = XKeysymToKeycode(display, key);
+
+    if (code == 0 ||
+        !XTestFakeKeyEvent(display, code, pressed, CurrentTime)) {
+        fprintf(stderr, "wm-probe: could not inject keyboard key state\n");
+        return -1;
+    }
+    XSync(display, False);
+    wait_a_bit();
+    return 0;
+}
+
+static int fake_legacy_auto_repeat_pair(KeySym key)
+{
+    KeyCode code = XKeysymToKeycode(display, key);
+
+    /* Without detectable auto-repeat, Xorg reports each repeat as an
+     * adjacent release/press pair with the same server timestamp. */
+    if (code == 0 ||
+        !XTestFakeKeyEvent(display, code, False, CurrentTime) ||
+        !XTestFakeKeyEvent(display, code, True, CurrentTime)) {
+        fprintf(stderr,
+                "wm-probe: could not inject legacy keyboard auto-repeat\n");
         return -1;
     }
     XSync(display, False);
@@ -3114,6 +3252,277 @@ static int publish_test_window_icon(Window window)
     return 0;
 }
 
+static int verify_task_manager_delete_repeat(Window manager,
+                                             Atom selected_pid_atom)
+{
+    pid_t child;
+    pid_t waited = 0;
+    int wait_status = 0;
+    int attempt;
+    int result = -1;
+
+    child = fork();
+    if (child < 0) {
+        fprintf(stderr,
+                "wm-probe: could not create End Process safety probe\n");
+        return -1;
+    }
+    if (child == 0) {
+        for (;;)
+            pause();
+    }
+
+    /* Refresh after the child exists, then navigate by the published stable
+     * PID identity rather than assuming it is the final row. */
+    if (fake_key(XK_F5) < 0 || fake_key(XK_End) < 0)
+        goto done;
+    for (attempt = 0; attempt < 500; ++attempt) {
+        unsigned long selected = 0U;
+
+        if (!window_cardinal_property(manager, selected_pid_atom, &selected))
+            goto done;
+        if (selected == (unsigned long)child)
+            break;
+        if (fake_key(selected > (unsigned long)child ? XK_Up : XK_Down) < 0)
+            goto done;
+    }
+    if (attempt == 500) {
+        fprintf(stderr,
+                "wm-probe: End Process safety child was absent from the process list\n");
+        goto done;
+    }
+
+    /* Arm once, then inject the exact release/press pair used by legacy Xorg
+     * auto-repeat.  It must not count as a genuine release or confirmation. */
+    if (fake_key_state(XK_Delete, True) < 0 ||
+        fake_legacy_auto_repeat_pair(XK_Delete) < 0)
+        goto done;
+    for (attempt = 0; attempt < 20; ++attempt) {
+        waited = waitpid(child, &wait_status, WNOHANG);
+        if (waited != 0)
+            break;
+        wait_a_bit();
+    }
+    if (fake_key_state(XK_Delete, False) < 0)
+        goto done;
+    if (waited == child) {
+        fprintf(stderr,
+                "wm-probe: repeated Delete KeyPress confirmed End Process without a genuine release\n");
+        child = -1;
+        goto done;
+    }
+    if (waited < 0) {
+        fprintf(stderr,
+                "wm-probe: could not inspect End Process safety child\n");
+        child = -1;
+        goto done;
+    }
+
+    /* A genuine second key activation after release must still send SIGTERM;
+     * this prevents the repeat guard from making End Process inert. */
+    if (fake_key(XK_Delete) < 0)
+        goto done;
+    for (attempt = 0; attempt < 100; ++attempt) {
+        waited = waitpid(child, &wait_status, WNOHANG);
+        if (waited != 0)
+            break;
+        wait_a_bit();
+    }
+    if (waited != child || !WIFSIGNALED(wait_status) ||
+        WTERMSIG(wait_status) != SIGTERM) {
+        fprintf(stderr,
+                "wm-probe: genuine End Process confirmation did not send SIGTERM\n");
+        if (waited == child)
+            child = -1;
+        goto done;
+    }
+    child = -1;
+    result = 0;
+
+done:
+    if (child > 0) {
+        pid_t cleanup_wait;
+
+        (void)kill(child, SIGKILL);
+        do {
+            cleanup_wait = waitpid(child, &wait_status, 0);
+        } while (cleanup_wait < 0 && errno == EINTR);
+    }
+    /* F5 must clear the warning armed by the first Delete before later test
+     * actions can interact with this Task Manager instance. */
+    if (fake_key(XK_F5) < 0)
+        result = -1;
+    return result;
+}
+
+static int verify_task_manager(Window client)
+{
+    static const char role[] = "task-manager-window";
+    Atom tab_atom =
+        XInternAtom(display, "_WIN31X_TASK_MANAGER_TAB", False);
+    Atom sample_atom =
+        XInternAtom(display, "_WIN31X_TASK_MANAGER_SAMPLE_SERIAL", False);
+    Atom cpu_atom =
+        XInternAtom(display, "_WIN31X_TASK_MANAGER_CPU_TENTHS", False);
+    Atom memory_atom =
+        XInternAtom(display, "_WIN31X_TASK_MANAGER_MEMORY_TENTHS", False);
+    Atom process_count_atom =
+        XInternAtom(display, "_WIN31X_TASK_MANAGER_PROCESS_COUNT", False);
+    Atom selected_pid_atom =
+        XInternAtom(display, "_WIN31X_TASK_MANAGER_SELECTED_PID", False);
+    Window frame = client_frame(client);
+    Window manager;
+    Window reopened;
+    Window transient_owner;
+    Window transient_dialog;
+    Window launcher;
+    unsigned long sample = 0;
+    unsigned long updated_sample = 0;
+    unsigned long cpu = 0;
+    unsigned long memory = 0;
+    unsigned long process_count = 0;
+    unsigned long selected_pid = 0;
+    int toggle_result;
+    unsigned long black = BlackPixel(display, DefaultScreen(display));
+    unsigned long white = WhitePixel(display, DefaultScreen(display));
+
+    if (frame == None || request_active_client(client) < 0) {
+        fprintf(stderr,
+                "wm-probe: could not prepare Task Manager focus test\n");
+        return -1;
+    }
+    transient_owner = XCreateSimpleWindow(display, root, 360, 120, 260, 150,
+                                          0, black, white);
+    XStoreName(display, transient_owner, "Task Manager Family Owner");
+    XMapWindow(display, transient_owner);
+    XFlush(display);
+    if (wait_for_state(transient_owner, NormalState) < 0) {
+        fprintf(stderr,
+                "wm-probe: Task Manager transient owner was not managed\n");
+        return -1;
+    }
+    transient_dialog = XCreateSimpleWindow(display, root, 410, 155, 180, 90,
+                                           0, black, white);
+    XStoreName(display, transient_dialog, "Task Manager Family Dialog");
+    XSetTransientForHint(display, transient_dialog, transient_owner);
+    XMapWindow(display, transient_dialog);
+    XFlush(display);
+    if (wait_for_state(transient_dialog, NormalState) < 0 ||
+        fake_three_key_chord(XK_Control_L, XK_Shift_L, XK_Escape) < 0) {
+        fprintf(stderr,
+                "wm-probe: could not prepare or invoke Task Manager with Ctrl+Shift+Escape\n");
+        return -1;
+    }
+    manager = wait_for_role(role, None, 1);
+    if (manager == None || wait_for_focus_window(manager) < 0 ||
+        wait_for_above(manager, frame) < 0 ||
+        count_windows_with_role(role) != 1U) {
+        fprintf(stderr,
+                "wm-probe: Ctrl+Shift+Escape did not open one focused Task Manager above the active client\n");
+        return -1;
+    }
+    if (wait_for_window_name(manager, "Windows 98 Task Manager") < 0 ||
+        wait_for_cardinal_value(manager, tab_atom, 0U) < 0 ||
+        wait_for_cardinal_change(manager, sample_atom, 0U, &sample) < 0 ||
+        !window_cardinal_property(manager, process_count_atom,
+                                  &process_count) ||
+        !window_cardinal_property(manager, cpu_atom, &cpu) ||
+        !window_cardinal_property(manager, memory_atom, &memory) ||
+        process_count == 0U || cpu > 1000U || memory > 1000U) {
+        fprintf(stderr,
+                "wm-probe: Task Manager did not publish a valid initial system sample\n");
+        return -1;
+    }
+    if (wait_for_cardinal_change(manager, sample_atom, sample,
+                                 &updated_sample) < 0) {
+        fprintf(stderr,
+                "wm-probe: Task Manager did not refresh its system sample while open\n");
+        return -1;
+    }
+
+    if (fake_key_chord(XK_Control_L, XK_Tab) < 0 ||
+        wait_for_cardinal_value(manager, tab_atom, 1U) < 0 ||
+        !window_cardinal_property(manager, selected_pid_atom,
+                                  &selected_pid) ||
+        selected_pid == 0U ||
+        verify_task_manager_delete_repeat(manager, selected_pid_atom) < 0 ||
+        fake_key_chord(XK_Control_L, XK_Tab) < 0 ||
+        wait_for_cardinal_value(manager, tab_atom, 2U) < 0 ||
+        fake_key_chord(XK_Control_L, XK_Tab) < 0 ||
+        wait_for_cardinal_value(manager, tab_atom, 3U) < 0 ||
+        fake_key_chord(XK_Control_L, XK_Tab) < 0 ||
+        wait_for_cardinal_value(manager, tab_atom, 0U) < 0) {
+        fprintf(stderr,
+                "wm-probe: Task Manager tabs or process selection did not respond to Ctrl+Tab\n");
+        return -1;
+    }
+
+    if (fake_key(XK_Return) < 0 ||
+        wait_for_active_client(transient_dialog) < 0 ||
+        !internal_window_remains_viewable(manager)) {
+        fprintf(stderr,
+                "wm-probe: Task Manager Applications page focused behind an active transient dialog\n");
+        return -1;
+    }
+    if (fake_key_chord(XK_Alt_L, XK_F2) < 0 ||
+        (launcher = wait_for_role("applications-window", None, 1)) == None ||
+        wait_for_focus_window(launcher) < 0 ||
+        click_internal_close_button(launcher) < 0 ||
+        wait_for_active_client(transient_dialog) < 0 ||
+        !internal_window_remains_viewable(manager)) {
+        fprintf(stderr,
+                "wm-probe: closing another internal window raised a background Task Manager over the active app\n");
+        return -1;
+    }
+    if (fake_three_key_chord(XK_Control_L, XK_Shift_L, XK_Escape) < 0 ||
+        wait_for_focus_window(manager) < 0 || wait_for_above(manager, frame) < 0 ||
+        find_role(role, None, 1) != manager ||
+        count_windows_with_role(role) != 1U) {
+        fprintf(stderr,
+                "wm-probe: invoking an open Task Manager did not refocus its singleton window\n");
+        return -1;
+    }
+
+    if (click_internal_close_button(manager) < 0 ||
+        !internal_window_is_hidden(manager) ||
+        count_windows_with_role(role) != 1U ||
+        wait_for_active_client(transient_dialog) < 0) {
+        fprintf(stderr,
+                "wm-probe: Task Manager close button did not hide only its singleton window\n");
+        return -1;
+    }
+
+    XDestroyWindow(display, transient_dialog);
+    XDestroyWindow(display, transient_owner);
+    XSync(display, False);
+    if (request_active_client(client) < 0) {
+        fprintf(stderr,
+                "wm-probe: could not restore the primary client after Task Manager family test\n");
+        return -1;
+    }
+
+    toggle_result = fake_toggle_key(XK_Caps_Lock);
+    if (toggle_result < 0 ||
+        fake_three_key_chord(XK_Control_L, XK_Shift_L, XK_Escape) < 0 ||
+        (reopened = wait_for_role(role, None, 1)) == None ||
+        reopened != manager || wait_for_focus_window(reopened) < 0 ||
+        count_windows_with_role(role) != 1U) {
+        fprintf(stderr,
+                "wm-probe: Task Manager did not reopen as one window with Caps Lock active\n");
+        return -1;
+    }
+    if (toggle_result == 0)
+        (void)fake_toggle_key(XK_Caps_Lock);
+    if (click_internal_close_button(reopened) < 0 ||
+        !internal_window_is_hidden(reopened) ||
+        wait_for_active_client(client) < 0) {
+        fprintf(stderr,
+                "wm-probe: reopened Task Manager did not close cleanly\n");
+        return -1;
+    }
+    return 0;
+}
+
 static int verify_control_panel(Window client, const char *wifi_marker,
                                 const char *lock_marker)
 {
@@ -4021,10 +4430,12 @@ static int verify_multi_monitor_internal_windows(Window client,
     const FrameGeometry right_monitor = {800, 100, 800, 600};
     const FrameGeometry applications_normal = {860, 170, 680, 460};
     const FrameGeometry control_normal = {60, 70, 680, 460};
+    const FrameGeometry task_manager_normal = {840, 140, 720, 520};
     const FrameGeometry maximized = {800, 100, 800, 600};
     const FrameGeometry snapped_left = {800, 100, 400, 600};
     Window launcher;
     Window panel;
+    Window task_manager;
     FrameGeometry moved_panel;
     int icon_x;
     int icon_y;
@@ -4112,6 +4523,41 @@ static int verify_multi_monitor_internal_windows(Window client,
         !role_remains_unmapped("control-panel-window")) {
         fprintf(stderr,
                 "wm-probe: an internal window reopened unexpectedly\n");
+        return -1;
+    }
+    if (request_active_client(client) < 0 ||
+        fake_three_key_chord(XK_Control_L, XK_Shift_L, XK_Escape) < 0) {
+        fprintf(stderr,
+                "wm-probe: could not open Task Manager on the active monitor\n");
+        return -1;
+    }
+    task_manager = wait_for_role("task-manager-window", None, 1);
+    if (task_manager == None || wait_for_focus_window(task_manager) < 0 ||
+        wait_for_frame_geometry(task_manager, &task_manager_normal) < 0) {
+        if (task_manager != None)
+            report_frame_geometry(
+                "Task Manager was not centered on the active right monitor",
+                task_manager);
+        return -1;
+    }
+    if (click_internal_maximize_button(task_manager) < 0 ||
+        wait_for_frame_geometry(task_manager, &maximized) < 0 ||
+        click_internal_maximize_button(task_manager) < 0 ||
+        wait_for_frame_geometry(task_manager, &task_manager_normal) < 0 ||
+        drag_frame_title_to(task_manager, 801, 350) < 0 ||
+        wait_for_frame_geometry(task_manager, &snapped_left) < 0 ||
+        drag_internal_back_to_geometry(task_manager,
+                                       &task_manager_normal) < 0 ||
+        click_internal_close_button(task_manager) < 0 ||
+        !internal_window_is_hidden(task_manager)) {
+        report_frame_geometry(
+            "Task Manager maximize, snap, restore, or close failed on the active monitor",
+            task_manager);
+        return -1;
+    }
+    if (!role_remains_unmapped("task-manager-window")) {
+        fprintf(stderr,
+                "wm-probe: Task Manager reopened unexpectedly after multi-monitor tests\n");
         return -1;
     }
     (void)applications_icon;
@@ -4376,6 +4822,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "wm-probe: clicking the desktop icon did not restore client\n");
         return 1;
     }
+    if (verify_task_manager(client) < 0)
+        return 1;
     if (verify_control_panel(client, wifi_marker, lock_marker) < 0)
         return 1;
 

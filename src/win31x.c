@@ -7,6 +7,7 @@
 #include "icon_assets.h"
 #include "session_actions.h"
 #include "settings.h"
+#include "task_manager_data.h"
 #include "wifi_backend.h"
 
 #include <X11/Xatom.h>
@@ -60,6 +61,15 @@
 #define RUN_DIALOG_DEFAULT_WIDTH 470
 #define RUN_DIALOG_DEFAULT_HEIGHT 176
 #define RUN_COMMAND_CAPACITY 512
+#define TASK_MANAGER_DEFAULT_WIDTH 720
+#define TASK_MANAGER_DEFAULT_HEIGHT 520
+#define TASK_MANAGER_REFRESH_MS UINT64_C(1000)
+#define TASK_MANAGER_CONFIRM_MS UINT64_C(5000)
+#define TASK_MANAGER_FORCE_DELAY_MS UINT64_C(3000)
+#define TASK_MANAGER_HISTORY_LENGTH 120U
+#define TASK_MANAGER_ROW_HEIGHT 20
+#define TASK_MANAGER_TAB_HEIGHT 25
+#define TASK_MANAGER_STATUS_CAPACITY 192
 #define DESKTOP_MENU_WIDTH 196
 #define DESKTOP_MENU_HEIGHT 119
 #define DESKTOP_MENU_ITEM_HEIGHT 26
@@ -116,7 +126,8 @@ typedef enum {
     INTERNAL_FOCUS_NONE,
     INTERNAL_FOCUS_APPLICATIONS,
     INTERNAL_FOCUS_CONTROL_PANEL,
-    INTERNAL_FOCUS_RUN
+    INTERNAL_FOCUS_RUN,
+    INTERNAL_FOCUS_TASK_MANAGER
 } InternalFocus;
 
 typedef enum {
@@ -187,6 +198,8 @@ typedef struct {
     unsigned long white;
     unsigned long silver;
     unsigned long dark_gray;
+    unsigned long graph_green;
+    unsigned long graph_grid;
     unsigned long active_title;
     unsigned long desktop;
     unsigned long scheme_desktop[WIN31X_COLOR_SCHEME_COUNT];
@@ -232,6 +245,12 @@ typedef struct {
     Atom wm_window_role;
     Atom win31x_role;
     Atom win31x_client;
+    Atom win31x_task_manager_tab;
+    Atom win31x_task_manager_sample_serial;
+    Atom win31x_task_manager_cpu_tenths;
+    Atom win31x_task_manager_memory_tenths;
+    Atom win31x_task_manager_process_count;
+    Atom win31x_task_manager_selected_pid;
 } Atoms;
 
 typedef enum {
@@ -241,6 +260,7 @@ typedef enum {
     DRAG_MOVE_LAUNCHER,
     DRAG_MOVE_CONTROL_PANEL,
     DRAG_MOVE_RUN,
+    DRAG_MOVE_TASK_MANAGER,
     DRAG_MOVE_ICON
 } DragKind;
 
@@ -290,6 +310,64 @@ typedef struct {
     Window return_client;
     MonitorAnchor monitor;
 } RunDialog;
+
+typedef enum {
+    TASK_MANAGER_TAB_APPLICATIONS,
+    TASK_MANAGER_TAB_PROCESSES,
+    TASK_MANAGER_TAB_PERFORMANCE,
+    TASK_MANAGER_TAB_SYSTEM,
+    TASK_MANAGER_TAB_COUNT
+} TaskManagerTab;
+
+typedef struct {
+    Window window;
+    int x;
+    int y;
+    int width;
+    int height;
+    bool visible;
+    bool positioned;
+    ClientLayout layout;
+    ClientLayout layout_before_maximize;
+    bool restore_valid;
+    int restore_x;
+    int restore_y;
+    int restore_width;
+    int restore_height;
+    MonitorAnchor layout_monitor;
+    InternalFocus return_internal_focus;
+    Window return_client;
+    Pixmap backing;
+    int backing_width;
+    int backing_height;
+    TaskManagerTab tab;
+    Win31xTaskManagerData data;
+    bool data_available;
+    uint64_t next_refresh_ms;
+    unsigned long sample_serial;
+    double cpu_history[TASK_MANAGER_HISTORY_LENGTH];
+    double memory_history[TASK_MANAGER_HISTORY_LENGTH];
+    size_t history_count;
+    Window selected_application;
+    Window closing_application;
+    Window application_last_click;
+    Time application_last_click_time;
+    int application_scroll;
+    pid_t selected_pid;
+    uint64_t selected_start_time;
+    int process_scroll;
+    pid_t confirm_pid;
+    uint64_t confirm_start_time;
+    uint64_t confirm_until_ms;
+    pid_t terminating_pid;
+    uint64_t terminating_start_time;
+    uint64_t force_due_ms;
+    bool force_ready;
+    bool process_delete_down;
+    bool status_is_refresh_error;
+    bool status_is_closing_application;
+    char status[TASK_MANAGER_STATUS_CAPACITY];
+} TaskManager;
 
 typedef enum {
     DESKTOP_MENU_LOCK,
@@ -448,6 +526,7 @@ typedef struct {
     WifiBackend wifi;
     ControlPanel control_panel;
     RunDialog run_dialog;
+    TaskManager task_manager;
     DesktopMenu desktop_menu;
     SessionConfirmation session_confirmation;
     InternalFocus internal_focus;
@@ -468,6 +547,10 @@ static void draw_launcher(WindowManager *wm);
 static void draw_control_panel(WindowManager *wm);
 static void draw_run_dialog(WindowManager *wm);
 static void hide_run_dialog(WindowManager *wm);
+static void draw_task_manager(WindowManager *wm);
+static void hide_task_manager(WindowManager *wm);
+static void show_task_manager(WindowManager *wm);
+static void task_manager_select_first_application(WindowManager *wm);
 static void dismiss_desktop_menu(WindowManager *wm);
 static void dismiss_session_confirmation(WindowManager *wm, bool restore_focus,
                                          Time time);
@@ -1021,6 +1104,8 @@ static void initialize_theme(WindowManager *wm)
     wm->theme.white = WhitePixel(wm->display, wm->screen);
     wm->theme.silver = allocate_color(wm, "#c0c0c0", wm->theme.white);
     wm->theme.dark_gray = allocate_color(wm, "#606060", wm->theme.black);
+    wm->theme.graph_green = allocate_color(wm, "#00ff00", wm->theme.white);
+    wm->theme.graph_grid = allocate_color(wm, "#005000", wm->theme.dark_gray);
     for (index = 0U; index < WIN31X_COLOR_SCHEME_COUNT; ++index) {
         const Win31xColorScheme *scheme = win31x_color_scheme(index);
 
@@ -1464,6 +1549,17 @@ static void initialize_atoms(WindowManager *wm)
     a->wm_window_role = intern(d, "WM_WINDOW_ROLE");
     a->win31x_role = intern(d, "_WIN31X_ROLE");
     a->win31x_client = intern(d, "_WIN31X_CLIENT");
+    a->win31x_task_manager_tab = intern(d, "_WIN31X_TASK_MANAGER_TAB");
+    a->win31x_task_manager_sample_serial =
+        intern(d, "_WIN31X_TASK_MANAGER_SAMPLE_SERIAL");
+    a->win31x_task_manager_cpu_tenths =
+        intern(d, "_WIN31X_TASK_MANAGER_CPU_TENTHS");
+    a->win31x_task_manager_memory_tenths =
+        intern(d, "_WIN31X_TASK_MANAGER_MEMORY_TENTHS");
+    a->win31x_task_manager_process_count =
+        intern(d, "_WIN31X_TASK_MANAGER_PROCESS_COUNT");
+    a->win31x_task_manager_selected_pid =
+        intern(d, "_WIN31X_TASK_MANAGER_SELECTED_PID");
 }
 
 static void set_utf8_property(WindowManager *wm, Window window, Atom property,
@@ -1925,6 +2021,12 @@ static size_t active_monitor_index(WindowManager *wm)
             wm, wm->run_dialog.x, wm->run_dialog.y,
             wm->run_dialog.width, wm->run_dialog.height);
     }
+    if (wm->internal_focus == INTERNAL_FOCUS_TASK_MANAGER &&
+        wm->task_manager.visible) {
+        return monitor_index_for_rectangle(
+            wm, wm->task_manager.x, wm->task_manager.y,
+            wm->task_manager.width, wm->task_manager.height);
+    }
     if (wm->active != NULL && !wm->active->minimized)
         return monitor_index_for_client(wm, wm->active);
     if (wm->active_monitor.valid)
@@ -2179,6 +2281,8 @@ static void apply_color_scheme(WindowManager *wm, size_t scheme_index,
         draw_control_panel(wm);
     if (wm->run_dialog.visible)
         draw_run_dialog(wm);
+    if (wm->task_manager.visible)
+        draw_task_manager(wm);
     if (wm->session_confirmation.visible)
         draw_session_confirmation(wm);
 }
@@ -3028,6 +3132,8 @@ static void focus_client(WindowManager *wm, Client *client, Time time)
             draw_control_panel(wm);
         if (wm->run_dialog.visible)
             draw_run_dialog(wm);
+        if (wm->task_manager.visible)
+            draw_task_manager(wm);
     }
 }
 
@@ -3047,6 +3153,9 @@ static void activate_internal_window(WindowManager *wm, InternalFocus focus,
         window = wm->control_panel.window;
     } else if (focus == INTERNAL_FOCUS_RUN && wm->run_dialog.visible) {
         window = wm->run_dialog.window;
+    } else if (focus == INTERNAL_FOCUS_TASK_MANAGER &&
+               wm->task_manager.visible) {
+        window = wm->task_manager.window;
     } else {
         return;
     }
@@ -3061,11 +3170,16 @@ static void activate_internal_window(WindowManager *wm, InternalFocus focus,
             wm, monitor_index_for_rectangle(
                     wm, wm->control_panel.x, wm->control_panel.y,
                     wm->control_panel.width, wm->control_panel.height));
-    } else {
+    } else if (focus == INTERNAL_FOCUS_RUN) {
         set_active_monitor(
             wm, monitor_index_for_rectangle(
                     wm, wm->run_dialog.x, wm->run_dialog.y,
                     wm->run_dialog.width, wm->run_dialog.height));
+    } else {
+        set_active_monitor(
+            wm, monitor_index_for_rectangle(
+                    wm, wm->task_manager.x, wm->task_manager.y,
+                    wm->task_manager.width, wm->task_manager.height));
     }
     publish_active_client(wm, NULL);
     update_focus_overlays(wm);
@@ -3077,6 +3191,8 @@ static void activate_internal_window(WindowManager *wm, InternalFocus focus,
         draw_control_panel(wm);
     if (wm->run_dialog.visible)
         draw_run_dialog(wm);
+    if (wm->task_manager.visible)
+        draw_task_manager(wm);
     XRaiseWindow(wm->display, window);
     XSetInputFocus(wm->display, window, RevertToPointerRoot, time);
 }
@@ -3218,6 +3334,8 @@ static void minimize_client(WindowManager *wm, Client *client)
         wm->active != NULL && wm->active->minimized)
         focus_next(wm, CurrentTime);
     reposition_icons(wm);
+    if (wm->task_manager.visible)
+        draw_task_manager(wm);
 }
 
 static void restore_client_window(WindowManager *wm, Client *client)
@@ -3272,6 +3390,8 @@ static void restore_client(WindowManager *wm, Client *client, Time time)
         focus_target = client;
     reposition_icons(wm);
     focus_client(wm, focus_target, time);
+    if (wm->task_manager.visible)
+        draw_task_manager(wm);
 }
 
 static void expose_orphaned_transients(WindowManager *wm, Window owner)
@@ -3308,6 +3428,14 @@ static void remove_client(WindowManager *wm, Client *client, bool destroyed,
         if (*cursor == client) {
             *cursor = client->next;
             break;
+        }
+    }
+    if (wm->task_manager.closing_application == client->window) {
+        wm->task_manager.closing_application = None;
+        if (wm->task_manager.status_is_closing_application) {
+            wm->task_manager.status[0] = '\0';
+            wm->task_manager.status_is_closing_application = false;
+            wm->task_manager.status_is_refresh_error = false;
         }
     }
     if (!remap)
@@ -3354,6 +3482,10 @@ static void remove_client(WindowManager *wm, Client *client, bool destroyed,
     free(client->state_identity);
     free(client);
     update_client_list(wm);
+    if (wm->task_manager.visible) {
+        task_manager_select_first_application(wm);
+        draw_task_manager(wm);
+    }
     if (was_active && wm->internal_focus == INTERNAL_FOCUS_NONE)
         focus_next(wm, CurrentTime);
 }
@@ -3833,6 +3965,10 @@ static Client *manage_window(WindowManager *wm, Window window, bool startup)
             send_configure_notify(wm, client);
         focus_client(wm, client, CurrentTime);
     }
+    if (wm->task_manager.visible) {
+        task_manager_select_first_application(wm);
+        draw_task_manager(wm);
+    }
     return client;
 }
 
@@ -4295,8 +4431,22 @@ static void focus_after_internal_close(WindowManager *wm, bool was_focused,
 
     if (!was_focused)
         return;
+    /* Internal windows that track an explicit return target restore it before
+     * reaching this fallback.  For Launcher and Control Panel, the managed
+     * client that was active before they took focus is the closest equivalent
+     * to the next window in the real root stacking order.  Do not let an
+     * unrelated, visible internal window jump above that client merely because
+     * it is still mapped in the background. */
+    if (wm->active != NULL && !wm->active->minimized) {
+        focus_client(wm, wm->active, time);
+        return;
+    }
     if (wm->run_dialog.visible) {
         activate_internal_window(wm, INTERNAL_FOCUS_RUN, time);
+        return;
+    }
+    if (wm->task_manager.visible) {
+        activate_internal_window(wm, INTERNAL_FOCUS_TASK_MANAGER, time);
         return;
     }
     if (wm->launcher_visible) {
@@ -4308,10 +4458,6 @@ static void focus_after_internal_close(WindowManager *wm, bool was_focused,
         return;
     }
     wm->internal_focus = INTERNAL_FOCUS_NONE;
-    if (wm->active != NULL && !wm->active->minimized) {
-        focus_client(wm, wm->active, time);
-        return;
-    }
     next = next_visible_client(wm, NULL);
     if (next != NULL)
         focus_client(wm, next, time);
@@ -5292,6 +5438,11 @@ static void restore_run_return_focus(WindowManager *wm, bool was_focused,
         activate_internal_window(wm, INTERNAL_FOCUS_CONTROL_PANEL, time);
         return;
     }
+    if (internal == INTERNAL_FOCUS_TASK_MANAGER &&
+        wm->task_manager.visible) {
+        activate_internal_window(wm, INTERNAL_FOCUS_TASK_MANAGER, time);
+        return;
+    }
     if (client != NULL && !client->minimized) {
         focus_client(wm, client, time);
         return;
@@ -5379,6 +5530,1682 @@ static void initialize_run_dialog(WindowManager *wm)
         &attributes);
     set_internal_role(wm, dialog->window, "run-window");
     set_utf8_property(wm, dialog->window, wm->atoms.net_wm_name, "Run");
+}
+
+static size_t task_manager_application_count(const WindowManager *wm)
+{
+    const Client *client;
+    size_t count = 0U;
+
+    for (client = wm->clients; client != NULL; client = client->next) {
+        if (client->transient_for == None)
+            ++count;
+    }
+    return count;
+}
+
+static Client *task_manager_application_at(WindowManager *wm, size_t index)
+{
+    Client *client;
+
+    for (client = wm->clients; client != NULL; client = client->next) {
+        if (client->transient_for != None)
+            continue;
+        if (index == 0U)
+            return client;
+        --index;
+    }
+    return NULL;
+}
+
+static Client *task_manager_selected_application(WindowManager *wm)
+{
+    Client *client = wm->task_manager.selected_application != None
+                         ? client_for_client_window(
+                               wm, wm->task_manager.selected_application)
+                         : NULL;
+
+    if (client != NULL && client->transient_for == None)
+        return client;
+    wm->task_manager.selected_application = None;
+    return NULL;
+}
+
+static void task_manager_select_first_application(WindowManager *wm)
+{
+    Client *client;
+
+    if (task_manager_selected_application(wm) != NULL)
+        return;
+    client = task_manager_application_at(wm, 0U);
+    if (client != NULL)
+        wm->task_manager.selected_application = client->window;
+}
+
+static bool task_manager_application_family_contains(WindowManager *wm,
+                                                     Client *application,
+                                                     Client *candidate)
+{
+    return application != NULL && candidate != NULL &&
+           client_is_in_transient_subtree(wm, candidate, application);
+}
+
+static Client *task_manager_application_focus_target(WindowManager *wm,
+                                                     Client *application)
+{
+    Client *candidate;
+    Client *target = application;
+
+    if (application == NULL || application->minimized)
+        return application;
+    if (wm->active != NULL && !wm->active->minimized &&
+        task_manager_application_family_contains(wm, application,
+                                                 wm->active))
+        return wm->active;
+
+    /* Prefer a visible descendant over its owner so a modal dialog never
+     * remains raised while keyboard focus is sent behind it.  The managed
+     * client list is newest-first; retain that ordering for sibling dialogs
+     * while still walking down to a nested descendant when one exists. */
+    for (candidate = wm->clients; candidate != NULL;
+         candidate = candidate->next) {
+        if (candidate->minimized || candidate == application ||
+            !task_manager_application_family_contains(
+                wm, application, candidate))
+            continue;
+        if (target == application ||
+            client_is_in_transient_subtree(wm, candidate, target))
+            target = candidate;
+    }
+    return target;
+}
+
+static const Win31xTaskManagerProcess *task_manager_process_by_identity(
+    const TaskManager *manager, pid_t pid, uint64_t start_time)
+{
+    const Win31xTaskManagerSnapshot *snapshot =
+        win31x_task_manager_data_snapshot(&manager->data);
+    size_t index;
+
+    if (snapshot == NULL || pid <= 0 || start_time == 0U)
+        return NULL;
+    for (index = 0U; index < snapshot->process_count; ++index) {
+        const Win31xTaskManagerProcess *process = &snapshot->processes[index];
+
+        if (process->pid == pid && process->start_time_ticks == start_time)
+            return process;
+    }
+    return NULL;
+}
+
+static const Win31xTaskManagerProcess *task_manager_selected_process(
+    const TaskManager *manager)
+{
+    return task_manager_process_by_identity(
+        manager, manager->selected_pid, manager->selected_start_time);
+}
+
+static double task_manager_memory_percent(
+    const Win31xTaskManagerSystem *system)
+{
+    uint64_t used;
+
+    if (system == NULL || system->memory_total_bytes == 0U)
+        return 0.0;
+    used = system->memory_available_bytes < system->memory_total_bytes
+               ? system->memory_total_bytes - system->memory_available_bytes
+               : 0U;
+    return (double)used * 100.0 / (double)system->memory_total_bytes;
+}
+
+static void task_manager_append_history(TaskManager *manager, double cpu,
+                                        double memory)
+{
+    if (cpu < 0.0)
+        cpu = 0.0;
+    if (cpu > 100.0)
+        cpu = 100.0;
+    if (memory < 0.0)
+        memory = 0.0;
+    if (memory > 100.0)
+        memory = 100.0;
+    if (manager->history_count < TASK_MANAGER_HISTORY_LENGTH) {
+        manager->cpu_history[manager->history_count] = cpu;
+        manager->memory_history[manager->history_count] = memory;
+        ++manager->history_count;
+    } else {
+        memmove(&manager->cpu_history[0], &manager->cpu_history[1],
+                (TASK_MANAGER_HISTORY_LENGTH - 1U) *
+                    sizeof(manager->cpu_history[0]));
+        memmove(&manager->memory_history[0], &manager->memory_history[1],
+                (TASK_MANAGER_HISTORY_LENGTH - 1U) *
+                    sizeof(manager->memory_history[0]));
+        manager->cpu_history[TASK_MANAGER_HISTORY_LENGTH - 1U] = cpu;
+        manager->memory_history[TASK_MANAGER_HISTORY_LENGTH - 1U] = memory;
+    }
+}
+
+static void task_manager_publish_cardinal(WindowManager *wm, Atom property,
+                                          unsigned long value)
+{
+    XChangeProperty(wm->display, wm->task_manager.window, property, XA_CARDINAL,
+                    32, PropModeReplace, (unsigned char *)&value, 1);
+}
+
+static void task_manager_publish_state(WindowManager *wm)
+{
+    TaskManager *manager = &wm->task_manager;
+    const Win31xTaskManagerSnapshot *snapshot =
+        win31x_task_manager_data_snapshot(&manager->data);
+    unsigned long cpu_tenths = 0U;
+    unsigned long memory_tenths = 0U;
+    unsigned long process_count = 0U;
+    unsigned long selected_pid = manager->selected_pid > 0
+                                     ? (unsigned long)manager->selected_pid
+                                     : 0U;
+
+    if (snapshot != NULL) {
+        double cpu = snapshot->system.cpu_percent_valid
+                         ? snapshot->system.cpu_percent
+                         : 0.0;
+        double memory = task_manager_memory_percent(&snapshot->system);
+
+        if (cpu > 100.0)
+            cpu = 100.0;
+        if (memory > 100.0)
+            memory = 100.0;
+        cpu_tenths = (unsigned long)(cpu * 10.0 + 0.5);
+        memory_tenths = (unsigned long)(memory * 10.0 + 0.5);
+        process_count = snapshot->process_count > (size_t)ULONG_MAX
+                            ? ULONG_MAX
+                            : (unsigned long)snapshot->process_count;
+    }
+    task_manager_publish_cardinal(
+        wm, wm->atoms.win31x_task_manager_tab,
+        (unsigned long)manager->tab);
+    task_manager_publish_cardinal(
+        wm, wm->atoms.win31x_task_manager_sample_serial,
+        manager->sample_serial);
+    task_manager_publish_cardinal(
+        wm, wm->atoms.win31x_task_manager_cpu_tenths, cpu_tenths);
+    task_manager_publish_cardinal(
+        wm, wm->atoms.win31x_task_manager_memory_tenths, memory_tenths);
+    task_manager_publish_cardinal(
+        wm, wm->atoms.win31x_task_manager_process_count, process_count);
+    task_manager_publish_cardinal(
+        wm, wm->atoms.win31x_task_manager_selected_pid, selected_pid);
+}
+
+static void task_manager_reconcile_process_state(WindowManager *wm,
+                                                 uint64_t now)
+{
+    TaskManager *manager = &wm->task_manager;
+    const Win31xTaskManagerSnapshot *snapshot =
+        win31x_task_manager_data_snapshot(&manager->data);
+
+    if (manager->selected_pid > 0 &&
+        task_manager_selected_process(manager) == NULL) {
+        manager->selected_pid = 0;
+        manager->selected_start_time = 0U;
+        manager->confirm_pid = 0;
+        manager->confirm_start_time = 0U;
+        manager->confirm_until_ms = 0U;
+    }
+    if (manager->confirm_pid > 0 && now > manager->confirm_until_ms) {
+        manager->confirm_pid = 0;
+        manager->confirm_start_time = 0U;
+        manager->confirm_until_ms = 0U;
+        snprintf(manager->status, sizeof(manager->status),
+                 "End Process confirmation expired.");
+        manager->status_is_refresh_error = false;
+        manager->status_is_closing_application = false;
+    }
+    if (manager->terminating_pid > 0) {
+        const Win31xTaskManagerProcess *process =
+            task_manager_process_by_identity(
+                manager, manager->terminating_pid,
+                manager->terminating_start_time);
+
+        if (process == NULL) {
+            snprintf(manager->status, sizeof(manager->status),
+                     "The process ended.");
+            manager->status_is_refresh_error = false;
+            manager->status_is_closing_application = false;
+            manager->terminating_pid = 0;
+            manager->terminating_start_time = 0U;
+            manager->force_due_ms = 0U;
+            manager->force_ready = false;
+        } else if (now >= manager->force_due_ms) {
+            manager->force_ready = true;
+            snprintf(manager->status, sizeof(manager->status),
+                     "%s (PID %ld) did not exit; Force End is available.",
+                     process->name, (long)process->pid);
+            manager->status_is_refresh_error = false;
+            manager->status_is_closing_application = false;
+        }
+    }
+    if (manager->selected_pid <= 0 && snapshot != NULL &&
+        snapshot->process_count > 0U) {
+        size_t index;
+        size_t selected = 0U;
+
+        for (index = 0U; index < snapshot->process_count; ++index) {
+            const Win31xTaskManagerProcess *process =
+                &snapshot->processes[index];
+
+            if (process->owned_by_user && process->pid > 1 &&
+                process->pid != getpid()) {
+                selected = index;
+                break;
+            }
+        }
+        manager->selected_pid = snapshot->processes[selected].pid;
+        manager->selected_start_time =
+            snapshot->processes[selected].start_time_ticks;
+        manager->process_scroll =
+            selected <= (size_t)INT_MAX ? (int)selected : 0;
+    }
+}
+
+static void refresh_task_manager(WindowManager *wm, bool force)
+{
+    TaskManager *manager = &wm->task_manager;
+    const Win31xTaskManagerSnapshot *snapshot;
+    uint64_t now = monotonic_milliseconds();
+    uint64_t completed;
+    double cpu;
+    double memory;
+
+    if (!manager->data_available || (!manager->visible && !force))
+        return;
+    if (!force && now != 0U && now < manager->next_refresh_ms)
+        return;
+    if (win31x_task_manager_data_refresh(&manager->data) < 0) {
+        snprintf(manager->status, sizeof(manager->status),
+                 "Could not refresh system information: %s", strerror(errno));
+        manager->status_is_refresh_error = true;
+        manager->status_is_closing_application = false;
+        completed = monotonic_milliseconds();
+        if (completed == 0U)
+            completed = now;
+        manager->next_refresh_ms = completed + TASK_MANAGER_REFRESH_MS;
+        if (manager->visible)
+            draw_task_manager(wm);
+        return;
+    }
+    if (manager->status_is_refresh_error) {
+        manager->status[0] = '\0';
+        manager->status_is_refresh_error = false;
+    }
+    snapshot = win31x_task_manager_data_snapshot(&manager->data);
+    cpu = snapshot != NULL && snapshot->system.cpu_percent_valid
+              ? snapshot->system.cpu_percent
+              : (manager->history_count > 0U
+                     ? manager->cpu_history[manager->history_count - 1U]
+                     : 0.0);
+    memory = snapshot != NULL
+                 ? task_manager_memory_percent(&snapshot->system)
+                 : 0.0;
+    task_manager_append_history(manager, cpu, memory);
+    if (manager->sample_serial < ULONG_MAX)
+        ++manager->sample_serial;
+    completed = monotonic_milliseconds();
+    if (completed == 0U)
+        completed = now;
+    manager->next_refresh_ms = completed + TASK_MANAGER_REFRESH_MS;
+    task_manager_reconcile_process_state(wm, completed);
+    task_manager_select_first_application(wm);
+    task_manager_publish_state(wm);
+    if (manager->visible)
+        draw_task_manager(wm);
+}
+
+static void format_task_manager_bytes(uint64_t bytes, char *text,
+                                      size_t capacity)
+{
+    static const char *const units[] = {"B", "KB", "MB", "GB", "TB"};
+    double value = (double)bytes;
+    size_t unit = 0U;
+
+    while (value >= 1024.0 && unit + 1U < sizeof(units) / sizeof(units[0])) {
+        value /= 1024.0;
+        ++unit;
+    }
+    if (unit == 0U)
+        snprintf(text, capacity, "%llu %s", (unsigned long long)bytes,
+                 units[unit]);
+    else
+        snprintf(text, capacity, "%.1f %s", value, units[unit]);
+}
+
+static void format_task_manager_uptime(double seconds, char *text,
+                                       size_t capacity)
+{
+    unsigned long long total = seconds > 0.0
+                                   ? (unsigned long long)seconds
+                                   : 0ULL;
+    unsigned long long days = total / 86400ULL;
+    unsigned long long hours = total / 3600ULL % 24ULL;
+    unsigned long long minutes = total / 60ULL % 60ULL;
+    unsigned long long remaining = total % 60ULL;
+
+    snprintf(text, capacity, "%llu day%s, %02llu:%02llu:%02llu", days,
+             days == 1ULL ? "" : "s", hours, minutes, remaining);
+}
+
+static void task_manager_fill_rectangle(WindowManager *wm, Drawable drawable,
+                                        int x, int y, int width, int height)
+{
+    if (width <= 0 || height <= 0)
+        return;
+    XFillRectangle(wm->display, drawable, wm->gc, x, y, (unsigned)width,
+                   (unsigned)height);
+}
+
+static void task_manager_draw_bevel(WindowManager *wm, Drawable drawable,
+                                    int x, int y, int width, int height,
+                                    bool sunken)
+{
+    if (width < 2 || height < 2)
+        return;
+    draw_bevel(wm, drawable, x, y, width, height, sunken);
+}
+
+static int task_manager_tab_x(const TaskManager *manager, TaskManagerTab tab)
+{
+    static const int positions[TASK_MANAGER_TAB_COUNT] = {8, 112, 211, 326};
+    int available;
+
+    if (tab < 0 || tab >= TASK_MANAGER_TAB_COUNT)
+        return 8;
+    if (manager == NULL || manager->width >= 416)
+        return positions[tab];
+    available = manager->width - 16;
+    if (available < 0)
+        available = 0;
+    return 8 + available * (int)tab / TASK_MANAGER_TAB_COUNT;
+}
+
+static int task_manager_tab_width(const TaskManager *manager,
+                                  TaskManagerTab tab)
+{
+    static const int widths[TASK_MANAGER_TAB_COUNT] = {105, 100, 116, 82};
+    int available;
+    int left;
+    int right;
+
+    if (tab < 0 || tab >= TASK_MANAGER_TAB_COUNT)
+        return 0;
+    if (manager == NULL || manager->width >= 416)
+        return widths[tab];
+    available = manager->width - 16;
+    if (available <= 0)
+        return 0;
+    left = available * (int)tab / TASK_MANAGER_TAB_COUNT;
+    right = available * ((int)tab + 1) / TASK_MANAGER_TAB_COUNT;
+    return right - left;
+}
+
+static int task_manager_content_top(void)
+{
+    return 73;
+}
+
+static int task_manager_status_y(const TaskManager *manager)
+{
+    return manager->height - 24;
+}
+
+static int task_manager_action_y(const TaskManager *manager)
+{
+    return manager->height - 58;
+}
+
+static int task_manager_list_visible_rows(const TaskManager *manager)
+{
+    int height = task_manager_action_y(manager) -
+                 (task_manager_content_top() + 32) - 7;
+    int rows = height / TASK_MANAGER_ROW_HEIGHT;
+
+    return rows > 0 ? rows : 0;
+}
+
+static bool task_manager_actions_visible(const TaskManager *manager)
+{
+    return manager != NULL &&
+           task_manager_action_y(manager) >= task_manager_content_top() + 5 &&
+           task_manager_action_y(manager) + 26 <=
+               task_manager_status_y(manager);
+}
+
+static bool task_manager_status_visible(const TaskManager *manager)
+{
+    return manager != NULL && manager->width >= 12 &&
+           task_manager_status_y(manager) >= task_manager_content_top();
+}
+
+static int task_manager_content_bottom(const TaskManager *manager)
+{
+    return task_manager_status_visible(manager)
+               ? task_manager_status_y(manager) - 5
+               : manager->height - 5;
+}
+
+static void task_manager_application_button_geometry(
+    const TaskManager *manager, int button, int *x, int *width)
+{
+    int available;
+    int gap = 4;
+    int each;
+
+    *x = 0;
+    *width = 0;
+    if (manager == NULL || button < 0 || button > 2)
+        return;
+    if (manager->width >= 314) {
+        *x = button == 0 ? 8 : (button == 1 ? 108 : manager->width - 106);
+        *width = button == 2 ? 98 : 92;
+        return;
+    }
+    available = manager->width - 16;
+    if (available <= gap * 2)
+        return;
+    each = (available - gap * 2) / 3;
+    if (each < 2)
+        return;
+    *x = 8 + button * (each + gap);
+    *width = button == 2 ? available - 2 * (each + gap) : each;
+}
+
+static void task_manager_process_button_geometry(const TaskManager *manager,
+                                                 int button, int *x,
+                                                 int *width)
+{
+    int available;
+    int gap = 6;
+    int first;
+
+    *x = 0;
+    *width = 0;
+    if (manager == NULL || button < 0 || button > 1)
+        return;
+    if (manager->width >= 226) {
+        *x = button == 0 ? 8 : manager->width - 118;
+        *width = button == 0 ? 92 : 110;
+        return;
+    }
+    available = manager->width - 16;
+    if (available <= gap)
+        return;
+    first = (available - gap) / 2;
+    if (first < 2)
+        return;
+    *x = button == 0 ? 8 : 8 + first + gap;
+    *width = button == 0 ? first : available - first - gap;
+}
+
+static Drawable task_manager_drawable(WindowManager *wm)
+{
+    TaskManager *manager = &wm->task_manager;
+
+    if (manager->backing != None &&
+        (manager->backing_width != manager->width ||
+         manager->backing_height != manager->height)) {
+        XFreePixmap(wm->display, manager->backing);
+        manager->backing = None;
+    }
+    if (manager->backing == None && manager->width > 0 &&
+        manager->height > 0) {
+        manager->backing = XCreatePixmap(
+            wm->display, manager->window, (unsigned)manager->width,
+            (unsigned)manager->height,
+            (unsigned)DefaultDepth(wm->display, wm->screen));
+        if (manager->backing != None) {
+            manager->backing_width = manager->width;
+            manager->backing_height = manager->height;
+        }
+    }
+    return manager->backing != None ? manager->backing : manager->window;
+}
+
+static void draw_fitted_text(WindowManager *wm, Drawable drawable, int x,
+                             int baseline, unsigned long color,
+                             const char *value, int maximum_width)
+{
+    char fitted[512];
+
+    if (maximum_width <= 0)
+        return;
+    fitted_text(wm, value != NULL ? value : "", maximum_width, fitted,
+                sizeof(fitted));
+    draw_text(wm, drawable, x, baseline, color, fitted);
+}
+
+static void task_manager_draw_chrome(WindowManager *wm, Drawable drawable)
+{
+    static const char *const labels[TASK_MANAGER_TAB_COUNT] = {
+        "Applications", "Processes", "Performance", "System"};
+    TaskManager *manager = &wm->task_manager;
+    int width = manager->width;
+    int height = manager->height;
+    int tab;
+
+    XSetForeground(wm->display, wm->gc, wm->theme.silver);
+    task_manager_fill_rectangle(wm, drawable, 0, 0, width, height);
+    task_manager_draw_bevel(wm, drawable, 0, 0, width, height, false);
+    if (width > 6) {
+        XSetForeground(wm->display, wm->gc,
+                       wm->internal_focus == INTERNAL_FOCUS_TASK_MANAGER
+                           ? wm->theme.active_title
+                           : wm->theme.dark_gray);
+        task_manager_fill_rectangle(wm, drawable, 3, 3, width - 6,
+                                    TITLE_HEIGHT);
+    }
+    if (width >= 90) {
+        draw_supplied_icon(wm, drawable, ICON_CATEGORY_TASK_MANAGER,
+                           ICON_SIZE_SMALL, 7, 5);
+        draw_fitted_text(wm, drawable, 28, 17, wm->theme.white,
+                         "Windows 98 Task Manager",
+                         internal_maximize_button_x(width) - 34);
+    }
+    if (width >= TITLE_BUTTON * 2 + 18) {
+        draw_title_button(
+            wm, drawable, internal_maximize_button_x(width), 4,
+            manager->layout == CLIENT_LAYOUT_MAXIMIZED
+                ? TITLE_GLYPH_RESTORE
+                : TITLE_GLYPH_MAXIMIZE);
+        draw_title_button(wm, drawable, internal_close_button_x(width), 4,
+                          TITLE_GLYPH_CLOSE);
+    }
+
+    if (width >= 35)
+        draw_text(wm, drawable, 9, 42, wm->theme.black, "File");
+    if (width >= 96)
+        draw_text(wm, drawable, 47, 42, wm->theme.black, "Options");
+    if (width >= 140)
+        draw_text(wm, drawable, 105, 42, wm->theme.black, "View");
+    if (width >= 180)
+        draw_text(wm, drawable, 145, 42, wm->theme.black, "Help");
+    if (width > 9) {
+        XSetForeground(wm->display, wm->gc, wm->theme.dark_gray);
+        XDrawLine(wm->display, drawable, wm->gc, 4, 47, width - 5, 47);
+        XSetForeground(wm->display, wm->gc, wm->theme.white);
+        XDrawLine(wm->display, drawable, wm->gc, 4, 48, width - 5, 48);
+    }
+
+    for (tab = 0; tab < TASK_MANAGER_TAB_COUNT; ++tab) {
+        int x = task_manager_tab_x(manager, (TaskManagerTab)tab);
+        int tab_width = task_manager_tab_width(manager, (TaskManagerTab)tab);
+        bool selected = manager->tab == (TaskManagerTab)tab;
+        int y = selected ? 50 : 53;
+        int tab_height = selected ? TASK_MANAGER_TAB_HEIGHT :
+                                    TASK_MANAGER_TAB_HEIGHT - 3;
+
+        if (x >= width - 7)
+            continue;
+        if (x + tab_width > width - 7)
+            tab_width = width - 7 - x;
+        if (tab_width < 12)
+            continue;
+        XSetForeground(wm->display, wm->gc, wm->theme.silver);
+        task_manager_fill_rectangle(wm, drawable, x, y, tab_width,
+                                    tab_height);
+        task_manager_draw_bevel(wm, drawable, x, y, tab_width, tab_height,
+                                false);
+        draw_centered_text(wm, drawable, labels[tab], x + tab_width / 2,
+                           y + 16, wm->theme.black, tab_width - 8);
+    }
+}
+
+static void task_manager_draw_list_box(WindowManager *wm, Drawable drawable,
+                                       int *list_x, int *list_y,
+                                       int *list_width)
+{
+    TaskManager *manager = &wm->task_manager;
+    int x = 8;
+    int y = task_manager_content_top();
+    int width = manager->width - 16;
+    int height = task_manager_action_y(manager) - y - 5;
+
+    XSetForeground(wm->display, wm->gc, wm->theme.white);
+    task_manager_fill_rectangle(wm, drawable, x, y, width, height);
+    task_manager_draw_bevel(wm, drawable, x, y, width, height, true);
+    if (height > 28 && width > 4) {
+        XSetForeground(wm->display, wm->gc, wm->theme.silver);
+        task_manager_fill_rectangle(wm, drawable, x + 2, y + 2, width - 4,
+                                    25);
+        task_manager_draw_bevel(wm, drawable, x + 2, y + 2, width - 4, 25,
+                                false);
+    }
+    *list_x = x + 3;
+    *list_y = y + 29;
+    *list_width = width > 6 ? width - 6 : 0;
+}
+
+static void task_manager_clamp_application_scroll(WindowManager *wm)
+{
+    TaskManager *manager = &wm->task_manager;
+    int maximum = (int)task_manager_application_count(wm) -
+                  task_manager_list_visible_rows(manager);
+
+    if (maximum < 0)
+        maximum = 0;
+    if (manager->application_scroll < 0)
+        manager->application_scroll = 0;
+    if (manager->application_scroll > maximum)
+        manager->application_scroll = maximum;
+}
+
+static void task_manager_clamp_process_scroll(WindowManager *wm)
+{
+    TaskManager *manager = &wm->task_manager;
+    const Win31xTaskManagerSnapshot *snapshot =
+        win31x_task_manager_data_snapshot(&manager->data);
+    int count = snapshot == NULL
+                    ? 0
+                    : (snapshot->process_count <= (size_t)INT_MAX
+                           ? (int)snapshot->process_count
+                           : INT_MAX);
+    int maximum = count - task_manager_list_visible_rows(manager);
+
+    if (maximum < 0)
+        maximum = 0;
+    if (manager->process_scroll < 0)
+        manager->process_scroll = 0;
+    if (manager->process_scroll > maximum)
+        manager->process_scroll = maximum;
+}
+
+static void task_manager_draw_applications(WindowManager *wm,
+                                           Drawable drawable)
+{
+    TaskManager *manager = &wm->task_manager;
+    Client *selected = task_manager_selected_application(wm);
+    int x;
+    int y;
+    int width;
+    int rows = task_manager_list_visible_rows(manager);
+    int index;
+    int status_x;
+    bool selection_available;
+    bool show_status;
+    int button_x;
+    int button_width;
+
+    task_manager_clamp_application_scroll(wm);
+    task_manager_draw_list_box(wm, drawable, &x, &y, &width);
+    status_x = x + width * 3 / 4;
+    show_status = width >= 160;
+    if (width > 12)
+        draw_text(wm, drawable, x + 5, y - 11, wm->theme.black, "Task");
+    if (show_status)
+        draw_text(wm, drawable, status_x, y - 11, wm->theme.black, "Status");
+    for (index = 0; index < rows; ++index) {
+        int application_index = manager->application_scroll + index;
+        Client *client = task_manager_application_at(
+            wm, (size_t)application_index);
+        int row_y = y + index * TASK_MANAGER_ROW_HEIGHT;
+        bool is_selected;
+        bool family_is_active;
+        unsigned long color;
+        const char *status;
+
+        if (client == NULL)
+            break;
+        is_selected = client->window == manager->selected_application;
+        if (is_selected) {
+            XSetForeground(wm->display, wm->gc, wm->theme.active_title);
+            task_manager_fill_rectangle(wm, drawable, x + 1, row_y,
+                                        width - 2,
+                                        TASK_MANAGER_ROW_HEIGHT);
+        }
+        color = is_selected ? wm->theme.white : wm->theme.black;
+        if (client->actual_icon_small.color != None)
+            draw_rendered_icon_centered(wm, drawable,
+                                        &client->actual_icon_small, x + 3,
+                                        row_y + 2, 16, 16);
+        else
+            draw_supplied_icon(wm, drawable, client_icon_category(client),
+                               ICON_SIZE_SMALL, x + 3, row_y + 2);
+        draw_fitted_text(wm, drawable, x + 23, row_y + 15, color,
+                         client->title,
+                         (show_status ? status_x : x + width) - x - 27);
+        family_is_active = wm->active != NULL && !wm->active->minimized &&
+                           task_manager_application_family_contains(
+                               wm, client, wm->active);
+        status = client->minimized
+                     ? "Minimized"
+                     : (family_is_active ? "Active" : "Running");
+        if (show_status)
+            draw_fitted_text(wm, drawable, status_x, row_y + 15, color,
+                             status, x + width - status_x - 5);
+    }
+    if (rows > 0 && width > 12 && task_manager_application_count(wm) == 0U)
+        draw_centered_text(wm, drawable, "No applications are running",
+                           manager->width / 2,
+                           y + TASK_MANAGER_ROW_HEIGHT + 8,
+                           wm->theme.dark_gray, manager->width - 40);
+    selection_available = selected != NULL;
+    if (!task_manager_actions_visible(manager))
+        return;
+    task_manager_application_button_geometry(manager, 0, &button_x,
+                                             &button_width);
+    draw_button(wm, drawable, button_x, task_manager_action_y(manager),
+                button_width, 26, "New Task...", false, true);
+    task_manager_application_button_geometry(manager, 1, &button_x,
+                                             &button_width);
+    draw_button(wm, drawable, button_x, task_manager_action_y(manager),
+                button_width, 26, "Switch To", false, selection_available);
+    task_manager_application_button_geometry(manager, 2, &button_x,
+                                             &button_width);
+    draw_button(wm, drawable, button_x, task_manager_action_y(manager),
+                button_width, 26, "End Task", false, selection_available);
+}
+
+static void task_manager_draw_processes(WindowManager *wm, Drawable drawable)
+{
+    TaskManager *manager = &wm->task_manager;
+    const Win31xTaskManagerSnapshot *snapshot =
+        win31x_task_manager_data_snapshot(&manager->data);
+    const Win31xTaskManagerProcess *selected =
+        task_manager_selected_process(manager);
+    int x;
+    int y;
+    int width;
+    int rows = task_manager_list_visible_rows(manager);
+    int name_x;
+    int pid_x;
+    int cpu_x;
+    int memory_x;
+    int user_x;
+    int row;
+    int button_x;
+    int button_width;
+    bool show_pid;
+    bool show_cpu;
+    bool show_memory;
+    bool show_user;
+    const char *action_label = "End Process";
+    bool action_enabled = selected != NULL && selected->owned_by_user &&
+                          selected->pid > 1 && selected->pid != getpid();
+    bool selected_is_terminating =
+        selected != NULL && selected->pid == manager->terminating_pid &&
+        selected->start_time_ticks == manager->terminating_start_time;
+
+    task_manager_clamp_process_scroll(wm);
+    task_manager_draw_list_box(wm, drawable, &x, &y, &width);
+    name_x = x + 5;
+    show_pid = width >= 120;
+    show_cpu = width >= 390;
+    show_memory = width >= 240;
+    show_user = width >= 390;
+    if (show_cpu) {
+        pid_x = x + width * 43 / 100;
+        cpu_x = x + width * 54 / 100;
+        memory_x = x + width * 65 / 100;
+        user_x = x + width * 84 / 100;
+    } else if (show_memory) {
+        pid_x = x + width * 60 / 100;
+        cpu_x = pid_x;
+        memory_x = x + width * 76 / 100;
+        user_x = x + width;
+    } else {
+        pid_x = x + width * 75 / 100;
+        cpu_x = pid_x;
+        memory_x = x + width;
+        user_x = x + width;
+    }
+    if (!show_pid)
+        pid_x = x + width;
+    if (width > 12)
+        draw_text(wm, drawable, name_x, y - 11, wm->theme.black,
+                  "Image Name");
+    if (show_pid)
+        draw_text(wm, drawable, pid_x, y - 11, wm->theme.black, "PID");
+    if (show_cpu)
+        draw_text(wm, drawable, cpu_x, y - 11, wm->theme.black, "CPU");
+    if (show_memory)
+        draw_text(wm, drawable, memory_x, y - 11, wm->theme.black, "Memory");
+    if (show_user)
+        draw_text(wm, drawable, user_x, y - 11, wm->theme.black, "User");
+    for (row = 0; row < rows; ++row) {
+        size_t process_index = (size_t)(manager->process_scroll + row);
+        const Win31xTaskManagerProcess *process;
+        int row_y = y + row * TASK_MANAGER_ROW_HEIGHT;
+        bool is_selected;
+        unsigned long color;
+        char pid_text[32];
+        char cpu_text[32];
+        char memory_text[32];
+        char user_text[32];
+
+        if (snapshot == NULL || process_index >= snapshot->process_count)
+            break;
+        process = &snapshot->processes[process_index];
+        is_selected = process->pid == manager->selected_pid &&
+                      process->start_time_ticks == manager->selected_start_time;
+        if (is_selected) {
+            XSetForeground(wm->display, wm->gc, wm->theme.active_title);
+            task_manager_fill_rectangle(wm, drawable, x + 1, row_y,
+                                        width - 2,
+                                        TASK_MANAGER_ROW_HEIGHT);
+        }
+        color = is_selected ? wm->theme.white : wm->theme.black;
+        snprintf(pid_text, sizeof(pid_text), "%ld", (long)process->pid);
+        if (process->cpu_percent_valid)
+            snprintf(cpu_text, sizeof(cpu_text), "%.1f%%",
+                     process->cpu_percent);
+        else
+            snprintf(cpu_text, sizeof(cpu_text), "--");
+        format_task_manager_bytes(process->resident_bytes, memory_text,
+                                  sizeof(memory_text));
+        if (process->owned_by_user)
+            snprintf(user_text, sizeof(user_text), "You");
+        else if (process->uid == 0)
+            snprintf(user_text, sizeof(user_text), "root");
+        else
+            snprintf(user_text, sizeof(user_text), "UID %lu",
+                     (unsigned long)process->uid);
+        draw_fitted_text(wm, drawable, name_x, row_y + 15, color,
+                         process->name, pid_x - name_x - 5);
+        if (show_pid)
+            draw_fitted_text(wm, drawable, pid_x, row_y + 15, color,
+                             pid_text,
+                             (show_cpu ? cpu_x : memory_x) - pid_x - 4);
+        if (show_cpu)
+            draw_fitted_text(wm, drawable, cpu_x, row_y + 15, color,
+                             cpu_text, memory_x - cpu_x - 4);
+        if (show_memory)
+            draw_fitted_text(wm, drawable, memory_x, row_y + 15, color,
+                             memory_text, user_x - memory_x - 4);
+        if (show_user)
+            draw_fitted_text(wm, drawable, user_x, row_y + 15, color,
+                             user_text, x + width - user_x - 3);
+    }
+    if (rows > 0 && width > 12 &&
+        (snapshot == NULL || snapshot->process_count == 0U))
+        draw_centered_text(wm, drawable, "No process information is available",
+                           manager->width / 2,
+                           y + TASK_MANAGER_ROW_HEIGHT + 8,
+                           wm->theme.dark_gray, manager->width - 40);
+    if (selected_is_terminating) {
+        if (manager->force_ready) {
+            action_label = "Force End";
+        } else {
+            action_label = "Ending...";
+            action_enabled = false;
+        }
+    } else if (selected != NULL && manager->confirm_pid == selected->pid &&
+               manager->confirm_start_time == selected->start_time_ticks &&
+               monotonic_milliseconds() <= manager->confirm_until_ms) {
+        action_label = "Confirm End";
+    }
+    if (!task_manager_actions_visible(manager))
+        return;
+    task_manager_process_button_geometry(manager, 0, &button_x,
+                                         &button_width);
+    draw_button(wm, drawable, button_x, task_manager_action_y(manager),
+                button_width, 26, "Refresh", false,
+                manager->data_available);
+    task_manager_process_button_geometry(manager, 1, &button_x,
+                                         &button_width);
+    draw_button(wm, drawable, button_x, task_manager_action_y(manager),
+                button_width, 26, action_label, false, action_enabled);
+}
+
+static void task_manager_draw_graph(WindowManager *wm, Drawable drawable,
+                                    int x, int y, int width, int height,
+                                    const double *history, size_t count,
+                                    const char *label, double current)
+{
+    XPoint points[TASK_MANAGER_HISTORY_LENGTH];
+    size_t shown;
+    size_t first;
+    size_t index;
+    char value[64];
+    int inner_width;
+    int inner_height;
+
+    if (width < 30 || height < 30)
+        return;
+    XSetForeground(wm->display, wm->gc, wm->theme.black);
+    task_manager_fill_rectangle(wm, drawable, x, y, width, height);
+    task_manager_draw_bevel(wm, drawable, x - 1, y - 1, width + 2,
+                            height + 2, true);
+    XSetForeground(wm->display, wm->gc, wm->theme.graph_grid);
+    for (index = 1U; index < 4U; ++index) {
+        int grid_x = x + (int)((size_t)width * index / 4U);
+        int grid_y = y + (int)((size_t)height * index / 4U);
+
+        XDrawLine(wm->display, drawable, wm->gc, grid_x, y, grid_x,
+                  y + height - 1);
+        XDrawLine(wm->display, drawable, wm->gc, x, grid_y, x + width - 1,
+                  grid_y);
+    }
+    inner_width = width - 2;
+    inner_height = height - 3;
+    shown = count;
+    if (shown > (size_t)inner_width)
+        shown = (size_t)inner_width;
+    first = count - shown;
+    for (index = 0U; index < shown; ++index) {
+        double value_at = history[first + index];
+
+        if (value_at < 0.0)
+            value_at = 0.0;
+        if (value_at > 100.0)
+            value_at = 100.0;
+        points[index].x = (short)(x + 1 +
+            (shown > 1U ? (int)(index * (size_t)(inner_width - 1) /
+                                     (shown - 1U))
+                        : inner_width - 1));
+        points[index].y = (short)(y + height - 2 -
+                                  (int)(value_at * inner_height / 100.0));
+    }
+    if (shown >= 2U) {
+        XSetForeground(wm->display, wm->gc, wm->theme.graph_green);
+        XDrawLines(wm->display, drawable, wm->gc, points, (int)shown,
+                   CoordModeOrigin);
+    }
+    draw_text(wm, drawable, x + 5, y + 15, wm->theme.graph_green, label);
+    snprintf(value, sizeof(value), "%.1f%%", current);
+    draw_fitted_text(wm, drawable, x + width - 70, y + 15,
+                     wm->theme.graph_green, value, 65);
+}
+
+static void task_manager_draw_performance(WindowManager *wm,
+                                          Drawable drawable)
+{
+    TaskManager *manager = &wm->task_manager;
+    const Win31xTaskManagerSnapshot *snapshot =
+        win31x_task_manager_data_snapshot(&manager->data);
+    double cpu = snapshot != NULL && snapshot->system.cpu_percent_valid
+                     ? snapshot->system.cpu_percent
+                     : 0.0;
+    double memory = snapshot != NULL
+                        ? task_manager_memory_percent(&snapshot->system)
+                        : 0.0;
+    int x = 12;
+    int y = task_manager_content_top() + 10;
+    int width = manager->width - 24;
+    int available_height = task_manager_content_bottom(manager) - y - 7;
+
+    if (width >= 560) {
+        int graph_width = (width - 12) / 2;
+
+        task_manager_draw_graph(wm, drawable, x, y, graph_width,
+                                available_height, manager->cpu_history,
+                                manager->history_count, "CPU Usage History",
+                                cpu);
+        task_manager_draw_graph(wm, drawable, x + graph_width + 12, y,
+                                width - graph_width - 12, available_height,
+                                manager->memory_history,
+                                manager->history_count,
+                                "Memory Usage History", memory);
+    } else {
+        int graph_height = (available_height - 10) / 2;
+
+        task_manager_draw_graph(wm, drawable, x, y, width, graph_height,
+                                manager->cpu_history, manager->history_count,
+                                "CPU Usage History", cpu);
+        task_manager_draw_graph(wm, drawable, x, y + graph_height + 10,
+                                width, available_height - graph_height - 10,
+                                manager->memory_history,
+                                manager->history_count,
+                                "Memory Usage History", memory);
+    }
+}
+
+static void task_manager_draw_system_row(WindowManager *wm, Drawable drawable,
+                                         int x, int y, int label_width,
+                                         int value_width, const char *label,
+                                         const char *value)
+{
+    draw_fitted_text(wm, drawable, x, y, wm->theme.dark_gray, label,
+                     label_width - 8);
+    draw_fitted_text(wm, drawable, x + label_width, y, wm->theme.black, value,
+                     value_width);
+}
+
+static void task_manager_draw_system(WindowManager *wm, Drawable drawable)
+{
+    TaskManager *manager = &wm->task_manager;
+    const Win31xTaskManagerSnapshot *snapshot =
+        win31x_task_manager_data_snapshot(&manager->data);
+    int x = 16;
+    int y = task_manager_content_top() + 20;
+    int width = manager->width - 32;
+    int label_width = width > 400 ? 145 : width / 3;
+    char memory[128];
+    char uptime[96];
+    char cores[32];
+    char load[96];
+    char processes[64];
+    char memory_total[48];
+    char memory_used[48];
+    uint64_t used = 0U;
+    int content_height = task_manager_content_bottom(manager) -
+                         task_manager_content_top();
+    const char *labels[9];
+    const char *values[9];
+    size_t row;
+
+    XSetForeground(wm->display, wm->gc, wm->theme.white);
+    task_manager_fill_rectangle(wm, drawable, 8, task_manager_content_top(),
+                                manager->width - 16, content_height);
+    task_manager_draw_bevel(wm, drawable, 8, task_manager_content_top(),
+                            manager->width - 16, content_height, true);
+    if (content_height <= 8 || width <= 0)
+        return;
+    draw_supplied_icon(wm, drawable, ICON_CATEGORY_TASK_MANAGER,
+                       ICON_SIZE_LARGE, x, y - 11);
+    if (width > 50)
+        draw_fitted_text(wm, drawable, x + 42, y + 2, wm->theme.black,
+                         "System Information", width - 42);
+    y += 42;
+    if (snapshot == NULL) {
+        draw_text(wm, drawable, x, y, wm->theme.dark_gray,
+                  "System information is unavailable.");
+        return;
+    }
+    if (snapshot->system.memory_total_bytes >
+        snapshot->system.memory_available_bytes)
+        used = snapshot->system.memory_total_bytes -
+               snapshot->system.memory_available_bytes;
+    format_task_manager_bytes(snapshot->system.memory_total_bytes,
+                              memory_total, sizeof(memory_total));
+    format_task_manager_bytes(used, memory_used, sizeof(memory_used));
+    snprintf(memory, sizeof(memory), "%s used / %s total", memory_used,
+             memory_total);
+    format_task_manager_uptime(snapshot->system.uptime_seconds, uptime,
+                               sizeof(uptime));
+    snprintf(cores, sizeof(cores), "%u logical processor%s",
+             snapshot->system.cpu_core_count,
+             snapshot->system.cpu_core_count == 1U ? "" : "s");
+    snprintf(load, sizeof(load), "%.2f, %.2f, %.2f",
+             snapshot->system.load_average[0],
+             snapshot->system.load_average[1],
+             snapshot->system.load_average[2]);
+    snprintf(processes, sizeof(processes), "%zu%s", snapshot->process_count,
+             snapshot->process_list_truncated ? " (list truncated)" : "");
+    labels[0] = "Operating system:";
+    labels[1] = "Computer name:";
+    labels[2] = "Kernel:";
+    labels[3] = "Processor:";
+    labels[4] = "CPU configuration:";
+    labels[5] = "Physical memory:";
+    labels[6] = "System uptime:";
+    labels[7] = "Load averages:";
+    labels[8] = "Processes:";
+    values[0] = snapshot->system.operating_system;
+    values[1] = snapshot->system.hostname;
+    values[2] = snapshot->system.kernel;
+    values[3] = snapshot->system.cpu_model;
+    values[4] = cores;
+    values[5] = memory;
+    values[6] = uptime;
+    values[7] = load;
+    values[8] = processes;
+    for (row = 0U; row < sizeof(labels) / sizeof(labels[0]); ++row) {
+        if (y + 5 > task_manager_content_bottom(manager))
+            break;
+        task_manager_draw_system_row(wm, drawable, x, y, label_width,
+                                     width - label_width, labels[row],
+                                     values[row]);
+        y += 26;
+    }
+}
+
+static void task_manager_draw_status(WindowManager *wm, Drawable drawable)
+{
+    TaskManager *manager = &wm->task_manager;
+    const Win31xTaskManagerSnapshot *snapshot =
+        win31x_task_manager_data_snapshot(&manager->data);
+    char status[256];
+
+    if (!task_manager_status_visible(manager))
+        return;
+
+    XSetForeground(wm->display, wm->gc, wm->theme.silver);
+    task_manager_fill_rectangle(wm, drawable, 5,
+                                task_manager_status_y(manager),
+                                manager->width - 10, 19);
+    task_manager_draw_bevel(wm, drawable, 5,
+                            task_manager_status_y(manager),
+                            manager->width - 10, 19, true);
+    if (manager->status[0] != '\0') {
+        snprintf(status, sizeof(status), "%s", manager->status);
+    } else if (snapshot != NULL) {
+        double cpu = snapshot->system.cpu_percent_valid
+                         ? snapshot->system.cpu_percent
+                         : 0.0;
+        double memory = task_manager_memory_percent(&snapshot->system);
+
+        snprintf(status, sizeof(status),
+                 "Processes: %zu   CPU Usage: %.1f%%   Memory Usage: %.1f%%",
+                 snapshot->process_count, cpu, memory);
+    } else {
+        snprintf(status, sizeof(status), "System information unavailable");
+    }
+    draw_fitted_text(wm, drawable, 10, task_manager_status_y(manager) + 14,
+                     wm->theme.black, status, manager->width - 20);
+}
+
+static void draw_task_manager(WindowManager *wm)
+{
+    TaskManager *manager = &wm->task_manager;
+    Drawable drawable;
+
+    if (manager->window == None || manager->width <= 0 ||
+        manager->height <= 0)
+        return;
+    drawable = task_manager_drawable(wm);
+    task_manager_draw_chrome(wm, drawable);
+    switch (manager->tab) {
+    case TASK_MANAGER_TAB_APPLICATIONS:
+        task_manager_draw_applications(wm, drawable);
+        break;
+    case TASK_MANAGER_TAB_PROCESSES:
+        task_manager_draw_processes(wm, drawable);
+        break;
+    case TASK_MANAGER_TAB_PERFORMANCE:
+        task_manager_draw_performance(wm, drawable);
+        break;
+    case TASK_MANAGER_TAB_SYSTEM:
+        task_manager_draw_system(wm, drawable);
+        break;
+    default:
+        manager->tab = TASK_MANAGER_TAB_APPLICATIONS;
+        task_manager_draw_applications(wm, drawable);
+        break;
+    }
+    task_manager_draw_status(wm, drawable);
+    if (manager->backing != None)
+        XCopyArea(wm->display, manager->backing, manager->window, wm->gc,
+                  0, 0, (unsigned)manager->width,
+                  (unsigned)manager->height, 0, 0);
+}
+
+static void restore_task_manager_placement(WindowManager *wm)
+{
+    TaskManager *manager = &wm->task_manager;
+    const Win31xDesktopPlacement *saved = &wm->desktop_state.task_manager;
+    size_t monitor_index;
+    int x;
+    int y;
+    int width;
+    int height;
+
+    if (!saved->valid)
+        return;
+    monitor_index = geometry_from_placement(wm, saved, &x, &y, &width,
+                                            &height, true);
+    manager->x = x;
+    manager->y = y;
+    manager->width = width;
+    manager->height = height;
+    manager->layout = (ClientLayout)saved->layout;
+    manager->layout_before_maximize =
+        (ClientLayout)saved->layout_before_maximize;
+    if (manager->layout != CLIENT_LAYOUT_NORMAL) {
+        manager->restore_x = x;
+        manager->restore_y = y;
+        manager->restore_width = width;
+        manager->restore_height = height;
+        manager->restore_valid = true;
+        set_monitor_anchor(&manager->layout_monitor,
+                           monitor_at(wm, monitor_index));
+        screen_layout_geometry(monitor_at(wm, monitor_index), manager->layout,
+                               &manager->x, &manager->y, &manager->width,
+                               &manager->height);
+    }
+    manager->positioned = true;
+}
+
+static void remember_task_manager_placement(WindowManager *wm)
+{
+    TaskManager *manager = &wm->task_manager;
+    size_t monitor_index;
+    int x = manager->x;
+    int y = manager->y;
+    int width = manager->width;
+    int height = manager->height;
+
+    if (manager->layout != CLIENT_LAYOUT_NORMAL && manager->restore_valid) {
+        x = manager->restore_x;
+        y = manager->restore_y;
+        width = manager->restore_width;
+        height = manager->restore_height;
+    }
+    monitor_index = manager->layout != CLIENT_LAYOUT_NORMAL &&
+                            manager->layout_monitor.valid
+                        ? monitor_index_for_anchor(wm,
+                                                   &manager->layout_monitor)
+                        : monitor_index_for_rectangle(wm, x, y, width,
+                                                      height);
+    placement_from_geometry(wm, &wm->desktop_state.task_manager,
+                            monitor_index, x, y, width, height,
+                            manager->layout);
+    if (wm->desktop_state.task_manager.valid) {
+        wm->desktop_state.task_manager.layout_before_maximize =
+            (Win31xDesktopLayout)manager->layout_before_maximize;
+        mark_desktop_state_dirty(wm);
+    }
+}
+
+static void apply_task_manager_layout(WindowManager *wm, ClientLayout layout)
+{
+    TaskManager *manager = &wm->task_manager;
+
+    if (layout == CLIENT_LAYOUT_NORMAL &&
+        manager->layout == CLIENT_LAYOUT_MAXIMIZED &&
+        manager->layout_before_maximize != CLIENT_LAYOUT_NORMAL)
+        layout = manager->layout_before_maximize;
+    if (layout == CLIENT_LAYOUT_MAXIMIZED &&
+        manager->layout != CLIENT_LAYOUT_MAXIMIZED)
+        manager->layout_before_maximize = manager->layout;
+    if (layout == CLIENT_LAYOUT_NORMAL) {
+        if (manager->layout == CLIENT_LAYOUT_NORMAL)
+            return;
+        manager->layout = CLIENT_LAYOUT_NORMAL;
+        if (manager->restore_valid) {
+            manager->x = manager->restore_x;
+            manager->y = manager->restore_y;
+            manager->width = manager->restore_width;
+            manager->height = manager->restore_height;
+        }
+        manager->restore_valid = false;
+        manager->layout_monitor.valid = false;
+        clamp_internal_geometry(wm, &manager->x, &manager->y,
+                                &manager->width, &manager->height);
+    } else {
+        const MonitorGeometry *monitor;
+
+        if (!manager->layout_monitor.valid) {
+            set_monitor_anchor(
+                &manager->layout_monitor,
+                monitor_at(wm, monitor_index_for_rectangle(
+                                   wm, manager->x, manager->y,
+                                   manager->width, manager->height)));
+        }
+        if (manager->layout == CLIENT_LAYOUT_NORMAL) {
+            manager->restore_x = manager->x;
+            manager->restore_y = manager->y;
+            manager->restore_width = manager->width;
+            manager->restore_height = manager->height;
+            manager->restore_valid = true;
+        }
+        manager->layout = layout;
+        monitor = monitor_at(
+            wm, monitor_index_for_anchor(wm, &manager->layout_monitor));
+        set_monitor_anchor(&manager->layout_monitor, monitor);
+        screen_layout_geometry(monitor, layout, &manager->x, &manager->y,
+                               &manager->width, &manager->height);
+    }
+    task_manager_clamp_application_scroll(wm);
+    task_manager_clamp_process_scroll(wm);
+    XMoveResizeWindow(wm->display, manager->window, manager->x, manager->y,
+                      (unsigned)manager->width, (unsigned)manager->height);
+    draw_task_manager(wm);
+}
+
+static void toggle_task_manager_maximize(WindowManager *wm)
+{
+    apply_task_manager_layout(
+        wm, wm->task_manager.layout == CLIENT_LAYOUT_MAXIMIZED
+                ? CLIENT_LAYOUT_NORMAL
+                : CLIENT_LAYOUT_MAXIMIZED);
+    remember_task_manager_placement(wm);
+}
+
+static void position_task_manager_on_monitor(WindowManager *wm,
+                                             size_t monitor_index)
+{
+    TaskManager *manager = &wm->task_manager;
+    const MonitorGeometry *monitor = monitor_at(wm, monitor_index);
+    int available_width = monitor->width - 24;
+    int available_height = monitor->height - 24;
+
+    manager->layout = CLIENT_LAYOUT_NORMAL;
+    manager->layout_before_maximize = CLIENT_LAYOUT_NORMAL;
+    manager->restore_valid = false;
+    manager->layout_monitor.valid = false;
+    manager->width = available_width >= 420
+                         ? (available_width < TASK_MANAGER_DEFAULT_WIDTH
+                                ? available_width
+                                : TASK_MANAGER_DEFAULT_WIDTH)
+                         : monitor->width;
+    manager->height = available_height >= 340
+                          ? (available_height < TASK_MANAGER_DEFAULT_HEIGHT
+                                 ? available_height
+                                 : TASK_MANAGER_DEFAULT_HEIGHT)
+                          : monitor->height;
+    if (manager->width < 1)
+        manager->width = 1;
+    if (manager->height < 1)
+        manager->height = 1;
+    manager->x = monitor->x + (monitor->width - manager->width) / 2;
+    manager->y = monitor->y + (monitor->height - manager->height) / 2;
+    manager->positioned = true;
+    XMoveResizeWindow(wm->display, manager->window, manager->x, manager->y,
+                      (unsigned)manager->width, (unsigned)manager->height);
+}
+
+static void dismiss_task_manager(WindowManager *wm)
+{
+    TaskManager *manager = &wm->task_manager;
+
+    if (!manager->visible)
+        return;
+    manager->visible = false;
+    manager->confirm_pid = 0;
+    manager->confirm_start_time = 0U;
+    manager->confirm_until_ms = 0U;
+    manager->process_delete_down = false;
+    if (wm->internal_focus == INTERNAL_FOCUS_TASK_MANAGER)
+        wm->internal_focus = INTERNAL_FOCUS_NONE;
+    if (wm->drag.kind == DRAG_MOVE_TASK_MANAGER)
+        cancel_drag(wm, CurrentTime);
+    XUnmapWindow(wm->display, manager->window);
+    update_focus_overlays(wm);
+}
+
+static void remember_task_manager_return_focus(WindowManager *wm)
+{
+    TaskManager *manager = &wm->task_manager;
+
+    if (wm->internal_focus == INTERNAL_FOCUS_TASK_MANAGER)
+        return;
+    manager->return_internal_focus = wm->internal_focus;
+    manager->return_client =
+        wm->internal_focus == INTERNAL_FOCUS_NONE && wm->active != NULL
+            ? wm->active->window
+            : None;
+}
+
+static void restore_task_manager_return_focus(WindowManager *wm,
+                                              bool was_focused, Time time)
+{
+    TaskManager *manager = &wm->task_manager;
+    InternalFocus internal = manager->return_internal_focus;
+    Window client_window = manager->return_client;
+    Client *client = client_window != None
+                         ? client_for_client_window(wm, client_window)
+                         : NULL;
+
+    manager->return_internal_focus = INTERNAL_FOCUS_NONE;
+    manager->return_client = None;
+    if (!was_focused)
+        return;
+    if (internal == INTERNAL_FOCUS_APPLICATIONS && wm->launcher_visible) {
+        activate_internal_window(wm, INTERNAL_FOCUS_APPLICATIONS, time);
+        return;
+    }
+    if (internal == INTERNAL_FOCUS_CONTROL_PANEL &&
+        wm->control_panel.visible) {
+        activate_internal_window(wm, INTERNAL_FOCUS_CONTROL_PANEL, time);
+        return;
+    }
+    if (internal == INTERNAL_FOCUS_RUN && wm->run_dialog.visible) {
+        activate_internal_window(wm, INTERNAL_FOCUS_RUN, time);
+        return;
+    }
+    if (client != NULL && !client->minimized) {
+        focus_client(wm, client, time);
+        return;
+    }
+    focus_after_internal_close(wm, true, time);
+}
+
+static void hide_task_manager(WindowManager *wm)
+{
+    bool was_focused;
+
+    if (!wm->task_manager.visible)
+        return;
+    was_focused = wm->internal_focus == INTERNAL_FOCUS_TASK_MANAGER;
+    dismiss_task_manager(wm);
+    restore_task_manager_return_focus(wm, was_focused, CurrentTime);
+}
+
+static void show_task_manager(WindowManager *wm)
+{
+    TaskManager *manager = &wm->task_manager;
+
+    dismiss_desktop_menu(wm);
+    remember_task_manager_return_focus(wm);
+    if (manager->visible) {
+        activate_internal_window(wm, INTERNAL_FOCUS_TASK_MANAGER,
+                                 CurrentTime);
+        XFlush(wm->display);
+        refresh_task_manager(wm, false);
+        return;
+    }
+    manager->visible = true;
+    if (manager->data_available) {
+        manager->status[0] = '\0';
+        manager->status_is_refresh_error = false;
+        manager->status_is_closing_application = false;
+    } else {
+        snprintf(manager->status, sizeof(manager->status),
+                 "Task information is unavailable on this system.");
+        manager->status_is_refresh_error = false;
+        manager->status_is_closing_application = false;
+    }
+    if (!manager->positioned) {
+        position_task_manager_on_monitor(wm, active_monitor_index(wm));
+        remember_task_manager_placement(wm);
+    } else {
+        XMoveResizeWindow(wm->display, manager->window, manager->x,
+                          manager->y, (unsigned)manager->width,
+                          (unsigned)manager->height);
+    }
+    XMapWindow(wm->display, manager->window);
+    activate_internal_window(wm, INTERNAL_FOCUS_TASK_MANAGER, CurrentTime);
+    draw_task_manager(wm);
+    XFlush(wm->display);
+    refresh_task_manager(wm, true);
+}
+
+static void initialize_task_manager(WindowManager *wm)
+{
+    TaskManager *manager = &wm->task_manager;
+    XSetWindowAttributes attributes;
+
+    manager->width = TASK_MANAGER_DEFAULT_WIDTH;
+    manager->height = TASK_MANAGER_DEFAULT_HEIGHT;
+    manager->tab = TASK_MANAGER_TAB_APPLICATIONS;
+    restore_task_manager_placement(wm);
+    attributes.override_redirect = True;
+    attributes.background_pixel = wm->theme.silver;
+    attributes.event_mask = ExposureMask | ButtonPressMask |
+                            ButtonReleaseMask | PointerMotionMask |
+                            KeyPressMask | KeyReleaseMask;
+    attributes.cursor = wm->arrow_cursor;
+    manager->window = XCreateWindow(
+        wm->display, wm->root, manager->x, manager->y,
+        (unsigned)manager->width, (unsigned)manager->height, 0,
+        CopyFromParent, InputOutput, CopyFromParent,
+        CWOverrideRedirect | CWBackPixel | CWEventMask | CWCursor,
+        &attributes);
+    set_internal_role(wm, manager->window, "task-manager-window");
+    set_utf8_property(wm, manager->window, wm->atoms.net_wm_name,
+                      "Windows 98 Task Manager");
+    if (win31x_task_manager_data_init(&manager->data) < 0) {
+        manager->data_available = false;
+        snprintf(manager->status, sizeof(manager->status),
+                 "Task information is unavailable: %s", strerror(errno));
+        manager->status_is_refresh_error = false;
+        manager->status_is_closing_application = false;
+    } else {
+        manager->data_available = true;
+    }
+    task_manager_publish_state(wm);
+}
+
+static void task_manager_switch_to_application(WindowManager *wm, Time time)
+{
+    Client *client = task_manager_selected_application(wm);
+    Client *target;
+
+    if (client == NULL)
+        return;
+    if (client->minimized)
+        restore_client(wm, client, time);
+    else {
+        target = task_manager_application_focus_target(wm, client);
+        focus_client(wm, target, time);
+    }
+}
+
+static void task_manager_end_application(WindowManager *wm, Time time)
+{
+    Client *client = task_manager_selected_application(wm);
+
+    if (client == NULL)
+        return;
+    snprintf(wm->task_manager.status, sizeof(wm->task_manager.status),
+             "Closing %s...", client->title);
+    wm->task_manager.closing_application = client->window;
+    wm->task_manager.status_is_refresh_error = false;
+    wm->task_manager.status_is_closing_application = true;
+    close_client(wm, client, time);
+    draw_task_manager(wm);
+}
+
+static void task_manager_request_end_process(WindowManager *wm)
+{
+    TaskManager *manager = &wm->task_manager;
+    const Win31xTaskManagerProcess *process =
+        task_manager_selected_process(manager);
+    uint64_t now = monotonic_milliseconds();
+    char error[WIN31X_TASK_MANAGER_ERROR_CAPACITY];
+
+    if (process == NULL)
+        return;
+    manager->status_is_closing_application = false;
+    if (!process->owned_by_user || process->pid <= 1 ||
+        process->pid == getpid()) {
+        snprintf(manager->status, sizeof(manager->status),
+                 "This process cannot be ended by Task Manager.");
+        manager->status_is_refresh_error = false;
+        XBell(wm->display, 0);
+        draw_task_manager(wm);
+        return;
+    }
+    if (!manager->force_ready && process->pid == manager->terminating_pid &&
+        process->start_time_ticks == manager->terminating_start_time) {
+        snprintf(manager->status, sizeof(manager->status),
+                 "Waiting for %s (PID %ld) to exit...", process->name,
+                 (long)process->pid);
+        manager->status_is_refresh_error = false;
+        draw_task_manager(wm);
+        return;
+    }
+    if (manager->force_ready && process->pid == manager->terminating_pid &&
+        process->start_time_ticks == manager->terminating_start_time) {
+        if (win31x_task_manager_data_force_terminate(
+                &manager->data, process->pid, process->start_time_ticks,
+                error, sizeof(error)) < 0) {
+            snprintf(manager->status, sizeof(manager->status), "%s", error);
+            manager->status_is_refresh_error = false;
+            XBell(wm->display, 0);
+        } else {
+            manager->force_ready = false;
+            snprintf(manager->status, sizeof(manager->status),
+                     "Force-ending %s (PID %ld)...", process->name,
+                     (long)process->pid);
+            manager->status_is_refresh_error = false;
+        }
+        manager->next_refresh_ms = 0U;
+        draw_task_manager(wm);
+        return;
+    }
+    if (manager->confirm_pid != process->pid ||
+        manager->confirm_start_time != process->start_time_ticks ||
+        now > manager->confirm_until_ms) {
+        manager->confirm_pid = process->pid;
+        manager->confirm_start_time = process->start_time_ticks;
+        manager->confirm_until_ms = now + TASK_MANAGER_CONFIRM_MS;
+        snprintf(manager->status, sizeof(manager->status),
+                 "Warning: ending a process can lose data. Click End Process again to confirm PID %ld.",
+                 (long)process->pid);
+        manager->status_is_refresh_error = false;
+        XBell(wm->display, 0);
+        draw_task_manager(wm);
+        return;
+    }
+    manager->confirm_pid = 0;
+    manager->confirm_start_time = 0U;
+    manager->confirm_until_ms = 0U;
+    if (win31x_task_manager_data_terminate(
+            &manager->data, process->pid, process->start_time_ticks,
+            error, sizeof(error)) < 0) {
+        snprintf(manager->status, sizeof(manager->status), "%s", error);
+        manager->status_is_refresh_error = false;
+        XBell(wm->display, 0);
+    } else {
+        manager->terminating_pid = process->pid;
+        manager->terminating_start_time = process->start_time_ticks;
+        manager->force_due_ms = now + TASK_MANAGER_FORCE_DELAY_MS;
+        manager->force_ready = false;
+        snprintf(manager->status, sizeof(manager->status),
+                 "End signal sent to %s (PID %ld).", process->name,
+                 (long)process->pid);
+        manager->status_is_refresh_error = false;
+    }
+    manager->next_refresh_ms = 0U;
+    draw_task_manager(wm);
+}
+
+static int task_manager_selected_process_index(const TaskManager *manager)
+{
+    const Win31xTaskManagerSnapshot *snapshot =
+        win31x_task_manager_data_snapshot(&manager->data);
+    size_t index;
+
+    if (snapshot == NULL)
+        return -1;
+    for (index = 0U; index < snapshot->process_count; ++index) {
+        if (snapshot->processes[index].pid == manager->selected_pid &&
+            snapshot->processes[index].start_time_ticks ==
+                manager->selected_start_time)
+            return index <= (size_t)INT_MAX ? (int)index : -1;
+    }
+    return -1;
+}
+
+static void task_manager_select_process_index(WindowManager *wm, int index)
+{
+    TaskManager *manager = &wm->task_manager;
+    const Win31xTaskManagerSnapshot *snapshot =
+        win31x_task_manager_data_snapshot(&manager->data);
+
+    if (snapshot == NULL || snapshot->process_count == 0U) {
+        manager->selected_pid = 0;
+        manager->selected_start_time = 0U;
+        return;
+    }
+    if (index < 0)
+        index = 0;
+    if ((size_t)index >= snapshot->process_count)
+        index = snapshot->process_count > (size_t)INT_MAX
+                    ? INT_MAX
+                    : (int)snapshot->process_count - 1;
+    manager->selected_pid = snapshot->processes[index].pid;
+    manager->selected_start_time =
+        snapshot->processes[index].start_time_ticks;
+    manager->confirm_pid = 0;
+    manager->confirm_start_time = 0U;
+    manager->confirm_until_ms = 0U;
+    if (index < manager->process_scroll)
+        manager->process_scroll = index;
+    if (index >= manager->process_scroll +
+                     task_manager_list_visible_rows(manager))
+        manager->process_scroll =
+            index - task_manager_list_visible_rows(manager) + 1;
+    task_manager_clamp_process_scroll(wm);
+    task_manager_publish_state(wm);
 }
 
 static int desktop_menu_item_y(DesktopMenuItem item)
@@ -5859,6 +7686,11 @@ static void restore_session_confirmation_focus(WindowManager *wm,
         activate_internal_window(wm, INTERNAL_FOCUS_RUN, time);
         return;
     }
+    if (saved_internal == INTERNAL_FOCUS_TASK_MANAGER &&
+        wm->task_manager.visible) {
+        activate_internal_window(wm, INTERNAL_FOCUS_TASK_MANAGER, time);
+        return;
+    }
     client = client_for_client_window(wm, saved_client);
     if (client != NULL && !client->minimized) {
         focus_client(wm, client, time);
@@ -5922,6 +7754,7 @@ static bool session_confirmation_should_yield_to_window(
         window == dialog->shield || window == wm->launcher ||
         window == wm->control_panel.window ||
         window == wm->run_dialog.window ||
+        window == wm->task_manager.window ||
         window == wm->desktop_menu.window || window == wm->support_window ||
         !XGetWindowAttributes(wm->display, window, &attributes) ||
         !attributes.override_redirect || attributes.class != InputOutput ||
@@ -6309,6 +8142,9 @@ static void raise_focused_internal_window(WindowManager *wm)
     else if (wm->internal_focus == INTERNAL_FOCUS_RUN &&
              wm->run_dialog.visible)
         XRaiseWindow(wm->display, wm->run_dialog.window);
+    else if (wm->internal_focus == INTERNAL_FOCUS_TASK_MANAGER &&
+             wm->task_manager.visible)
+        XRaiseWindow(wm->display, wm->task_manager.window);
     if (wm->desktop_menu.visible)
         XRaiseWindow(wm->display, wm->desktop_menu.window);
     raise_drag_outline(wm);
@@ -6368,6 +8204,7 @@ static void grab_shortcuts(WindowManager *wm)
     KeyCode f2 = XKeysymToKeycode(wm->display, XK_F2);
     KeyCode f4 = XKeysymToKeycode(wm->display, XK_F4);
     KeyCode r = XKeysymToKeycode(wm->display, XK_r);
+    KeyCode escape = XKeysymToKeycode(wm->display, XK_Escape);
     KeyCode num_lock = XKeysymToKeycode(wm->display, XK_Num_Lock);
     KeyCode scroll_lock = XKeysymToKeycode(wm->display, XK_Scroll_Lock);
     XModifierKeymap *mapping = XGetModifierMapping(wm->display);
@@ -6448,6 +8285,10 @@ static void grab_shortcuts(WindowManager *wm)
         if (f4 != 0)
             XGrabKey(wm->display, f4, modifiers, wm->root, True,
                      GrabModeAsync, GrabModeAsync);
+        if (escape != 0)
+            XGrabKey(wm->display, escape,
+                     ControlMask | ShiftMask | lock_combinations[index],
+                     wm->root, True, GrabModeAsync, GrabModeAsync);
         if (r == 0)
             continue;
         for (super_index = 0U; super_index < wm->super_mask_count;
@@ -6699,6 +8540,47 @@ static void prepare_control_panel_drag_restore(WindowManager *wm,
     wm->drag.arranged_restore_prepared = true;
 }
 
+static void prepare_task_manager_drag_restore(WindowManager *wm,
+                                              int pointer_x, int pointer_y)
+{
+    TaskManager *manager = &wm->task_manager;
+    int old_x = manager->x;
+    int old_y = manager->y;
+    int old_width = manager->width;
+    int offset_x = pointer_x - old_x;
+    int offset_y = pointer_y - old_y;
+    int width = manager->restore_valid ? manager->restore_width :
+                                         manager->width;
+    int height = manager->restore_valid ? manager->restore_height :
+                                          manager->height;
+    int x;
+    int y;
+
+    if (offset_x < 0)
+        offset_x = 0;
+    if (offset_x > old_width)
+        offset_x = old_width;
+    if (offset_y < 0)
+        offset_y = 0;
+    if (offset_y >= TITLE_Y + TITLE_HEIGHT)
+        offset_y = TITLE_Y + TITLE_HEIGHT - 1;
+    x = pointer_x -
+        (int)((long long)offset_x * width / (old_width > 0 ? old_width : 1));
+    y = pointer_y - offset_y;
+    clamp_internal_geometry(wm, &x, &y, &width, &height);
+    wm->drag.start_root_x = pointer_x;
+    wm->drag.start_root_y = pointer_y;
+    wm->drag.start_x = x;
+    wm->drag.start_y = y;
+    wm->drag.start_width = width;
+    wm->drag.start_height = height;
+    wm->drag.pending_x = x;
+    wm->drag.pending_y = y;
+    wm->drag.pending_width = width;
+    wm->drag.pending_height = height;
+    wm->drag.arranged_restore_prepared = true;
+}
+
 static void prepare_client_drag_restore(WindowManager *wm, Client *client,
                                         int pointer_x, int pointer_y)
 {
@@ -6772,6 +8654,11 @@ static void start_drag(WindowManager *wm, DragKind kind, Client *client,
         wm->drag.start_y = wm->run_dialog.y;
         wm->drag.start_width = wm->run_dialog.width;
         wm->drag.start_height = wm->run_dialog.height;
+    } else if (kind == DRAG_MOVE_TASK_MANAGER) {
+        wm->drag.start_x = wm->task_manager.x;
+        wm->drag.start_y = wm->task_manager.y;
+        wm->drag.start_width = wm->task_manager.width;
+        wm->drag.start_height = wm->task_manager.height;
     } else {
         wm->drag.start_x = wm->launcher_x;
         wm->drag.start_y = wm->launcher_y;
@@ -7129,6 +9016,188 @@ static void handle_run_button(WindowManager *wm, XButtonEvent *event)
         hide_run_dialog(wm);
 }
 
+static void task_manager_set_tab(WindowManager *wm, TaskManagerTab tab)
+{
+    TaskManager *manager = &wm->task_manager;
+
+    if (tab < 0 || tab >= TASK_MANAGER_TAB_COUNT)
+        return;
+    manager->tab = tab;
+    manager->status[0] = '\0';
+    manager->status_is_refresh_error = false;
+    manager->status_is_closing_application = false;
+    manager->confirm_pid = 0;
+    manager->confirm_start_time = 0U;
+    manager->confirm_until_ms = 0U;
+    manager->process_delete_down = false;
+    if (tab == TASK_MANAGER_TAB_APPLICATIONS)
+        task_manager_select_first_application(wm);
+    if (tab == TASK_MANAGER_TAB_PROCESSES &&
+        task_manager_selected_process(manager) == NULL)
+        task_manager_select_process_index(wm, 0);
+    task_manager_publish_state(wm);
+    draw_task_manager(wm);
+}
+
+static void handle_task_manager_button(WindowManager *wm,
+                                       XButtonEvent *event)
+{
+    TaskManager *manager = &wm->task_manager;
+    int tab;
+
+    if (event->button == Button4 || event->button == Button5) {
+        int direction = event->button == Button4 ? -1 : 1;
+
+        if (manager->tab == TASK_MANAGER_TAB_APPLICATIONS) {
+            manager->application_scroll += direction;
+            task_manager_clamp_application_scroll(wm);
+            draw_task_manager(wm);
+        } else if (manager->tab == TASK_MANAGER_TAB_PROCESSES) {
+            manager->process_scroll += direction * 3;
+            task_manager_clamp_process_scroll(wm);
+            draw_task_manager(wm);
+        }
+        return;
+    }
+    if (event->button != Button1)
+        return;
+    if (event->y < 25 &&
+        event->x >= internal_close_button_x(manager->width)) {
+        hide_task_manager(wm);
+        return;
+    }
+    if (event->y < 25 &&
+        event->x >= internal_maximize_button_x(manager->width) &&
+        event->x < internal_maximize_button_x(manager->width) +
+                       TITLE_BUTTON) {
+        toggle_task_manager_maximize(wm);
+        return;
+    }
+    if (event->y < 25) {
+        start_drag(wm, DRAG_MOVE_TASK_MANAGER, NULL, NULL, 0,
+                   event->x_root, event->y_root);
+        return;
+    }
+    for (tab = 0; tab < TASK_MANAGER_TAB_COUNT; ++tab) {
+        if (point_in_rectangle(
+                event->x, event->y,
+                task_manager_tab_x(manager, (TaskManagerTab)tab), 49,
+                task_manager_tab_width(manager, (TaskManagerTab)tab),
+                TASK_MANAGER_TAB_HEIGHT + 2)) {
+            task_manager_set_tab(wm, (TaskManagerTab)tab);
+            return;
+        }
+    }
+    if (manager->tab == TASK_MANAGER_TAB_APPLICATIONS) {
+        int list_y = task_manager_content_top() + 29;
+        int rows = task_manager_list_visible_rows(manager);
+        int button_x;
+        int button_width;
+
+        if (point_in_rectangle(event->x, event->y, 11, list_y,
+                               manager->width - 22,
+                               rows * TASK_MANAGER_ROW_HEIGHT)) {
+            int row = (event->y - list_y) / TASK_MANAGER_ROW_HEIGHT;
+            Client *client = task_manager_application_at(
+                wm, (size_t)(manager->application_scroll + row));
+
+            if (client != NULL) {
+                manager->selected_application = client->window;
+                manager->status[0] = '\0';
+                manager->status_is_refresh_error = false;
+                manager->status_is_closing_application = false;
+                draw_task_manager(wm);
+                if (manager->application_last_click == client->window &&
+                    event->time - manager->application_last_click_time <=
+                        DOUBLE_CLICK_MS) {
+                    task_manager_switch_to_application(wm, event->time);
+                    return;
+                }
+                manager->application_last_click = client->window;
+                manager->application_last_click_time = event->time;
+            }
+            return;
+        }
+        if (!task_manager_actions_visible(manager))
+            return;
+        task_manager_application_button_geometry(manager, 0, &button_x,
+                                                 &button_width);
+        if (point_in_rectangle(event->x, event->y, button_x,
+                               task_manager_action_y(manager), button_width,
+                               26)) {
+            show_run_dialog(wm);
+            return;
+        }
+        task_manager_application_button_geometry(manager, 1, &button_x,
+                                                 &button_width);
+        if (point_in_rectangle(event->x, event->y, button_x,
+                               task_manager_action_y(manager), button_width,
+                               26)) {
+            task_manager_switch_to_application(wm, event->time);
+            return;
+        }
+        task_manager_application_button_geometry(manager, 2, &button_x,
+                                                 &button_width);
+        if (point_in_rectangle(event->x, event->y, button_x,
+                               task_manager_action_y(manager), button_width,
+                               26)) {
+            task_manager_end_application(wm, event->time);
+            return;
+        }
+    } else if (manager->tab == TASK_MANAGER_TAB_PROCESSES) {
+        const Win31xTaskManagerSnapshot *snapshot =
+            win31x_task_manager_data_snapshot(&manager->data);
+        int list_y = task_manager_content_top() + 29;
+        int rows = task_manager_list_visible_rows(manager);
+        int button_x;
+        int button_width;
+
+        if (point_in_rectangle(event->x, event->y, 11, list_y,
+                               manager->width - 22,
+                               rows * TASK_MANAGER_ROW_HEIGHT)) {
+            int row = (event->y - list_y) / TASK_MANAGER_ROW_HEIGHT;
+            size_t process_index =
+                (size_t)(manager->process_scroll + row);
+
+            if (snapshot == NULL || process_index >= snapshot->process_count) {
+                return;
+            }
+            task_manager_select_process_index(wm, (int)process_index);
+            manager->status[0] = '\0';
+            manager->status_is_refresh_error = false;
+            manager->status_is_closing_application = false;
+            draw_task_manager(wm);
+            return;
+        }
+        if (!task_manager_actions_visible(manager))
+            return;
+        task_manager_process_button_geometry(manager, 0, &button_x,
+                                             &button_width);
+        if (point_in_rectangle(event->x, event->y, button_x,
+                               task_manager_action_y(manager), button_width,
+                               26)) {
+            manager->status[0] = '\0';
+            manager->status_is_refresh_error = false;
+            manager->status_is_closing_application = false;
+            manager->confirm_pid = 0;
+            manager->confirm_start_time = 0U;
+            manager->confirm_until_ms = 0U;
+            manager->process_delete_down = false;
+            manager->next_refresh_ms = 0U;
+            refresh_task_manager(wm, true);
+            return;
+        }
+        task_manager_process_button_geometry(manager, 1, &button_x,
+                                             &button_width);
+        if (point_in_rectangle(event->x, event->y, button_x,
+                               task_manager_action_y(manager), button_width,
+                               26)) {
+            task_manager_request_end_process(wm);
+            return;
+        }
+    }
+}
+
 static void activate_desktop_icon(WindowManager *wm, DesktopIcon *icon,
                                   Time time)
 {
@@ -7194,6 +9263,13 @@ static void handle_button_press(WindowManager *wm, XButtonEvent *event)
         handle_run_button(wm, event);
         return;
     }
+    if (event->window == wm->task_manager.window) {
+        remember_task_manager_return_focus(wm);
+        activate_internal_window(wm, INTERNAL_FOCUS_TASK_MANAGER,
+                                 event->time);
+        handle_task_manager_button(wm, event);
+        return;
+    }
     client = client_for_window(wm, event->window);
     if (client == NULL)
         return;
@@ -7236,6 +9312,10 @@ static void handle_motion(WindowManager *wm, XMotionEvent *event)
                wm->control_panel.layout != CLIENT_LAYOUT_NORMAL &&
                !wm->drag.arranged_restore_prepared) {
         prepare_control_panel_drag_restore(wm, event->x_root, event->y_root);
+    } else if (wm->drag.kind == DRAG_MOVE_TASK_MANAGER &&
+               wm->task_manager.layout != CLIENT_LAYOUT_NORMAL &&
+               !wm->drag.arranged_restore_prepared) {
+        prepare_task_manager_drag_restore(wm, event->x_root, event->y_root);
     } else if (wm->drag.kind == DRAG_MOVE_CLIENT && wm->drag.client != NULL &&
                wm->drag.client->layout != CLIENT_LAYOUT_NORMAL &&
                !wm->drag.arranged_restore_prepared) {
@@ -7290,6 +9370,17 @@ static void handle_motion(WindowManager *wm, XMotionEvent *event)
         return;
     }
     if (wm->drag.kind == DRAG_MOVE_RUN) {
+        int x = wm->drag.start_x + dx;
+        int y = wm->drag.start_y + dy;
+
+        clamp_drag_position(wm, wm->drag.start_width, &x, &y);
+        wm->drag.pending_x = x;
+        wm->drag.pending_y = y;
+        show_drag_outline(wm, x, y, wm->drag.pending_width,
+                          wm->drag.pending_height);
+        return;
+    }
+    if (wm->drag.kind == DRAG_MOVE_TASK_MANAGER) {
         int x = wm->drag.start_x + dx;
         int y = wm->drag.start_y + dy;
 
@@ -7490,6 +9581,30 @@ static void finish_drag(WindowManager *wm, XButtonEvent *event)
             draw_control_panel(wm);
         }
         remember_control_panel_placement(wm);
+    } else if (drag.kind == DRAG_MOVE_TASK_MANAGER) {
+        TaskManager *manager = &wm->task_manager;
+
+        manager->layout = CLIENT_LAYOUT_NORMAL;
+        manager->layout_before_maximize = CLIENT_LAYOUT_NORMAL;
+        manager->restore_valid = false;
+        manager->layout_monitor.valid = false;
+        manager->x = drag.pending_x;
+        manager->y = drag.pending_y;
+        manager->width = drag.pending_width;
+        manager->height = drag.pending_height;
+        if (snap != CLIENT_LAYOUT_NORMAL) {
+            set_monitor_anchor(&manager->layout_monitor,
+                               monitor_at(wm, snap_monitor));
+            apply_task_manager_layout(wm, snap);
+        } else {
+            clamp_internal_geometry(wm, &manager->x, &manager->y,
+                                    &manager->width, &manager->height);
+            XMoveResizeWindow(wm->display, manager->window, manager->x,
+                              manager->y, (unsigned)manager->width,
+                              (unsigned)manager->height);
+            draw_task_manager(wm);
+        }
+        remember_task_manager_placement(wm);
     } else if (drag.kind == DRAG_MOVE_RUN) {
         wm->run_dialog.x = drag.pending_x;
         wm->run_dialog.y = drag.pending_y;
@@ -7636,6 +9751,200 @@ static void handle_run_key(WindowManager *wm, XKeyEvent *event, KeySym key)
     }
 }
 
+static int task_manager_selected_application_index(WindowManager *wm)
+{
+    size_t count = task_manager_application_count(wm);
+    size_t index;
+
+    for (index = 0U; index < count; ++index) {
+        Client *client = task_manager_application_at(wm, index);
+
+        if (client != NULL &&
+            client->window == wm->task_manager.selected_application)
+            return index <= (size_t)INT_MAX ? (int)index : -1;
+    }
+    return -1;
+}
+
+static void task_manager_select_application_index(WindowManager *wm,
+                                                  int index)
+{
+    TaskManager *manager = &wm->task_manager;
+    int count = task_manager_application_count(wm) <= (size_t)INT_MAX
+                    ? (int)task_manager_application_count(wm)
+                    : INT_MAX;
+    Client *client;
+
+    if (count <= 0) {
+        manager->selected_application = None;
+        return;
+    }
+    if (index < 0)
+        index = 0;
+    if (index >= count)
+        index = count - 1;
+    client = task_manager_application_at(wm, (size_t)index);
+    if (client != NULL)
+        manager->selected_application = client->window;
+    if (index < manager->application_scroll)
+        manager->application_scroll = index;
+    if (index >= manager->application_scroll +
+                     task_manager_list_visible_rows(manager))
+        manager->application_scroll =
+            index - task_manager_list_visible_rows(manager) + 1;
+    task_manager_clamp_application_scroll(wm);
+}
+
+static void handle_task_manager_key(WindowManager *wm, XKeyEvent *event,
+                                    KeySym key)
+{
+    TaskManager *manager = &wm->task_manager;
+    unsigned int state = event->state & ~wm->ignored_lock_mask;
+
+    if ((state & Mod1Mask) != 0U) {
+        if (key == XK_F4)
+            hide_task_manager(wm);
+        else if (key == XK_Tab)
+            focus_next(wm, event->time);
+        else if (key == XK_F2)
+            show_launcher(wm);
+        return;
+    }
+    if (key == XK_Delete) {
+        if (manager->process_delete_down)
+            return;
+        manager->process_delete_down = true;
+    }
+    if (key == XK_Tab && (state & ControlMask) != 0U) {
+        int direction = (state & ShiftMask) != 0U ? -1 : 1;
+        int tab = ((int)manager->tab + direction + TASK_MANAGER_TAB_COUNT) %
+                  TASK_MANAGER_TAB_COUNT;
+
+        task_manager_set_tab(wm, (TaskManagerTab)tab);
+        return;
+    }
+    if ((key == XK_Left || key == XK_Right) &&
+        (state & (ControlMask | ShiftMask)) == 0U) {
+        int direction = key == XK_Left ? -1 : 1;
+        int tab = ((int)manager->tab + direction + TASK_MANAGER_TAB_COUNT) %
+                  TASK_MANAGER_TAB_COUNT;
+
+        task_manager_set_tab(wm, (TaskManagerTab)tab);
+        return;
+    }
+    if (key == XK_F5) {
+        manager->confirm_pid = 0;
+        manager->confirm_start_time = 0U;
+        manager->confirm_until_ms = 0U;
+        manager->process_delete_down = false;
+        manager->status[0] = '\0';
+        manager->status_is_refresh_error = false;
+        manager->status_is_closing_application = false;
+        manager->next_refresh_ms = 0U;
+        refresh_task_manager(wm, true);
+        return;
+    }
+    if (key == XK_Escape) {
+        manager->confirm_pid = 0;
+        manager->confirm_start_time = 0U;
+        manager->confirm_until_ms = 0U;
+        manager->process_delete_down = false;
+        manager->status[0] = '\0';
+        manager->status_is_refresh_error = false;
+        manager->status_is_closing_application = false;
+        draw_task_manager(wm);
+        return;
+    }
+    if (manager->tab == TASK_MANAGER_TAB_APPLICATIONS) {
+        int selected = task_manager_selected_application_index(wm);
+        int page = task_manager_list_visible_rows(manager);
+
+        if (key == XK_Return || key == XK_KP_Enter) {
+            task_manager_switch_to_application(wm, event->time);
+            return;
+        }
+        if (key == XK_Delete) {
+            task_manager_end_application(wm, event->time);
+            return;
+        }
+        if (key == XK_Up)
+            --selected;
+        else if (key == XK_Down)
+            ++selected;
+        else if (key == XK_Home)
+            selected = 0;
+        else if (key == XK_End)
+            selected = INT_MAX;
+        else if (key == XK_Page_Up)
+            selected -= page;
+        else if (key == XK_Page_Down)
+            selected += page;
+        else
+            return;
+        task_manager_select_application_index(wm, selected);
+        manager->status[0] = '\0';
+        manager->status_is_refresh_error = false;
+        manager->status_is_closing_application = false;
+        draw_task_manager(wm);
+        return;
+    }
+    if (manager->tab == TASK_MANAGER_TAB_PROCESSES) {
+        int selected = task_manager_selected_process_index(manager);
+        int page = task_manager_list_visible_rows(manager);
+
+        if (key == XK_Delete) {
+            task_manager_request_end_process(wm);
+            return;
+        }
+        if (key == XK_Up)
+            --selected;
+        else if (key == XK_Down)
+            ++selected;
+        else if (key == XK_Home)
+            selected = 0;
+        else if (key == XK_End)
+            selected = INT_MAX;
+        else if (key == XK_Page_Up)
+            selected -= page;
+        else if (key == XK_Page_Down)
+            selected += page;
+        else
+            return;
+        task_manager_select_process_index(wm, selected);
+        manager->status[0] = '\0';
+        manager->status_is_refresh_error = false;
+        manager->status_is_closing_application = false;
+        draw_task_manager(wm);
+    }
+}
+
+static bool task_manager_key_release_is_auto_repeat(
+    WindowManager *wm, const XKeyEvent *event)
+{
+    XEvent next;
+
+    if (XPending(wm->display) <= 0)
+        return false;
+    XPeekEvent(wm->display, &next);
+    return next.type == KeyPress &&
+           next.xkey.window == event->window &&
+           next.xkey.keycode == event->keycode &&
+           next.xkey.time == event->time;
+}
+
+static void handle_key_release(WindowManager *wm, XKeyEvent *event)
+{
+    KeySym key;
+
+    if (event->window != wm->task_manager.window)
+        return;
+    key = XLookupKeysym(event, 0);
+    if (key != XK_Delete ||
+        task_manager_key_release_is_auto_repeat(wm, event))
+        return;
+    wm->task_manager.process_delete_down = false;
+}
+
 static void handle_key_press(WindowManager *wm, XKeyEvent *event)
 {
     KeySym key = XLookupKeysym(event, 0);
@@ -7654,6 +9963,13 @@ static void handle_key_press(WindowManager *wm, XKeyEvent *event)
             cancel_drag_and_restore(wm, event->time);
         return;
     }
+    if (key == XK_Escape &&
+        (event->state & ~wm->ignored_lock_mask) ==
+            (ControlMask | ShiftMask)) {
+        dismiss_desktop_menu(wm);
+        show_task_manager(wm);
+        return;
+    }
     if (wm->desktop_menu.visible &&
         handle_desktop_menu_key(wm, key, event->time))
         return;
@@ -7664,6 +9980,11 @@ static void handle_key_press(WindowManager *wm, XKeyEvent *event)
 
     if (event->window == wm->run_dialog.window) {
         handle_run_key(wm, event, key);
+        return;
+    }
+
+    if (event->window == wm->task_manager.window) {
+        handle_task_manager_key(wm, event, key);
         return;
     }
 
@@ -8052,6 +10373,26 @@ static void reflow_monitor_layout(WindowManager *wm)
                               (unsigned)wm->run_dialog.height);
         draw_run_dialog(wm);
     }
+    if (wm->desktop_state.task_manager.valid &&
+        (ClientLayout)wm->desktop_state.task_manager.layout ==
+            wm->task_manager.layout)
+        restore_task_manager_placement(wm);
+    if (wm->task_manager.visible) {
+        TaskManager *manager = &wm->task_manager;
+
+        if (manager->layout == CLIENT_LAYOUT_NORMAL) {
+            clamp_internal_geometry(wm, &manager->x, &manager->y,
+                                    &manager->width, &manager->height);
+            task_manager_clamp_application_scroll(wm);
+            task_manager_clamp_process_scroll(wm);
+            XMoveResizeWindow(wm->display, manager->window, manager->x,
+                              manager->y, (unsigned)manager->width,
+                              (unsigned)manager->height);
+            draw_task_manager(wm);
+        } else {
+            apply_task_manager_layout(wm, manager->layout);
+        }
+    }
     if (wm->session_confirmation.visible) {
         position_session_confirmation(wm);
         draw_session_confirmation(wm);
@@ -8169,6 +10510,8 @@ static void dispatch_event(WindowManager *wm, XEvent *event)
             draw_control_panel(wm);
         else if (event->xexpose.window == wm->run_dialog.window)
             draw_run_dialog(wm);
+        else if (event->xexpose.window == wm->task_manager.window)
+            draw_task_manager(wm);
         else if (event->xexpose.window == wm->desktop_menu.window)
             draw_desktop_menu(wm);
         else if (event->xexpose.window ==
@@ -8207,6 +10550,9 @@ static void dispatch_event(WindowManager *wm, XEvent *event)
         break;
     case KeyPress:
         handle_key_press(wm, &event->xkey);
+        break;
+    case KeyRelease:
+        handle_key_release(wm, &event->xkey);
         break;
     case PropertyNotify:
         client = client_for_client_window(wm, event->xproperty.window);
@@ -8270,6 +10616,8 @@ static void dispatch_event(WindowManager *wm, XEvent *event)
                     draw_control_panel(wm);
                 if (wm->run_dialog.visible)
                     draw_run_dialog(wm);
+                if (wm->task_manager.visible)
+                    draw_task_manager(wm);
             }
         }
         break;
@@ -8453,6 +10801,7 @@ static int initialize_window_manager(WindowManager *wm, const char *display_name
     initialize_launcher(wm);
     initialize_control_panel(wm);
     initialize_run_dialog(wm);
+    initialize_task_manager(wm);
     initialize_desktop_menu(wm);
     initialize_session_confirmation(wm);
     initialize_drag_outline(wm);
@@ -8532,6 +10881,7 @@ static void run_event_loop(WindowManager *wm)
 
     while (keep_running) {
         flush_desktop_state(wm, false);
+        refresh_task_manager(wm, false);
         if (child_changed)
             reap_children(wm);
         while (keep_running && XPending(wm->display) > 0) {
@@ -8559,6 +10909,7 @@ static void run_event_loop(WindowManager *wm)
             if (selected < 0 && errno != EINTR)
                 break;
             service_wifi_backend(wm, selected >= 0 ? &read_set : NULL);
+            refresh_task_manager(wm, false);
             flush_desktop_state(wm, false);
         }
     }
@@ -8585,6 +10936,11 @@ static void shut_down(WindowManager *wm)
         XDestroyWindow(wm->display, wm->control_panel.window);
     if (wm->run_dialog.window != None)
         XDestroyWindow(wm->display, wm->run_dialog.window);
+    win31x_task_manager_data_destroy(&wm->task_manager.data);
+    if (wm->task_manager.backing != None)
+        XFreePixmap(wm->display, wm->task_manager.backing);
+    if (wm->task_manager.window != None)
+        XDestroyWindow(wm->display, wm->task_manager.window);
     if (wm->desktop_menu.window != None)
         XDestroyWindow(wm->display, wm->desktop_menu.window);
     if (wm->session_confirmation.window != None)

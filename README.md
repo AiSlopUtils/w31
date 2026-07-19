@@ -14,17 +14,18 @@ The current implementation includes:
   repaints while dragging under Xorg or QEMU. Transient dialogs stay above
   their owning application.
 - RandR 1.5 logical-monitor discovery with an Xinerama fallback. Maximize,
-  snap, Applications, Control Panel, Run, the desktop menu, and power
-  confirmations use the active monitor. Display hotplug and layout changes
-  reflow arranged windows, internal windows, dialogs, and desktop icons.
+  snap, Applications, Control Panel, Task Manager, Run, the desktop menu, and
+  power confirmations use the active monitor. Display hotplug and layout
+  changes reflow arranged windows, internal windows, dialogs, and desktop
+  icons.
 - A real desktop icon for every minimized client. When the client publishes
   `_NET_WM_ICON`, that program artwork is used in its frame and minimized
   icon; one click maps, raises, and focuses the application again.
 - A private, versioned desktop-layout store remembers manually positioned
-  Applications and Control Panel icons, Applications, Control Panel, and Run
-  geometry, application geometry and snap/maximize state by stable X identity,
-  and the last Control Panel section. Monitor-relative positions safely fall
-  back when a display is disconnected.
+  Applications and Control Panel icons, Applications, Control Panel, Task
+  Manager, and Run geometry, application geometry and snap/maximize state by
+  stable X identity, and the last Control Panel section. Monitor-relative
+  positions safely fall back when a display is disconnected.
 - A permanent **Applications** desktop icon. It opens a keyboard- and
   mouse-driven window containing the visible applications installed through
   freedesktop `.desktop` entries. Applications and Control Panel are persistent
@@ -35,6 +36,13 @@ The current implementation includes:
 - A Windows+R / Super+R **Run** dialog. It accepts an executable and literal
   arguments, reports invalid commands in place, and never evaluates shell
   syntax.
+- A Windows 98-style **Task Manager**, opened with Ctrl+Shift+Esc. Its
+  Applications tab switches to or closes managed X11 applications; Processes
+  shows live Linux process CPU and resident-memory use; Performance plots CPU
+  and memory histories; and System reports the operating system, kernel, host,
+  processor, logical CPU count, memory, uptime, load, and process count. The
+  sampler reads procfs directly once per second and never invokes `ps` or a
+  shell.
 - A classic right-click desktop menu with **Lock**, **Log Out**, **Restart**,
   and **Shut Down**. It leaves the active application focused, dismisses on an
   outside click, and appears only for the unused desktop rather than over an
@@ -54,7 +62,7 @@ The current implementation includes:
   `WM_CHANGE_STATE`, and `WM_STATE` handling.
 - A deliberately small EWMH subset for client lists, activation, close
   requests, frame extents, one desktop, work area, and hidden state.
-- Alt+Tab, Alt+F2, Alt+F4, and Windows+R / Super+R shortcuts.
+- Alt+Tab, Alt+F2, Alt+F4, Ctrl+Shift+Esc, and Windows+R / Super+R shortcuts.
 
 ![Win31 X running on Debian 13 ARM64 in QEMU](docs/win31x-desktop.png)
 
@@ -81,7 +89,13 @@ sudo apt install network-manager xss-lock xsecurelock
 
 The binary is `build/win31x`. Win31 X does not need a compositor, GTK, Qt, or
 an existing desktop environment. Its supplied-color icon renderer requires the
-normal TrueColor visual provided by contemporary Xorg configurations.
+normal TrueColor visual provided by contemporary Xorg configurations. Task
+Manager requires the normal Linux procfs mounted at `/proc`; Debian mounts it
+by default and no extra runtime package is needed. Safely ending a process also
+requires Linux 5.3 or newer with usable `pidfd_open` and `pidfd_send_signal`
+support. On older or restricted kernels the monitoring views continue to work,
+but End Process and Force End report that process control is unavailable rather
+than falling back to a PID-reuse-prone signal-by-number operation.
 
 To install the binary and make it available in a display manager's session
 list:
@@ -114,12 +128,13 @@ Wi-Fi, colors, and screen locking. Applications and Control Panel remain open
 when you focus another window or start a program, and they can be open at the
 same time; close either one with its `X` button or Alt+F4. Press Windows+R to
 run an executable by name or path. Right-click unused desktop space for the
-session menu.
+session menu. Press Ctrl+Shift+Esc to open Task Manager; pressing the shortcut
+again raises the existing window instead of opening a duplicate.
 
 Drag the Applications or Control Panel icon to arrange the desktop. Their
-positions, Applications, Control Panel, and Run geometry, application window
-geometry, color scheme, and the selected Control Panel section are restored at
-the next login.
+positions, Applications, Control Panel, Task Manager, and Run geometry,
+application window geometry, color scheme, and the selected Control Panel
+section are restored at the next login.
 
 Application geometry is keyed by GTK application ID, desktop-file ID, or
 WM_CLASS, plus WM_WINDOW_ROLE when an application supplies one. Concurrent
@@ -138,6 +153,7 @@ Controls:
 | Arrange desktop icons | Drag an icon; click without moving to open it |
 | Applications | Click its desktop icon or press Alt+F2 |
 | Control Panel | Click its desktop icon |
+| Task Manager | Ctrl+Shift+Esc |
 | Run a command | Windows+R / Super+R, then type an executable and arguments |
 | Lock | Right-click unused desktop space, then click Lock (immediate) |
 | Log out / restart / shut down | Right-click unused desktop space, click the action, then confirm it |
@@ -145,14 +161,17 @@ Controls:
 | Wi-Fi | Refresh, select a network, enter its password if required, then Connect |
 | Change colors | Select Colors, then click a color scheme |
 | Auto lock | Select Auto Lock, toggle it, choose a timeout, or click Lock Now |
+| Task Manager tabs | Click a tab; use Ctrl+Tab or Left/Right to change tabs |
+| Refresh Task Manager | F5 (otherwise it refreshes once per second) |
 | Cycle / close active window | Alt+Tab / Alt+F4 |
 
 ## Tests
 
 `make check` tests `.desktop` parsing, safe `Exec` and Run argument parsing,
 XDG application-icon resolution and raster decoding, settings and desktop
-layout validation, private atomic persistence, NetworkManager output and command handling,
-auto-lock process supervision, fixed session-action argument vectors, all
+layout validation, private atomic persistence, NetworkManager output and
+command handling, auto-lock process supervision, fixed session-action argument
+vectors, Task Manager procfs parsing and protected process termination, all
 supplied PNG dimensions and decoding, exact supplied-asset checksums, and every
 icon category. The core tests do not require X; the auto-lock test exercises X
 saver policy as well when a display is available. For the X11 regression suite,
@@ -183,6 +202,9 @@ machine:
   keeping the launcher open, and verify its real desktop-entry icon is drawn;
 - open Run with a real XTEST Windows+R chord (also with Caps Lock and Num Lock),
   edit and execute a command, and keep the other internal windows open;
+- open one Task Manager with a real Ctrl+Shift+Esc chord, move between its four
+  tabs, observe advancing CPU/memory samples, and keep it open across focus
+  changes;
 - open the desktop menu only from unused root space, clamp it at monitor edges,
   preserve the active client, dismiss it on an outside click, and exercise
   immediate Lock plus confirmed Restart, Shut Down, and Log Out through
@@ -202,7 +224,8 @@ machine:
 - reject a second window manager on the same display.
 
 The same target also restarts the WM against one- and two-monitor layouts to
-verify exact icon, Applications, Control Panel, Run, and application geometry;
+verify exact icon, Applications, Control Panel, Task Manager, Run, and
+application geometry;
 duplicate application identities; Control Panel section and color restoration;
 disconnected-monitor fallback/return; corrupt-coordinate clamping; and safe
 client exit while a minimized icon is being dragged.
@@ -242,6 +265,9 @@ to get a completely fresh guest.
 
 ![Win31 X architecture](docs/architecture.svg)
 
+The component boundaries and Task Manager sampling and signal-safety rules are
+described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 Win31 X is a focused single-workspace window manager. It prefers the logical
 monitor layout reported by RandR 1.5, falls back to Xinerama heads when RandR
 does not provide a usable multi-monitor layout, and treats the root window as
@@ -255,9 +281,10 @@ other shell syntax are not evaluated.
 
 The active monitor follows the interaction: a desktop or icon click and a
 title-bar release use the monitor under the pointer, while keyboard actions use
-the monitor containing the focused Applications, Control Panel, Run, or
-managed-client window. If no window supplies that context, Win31 X retains the
-last active monitor and falls back to the pointer and then the primary monitor.
+the monitor containing the focused Applications, Control Panel, Task Manager,
+Run, or managed-client window. If no window supplies that context, Win31 X
+retains the last active monitor and falls back to the pointer and then the
+primary monitor.
 The permanent Applications and Control Panel icons start on the primary
 monitor, but can be dragged to any monitor. Their preferred monitor and
 monitor-relative position persist across sessions; each minimized application
@@ -266,7 +293,8 @@ icon stays on the monitor where its client was minimized.
 Maximize fills only the monitor containing the window. Releasing a title bar at
 either edge of any monitor snaps it to that monitor's left or right half, and
 restore returns the exact pre-arranged geometry. Applications, Control Panel,
-and Run are centered on the active monitor the first time they open; their
+Task Manager, and Run are centered on the active monitor the first time they
+open; their
 saved geometry takes precedence on later logins. The right-click desktop menu is
 constrained to the monitor under the pointer, and a power confirmation is
 centered on that same monitor. RandR hotplug and screen-layout notifications
@@ -281,6 +309,20 @@ Title-bar moves use a thin rubber-band outline in the Windows 3.1 style. The
 real window remains stationary until the pointer button is released, reducing
 the large repaints that can otherwise produce visible tearing in Xorg guests
 under QEMU. Border resizing remains live.
+
+Task Manager samples the Linux `/proc` files directly in the normal event-loop
+timer and keeps point-in-time data separate from drawing. Process percentages
+compare two samples by both PID and kernel start time, preventing a reused PID
+from inheriting an old process's history. **End Task** on the Applications tab
+uses the application's normal X11 close protocol. **End Process** is limited to
+processes owned by the logged-in user, refuses PID 1 and the window manager,
+revalidates the PID, owner, and start time immediately before signaling, and
+asks for a second click before sending `SIGTERM`. If the same process survives
+the grace period, the UI offers a separate **Force End** action using `SIGKILL`.
+Both signals are sent through a stable Linux pidfd, so Win31 X never falls back
+to signaling a possibly reused numeric PID. Neither action invokes a shell, and
+processes belonging to other users remain visible but cannot be ended from
+Win31 X.
 
 The WM-owned desktop menu is itself override-redirect, so opening it does not
 replace the active application or `_NET_ACTIVE_WINDOW`. Lock uses the same

@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define WIN31X_DESKTOP_STATE_VERSION 2U
+#define WIN31X_DESKTOP_STATE_VERSION 3U
 #define WIN31X_DESKTOP_CLIENT_MAX 128U
 #define WIN31X_DESKTOP_ID_CAPACITY 256U
 #define WIN31X_DESKTOP_MONITOR_CAPACITY 128U
@@ -57,6 +57,7 @@ typedef struct {
     Win31xDesktopPlacement launcher;
     Win31xDesktopPlacement control_panel;
     Win31xDesktopPlacement run_dialog;
+    Win31xDesktopPlacement task_manager;
     Win31xDesktopClientRecord clients[WIN31X_DESKTOP_CLIENT_MAX];
     size_t client_count;
     /* False when an unsupported on-disk schema was loaded and preserved. */
@@ -84,21 +85,23 @@ bool win31x_desktop_placement_is_valid(
  * save cannot replace data this version does not understand. I/O and
  * security failures are reported as -1 with errno set.
  *
- * Version 2 is a whitespace-delimited, one-record-per-line format:
+ * Version 3 is a whitespace-delimited, one-record-per-line format:
  *
- *   version 2
+ *   version 3
  *   applications_icon VALID MONITOR_HEX CX CY X Y WIDTH HEIGHT LAYOUT PREV
  *   control_panel_icon VALID MONITOR_HEX CX CY X Y WIDTH HEIGHT LAYOUT PREV
  *   launcher VALID MONITOR_HEX CX CY X Y WIDTH HEIGHT LAYOUT PREV
  *   control_panel VALID MONITOR_HEX CX CY X Y WIDTH HEIGHT LAYOUT PREV
  *   run_dialog VALID MONITOR_HEX CX CY X Y WIDTH HEIGHT LAYOUT PREV
+ *   task_manager VALID MONITOR_HEX CX CY X Y WIDTH HEIGHT LAYOUT PREV
  *   client IDENTITY_HEX VALID MONITOR_HEX CX CY X Y WIDTH HEIGHT LAYOUT PREV
  *
  * Strings are bytewise hexadecimal; "-" represents an empty monitor name.
  * VALID is 0 or 1 and LAYOUT uses Win31xDesktopLayout's numeric values. The
  * loader also accepts legacy version 1 records, where PREV was absent and
- * defaults to NORMAL. A PREV field in version 1 is tolerated for migration;
- * saves always write version 2 and include PREV.
+ * defaults to NORMAL, plus version 2 records without Task Manager state. A
+ * PREV field in version 1 is tolerated for migration; saves always write
+ * version 3 and include PREV.
  */
 int win31x_desktop_state_load(Win31xDesktopState *state);
 
