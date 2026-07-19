@@ -21,6 +21,8 @@ packages:
   - debhelper
   - pkg-config
   - libx11-dev
+  - libxrandr-dev
+  - libxinerama-dev
   - libpng-dev
   - libxtst-dev
   - network-manager

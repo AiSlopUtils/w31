@@ -100,12 +100,19 @@ static void test_color_metadata(void)
 
 static void test_defaults(void)
 {
-    Win31xSettings settings = {4U, true, 120U};
+    Win31xSettings settings = {
+        .color_scheme = 4U,
+        .auto_lock_enabled = true,
+        .auto_lock_minutes = 120U,
+        .control_panel_section = WIN31X_CONTROL_PANEL_SECTION_AUTO_LOCK,
+    };
 
     win31x_settings_defaults(&settings);
     CHECK(settings.color_scheme == 0U);
     CHECK(!settings.auto_lock_enabled);
     CHECK(settings.auto_lock_minutes == 10U);
+    CHECK(settings.control_panel_section ==
+          WIN31X_CONTROL_PANEL_SECTION_WIFI);
     win31x_settings_defaults(NULL);
 }
 
@@ -115,7 +122,12 @@ static void test_round_trip(const char *root)
     char settings_directory[TEST_PATH_CAPACITY];
     char settings_path[TEST_PATH_CAPACITY];
     struct stat status;
-    Win31xSettings saved = {3U, true, 42U};
+    Win31xSettings saved = {
+        .color_scheme = 3U,
+        .auto_lock_enabled = true,
+        .auto_lock_minutes = 42U,
+        .control_panel_section = WIN31X_CONTROL_PANEL_SECTION_COLORS,
+    };
     Win31xSettings loaded;
 
     CHECK(path_join(config_root, sizeof(config_root), root, "round-trip") == 0);
@@ -134,6 +146,13 @@ static void test_round_trip(const char *root)
     CHECK(loaded.color_scheme == saved.color_scheme);
     CHECK(loaded.auto_lock_enabled == saved.auto_lock_enabled);
     CHECK(loaded.auto_lock_minutes == saved.auto_lock_minutes);
+    CHECK(loaded.control_panel_section == saved.control_panel_section);
+
+    saved.control_panel_section = (Win31xControlPanelSection)999;
+    CHECK(win31x_settings_save(&saved) == 0);
+    CHECK(win31x_settings_load(&loaded) == 0);
+    CHECK(loaded.control_panel_section ==
+          WIN31X_CONTROL_PANEL_SECTION_WIFI);
 
     CHECK(unlink(settings_path) == 0);
     CHECK(rmdir(settings_directory) == 0);
@@ -161,21 +180,43 @@ static void test_malformed_and_clamping(const char *root)
               "line without an equals sign\n"
               "color_scheme=Forest\n"
               "auto_lock_enabled=on\n"
-              "auto_lock_minutes=0\n") == 0);
+              "auto_lock_minutes=0\n"
+              "control_panel_section=auto-lock\n") == 0);
     CHECK(win31x_settings_load(&settings) == 0);
     CHECK(settings.color_scheme == 2U);
     CHECK(settings.auto_lock_enabled);
     CHECK(settings.auto_lock_minutes == WIN31X_AUTO_LOCK_MINUTES_MIN);
+    CHECK(settings.control_panel_section ==
+          WIN31X_CONTROL_PANEL_SECTION_AUTO_LOCK);
 
     CHECK(write_text_file(
               settings_path,
               "color_scheme=not-a-scheme\n"
               "auto_lock_enabled=perhaps\n"
-              "auto_lock_minutes=999999999999999999999999999999999999\n") == 0);
+              "auto_lock_minutes=999999999999999999999999999999999999\n"
+              "control_panel_section=not-a-section\n") == 0);
     CHECK(win31x_settings_load(&settings) == 0);
     CHECK(settings.color_scheme == 0U);
     CHECK(!settings.auto_lock_enabled);
     CHECK(settings.auto_lock_minutes == WIN31X_AUTO_LOCK_MINUTES_MAX);
+    CHECK(settings.control_panel_section ==
+          WIN31X_CONTROL_PANEL_SECTION_WIFI);
+
+    CHECK(write_text_file(settings_path, "control_panel_section=1\n") == 0);
+    CHECK(win31x_settings_load(&settings) == 0);
+    CHECK(settings.control_panel_section ==
+          WIN31X_CONTROL_PANEL_SECTION_COLORS);
+
+    CHECK(write_text_file(settings_path,
+                          "color_scheme=ocean-blue\n"
+                          "auto_lock_enabled=true\n"
+                          "auto_lock_minutes=25\n") == 0);
+    CHECK(win31x_settings_load(&settings) == 0);
+    CHECK(settings.color_scheme == 1U);
+    CHECK(settings.auto_lock_enabled);
+    CHECK(settings.auto_lock_minutes == 25U);
+    CHECK(settings.control_panel_section ==
+          WIN31X_CONTROL_PANEL_SECTION_WIFI);
 
     CHECK(unlink(settings_path) == 0);
     CHECK(rmdir(settings_directory) == 0);
@@ -188,7 +229,12 @@ static void test_relative_xdg_is_ignored(const char *root)
     char config[TEST_PATH_CAPACITY];
     char settings_directory[TEST_PATH_CAPACITY];
     char settings_path[TEST_PATH_CAPACITY];
-    Win31xSettings saved = {1U, false, 5U};
+    Win31xSettings saved = {
+        .color_scheme = 1U,
+        .auto_lock_enabled = false,
+        .auto_lock_minutes = 5U,
+        .control_panel_section = WIN31X_CONTROL_PANEL_SECTION_AUTO_LOCK,
+    };
     Win31xSettings loaded;
 
     CHECK(path_join(home, sizeof(home), root, "home") == 0);
@@ -205,6 +251,7 @@ static void test_relative_xdg_is_ignored(const char *root)
     CHECK(win31x_settings_load(&loaded) == 0);
     CHECK(loaded.color_scheme == saved.color_scheme);
     CHECK(loaded.auto_lock_minutes == saved.auto_lock_minutes);
+    CHECK(loaded.control_panel_section == saved.control_panel_section);
 
     CHECK(unlink(settings_path) == 0);
     CHECK(rmdir(settings_directory) == 0);

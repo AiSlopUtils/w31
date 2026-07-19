@@ -29,5 +29,26 @@ win31x (0.1.0) unstable; urgency=medium
     clients, Applications, and Control Panel, including EWMH maximize state.
   * Keep Applications and Control Panel mapped independently across focus
     changes and launches until explicitly closed with X or Alt+F4.
+  * Add a Windows/Super+R Run dialog with direct, shell-free argument parsing
+    and executable validation.
+  * Use each desktop entry's real hicolor or pixmaps PNG/XPM icon in
+    Applications, and use client-provided _NET_WM_ICON artwork in title bars
+    and minimized desktop icons, retaining supplied Win98 artwork as fallback.
+  * Add a focus-preserving right-click desktop menu for Lock, Log Out, Restart,
+    and Shut Down. Invoke power actions through validated, direct systemctl
+    argument vectors and cover every action without powering off test systems.
+  * Require classic confirmation dialogs before Log Out, Restart, and Shut
+    Down, with a safe default and lock-screen-aware modality; keep Lock
+    immediate.
+  * Use classic rubber-band outlines for title-bar moves and commit the real
+    window geometry on button release, reducing repaint tearing under Xorg and
+    QEMU while preserving left/right edge snap.
+  * Add RandR 1.5 monitor discovery with an Xinerama fallback. Keep maximize,
+    edge snap, desktop icons, internal windows, menus, Run and power dialogs
+    on the appropriate monitor, and reflow them after display-layout changes.
+  * Persist draggable desktop-icon positions, Applications, Control Panel and
+    Run geometry, managed application geometry, colors, and the selected
+    Control Panel section in private, versioned per-user configuration files;
+    preserve future schemas and safely bound malformed coordinates.
 
- -- Win31 X maintainers <maintainers@win31x.invalid>  Fri, 17 Jul 2026 12:00:00 +0800
+ -- Win31 X maintainers <maintainers@win31x.invalid>  Sat, 18 Jul 2026 12:00:00 +0800

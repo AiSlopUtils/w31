@@ -46,6 +46,17 @@ typedef struct {
 } IconAssets;
 
 /*
+ * Load an arbitrary application icon from a PNG or XPM file.  Decoded images
+ * are bounded to protect the window manager from unreasonable desktop-entry
+ * assets.  The destination must be zero-initialized and released with
+ * icon_image_free().
+ */
+int icon_image_load_file(const char *path, IconImage *image);
+int icon_image_scale_fit(const IconImage *source, unsigned int max_width,
+                         unsigned int max_height, IconImage *scaled);
+void icon_image_free(IconImage *image);
+
+/*
  * Load the complete icon set. The IconAssets object must be zero-initialized
  * and must be released with icon_assets_free(). On failure, an informative
  * diagnostic is written to stderr and the object is left empty.

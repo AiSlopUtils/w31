@@ -1,15 +1,21 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "applications.h"
+#include "app_icons.h"
 #include "auto_lock.h"
+#include "desktop_state.h"
 #include "icon_assets.h"
+#include "session_actions.h"
 #include "settings.h"
 #include "wifi_backend.h"
 
 #include <X11/Xatom.h>
+#include <X11/XKBlib.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/cursorfont.h>
+#include <X11/extensions/Xrandr.h>
+#include <X11/extensions/Xinerama.h>
 #include <X11/keysym.h>
 
 #include <errno.h>
@@ -23,6 +29,7 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define WIN31X_NAME "Win31 X"
@@ -50,11 +57,53 @@
 #define CONTROL_PANEL_NAV_ITEM_HEIGHT 88
 #define CONTROL_PANEL_NAV_GAP 6
 #define CONTROL_PANEL_PASSWORD_CAPACITY 128
+#define RUN_DIALOG_DEFAULT_WIDTH 470
+#define RUN_DIALOG_DEFAULT_HEIGHT 176
+#define RUN_COMMAND_CAPACITY 512
+#define DESKTOP_MENU_WIDTH 196
+#define DESKTOP_MENU_HEIGHT 119
+#define DESKTOP_MENU_ITEM_HEIGHT 26
+#define SESSION_CONFIRM_DEFAULT_WIDTH 420
+#define SESSION_CONFIRM_DEFAULT_HEIGHT 176
+#define SESSION_CONFIRM_BUTTON_WIDTH 78
+#define SESSION_CONFIRM_BUTTON_HEIGHT 26
+#define SESSION_CONFIRM_BUTTON_GAP 8
+#define SESSION_CONFIRM_BUTTON_MARGIN 13
 #define DOUBLE_CLICK_MS 450
 #define SNAP_THRESHOLD 8
+#define DRAG_OUTLINE_THICKNESS 3
+#define DRAG_OUTLINE_WINDOW_COUNT 4
+#define CLIENT_ICON_PROPERTY_LIMIT (1024UL * 1024UL)
+#define MAX_MONITORS 32
+#define DESKTOP_STATE_SAVE_DELAY_MS UINT64_C(750)
+#define ICON_DRAG_SLOP 5
+#define STATE_IDENTITY_INSTANCE_RESERVE 24U
 
 typedef struct Client Client;
 typedef struct DesktopIcon DesktopIcon;
+
+typedef struct {
+    Atom name;
+    int x;
+    int y;
+    int width;
+    int height;
+    bool primary;
+} MonitorGeometry;
+
+typedef struct {
+    Atom name;
+    int x;
+    int y;
+    bool valid;
+} MonitorAnchor;
+
+typedef struct {
+    Pixmap color;
+    Pixmap mask;
+    unsigned int width;
+    unsigned int height;
+} RenderedIcon;
 
 typedef enum {
     CLIENT_LAYOUT_NORMAL,
@@ -66,7 +115,8 @@ typedef enum {
 typedef enum {
     INTERNAL_FOCUS_NONE,
     INTERNAL_FOCUS_APPLICATIONS,
-    INTERNAL_FOCUS_CONTROL_PANEL
+    INTERNAL_FOCUS_CONTROL_PANEL,
+    INTERNAL_FOCUS_RUN
 } InternalFocus;
 
 typedef enum {
@@ -86,6 +136,11 @@ struct DesktopIcon {
     Window window;
     IconKind kind;
     Client *client;
+    MonitorAnchor monitor;
+    int x;
+    int y;
+    bool manual_position;
+    Win31xDesktopPlacement preferred;
     DesktopIcon *next;
 };
 
@@ -97,6 +152,13 @@ struct Client {
     Window minimized_with_owner;
     char *title;
     char *class_name;
+    char *state_base_identity;
+    char *state_identity;
+    unsigned int state_instance;
+    bool state_persistable;
+    bool state_restored;
+    bool state_monitor_fallback;
+    bool initial_maximize_precedence;
     /* Root-relative coordinates of the client's inside (drawable) corner. */
     int x;
     int y;
@@ -113,7 +175,10 @@ struct Client {
     int restore_y;
     int restore_width;
     int restore_height;
+    MonitorAnchor layout_monitor;
     DesktopIcon *icon;
+    RenderedIcon actual_icon_small;
+    RenderedIcon actual_icon_large;
     Client *next;
 };
 
@@ -128,12 +193,16 @@ typedef struct {
     unsigned long scheme_active_title[WIN31X_COLOR_SCHEME_COUNT];
 } Theme;
 
+typedef enum {
+    APPLICATION_ICON_UNTRIED,
+    APPLICATION_ICON_READY,
+    APPLICATION_ICON_FAILED
+} ApplicationIconState;
+
 typedef struct {
-    Pixmap color;
-    Pixmap mask;
-    unsigned int width;
-    unsigned int height;
-} RenderedIcon;
+    RenderedIcon rendered;
+    ApplicationIconState state;
+} ApplicationRenderedIcon;
 
 typedef struct {
     Atom wm_protocols;
@@ -146,6 +215,7 @@ typedef struct {
     Atom net_supporting_wm_check;
     Atom net_wm_name;
     Atom net_wm_icon_name;
+    Atom net_wm_icon;
     Atom net_client_list;
     Atom net_active_window;
     Atom net_close_window;
@@ -157,6 +227,9 @@ typedef struct {
     Atom net_wm_state_hidden;
     Atom net_wm_state_maximized_horz;
     Atom net_wm_state_maximized_vert;
+    Atom net_wm_desktop_file;
+    Atom gtk_application_id;
+    Atom wm_window_role;
     Atom win31x_role;
     Atom win31x_client;
 } Atoms;
@@ -166,7 +239,9 @@ typedef enum {
     DRAG_MOVE_CLIENT,
     DRAG_RESIZE_CLIENT,
     DRAG_MOVE_LAUNCHER,
-    DRAG_MOVE_CONTROL_PANEL
+    DRAG_MOVE_CONTROL_PANEL,
+    DRAG_MOVE_RUN,
+    DRAG_MOVE_ICON
 } DragKind;
 
 typedef enum {
@@ -190,6 +265,7 @@ typedef struct {
     int restore_y;
     int restore_width;
     int restore_height;
+    MonitorAnchor layout_monitor;
     ControlSection section;
     int wifi_selected;
     int wifi_scroll;
@@ -198,6 +274,71 @@ typedef struct {
     size_t password_length;
     char settings_status[160];
 } ControlPanel;
+
+typedef struct {
+    Window window;
+    int x;
+    int y;
+    int width;
+    int height;
+    bool visible;
+    bool positioned;
+    char command[RUN_COMMAND_CAPACITY];
+    size_t command_length;
+    char status[160];
+    InternalFocus return_internal_focus;
+    Window return_client;
+    MonitorAnchor monitor;
+} RunDialog;
+
+typedef enum {
+    DESKTOP_MENU_LOCK,
+    DESKTOP_MENU_LOG_OUT,
+    DESKTOP_MENU_RESTART,
+    DESKTOP_MENU_SHUT_DOWN,
+    DESKTOP_MENU_ITEM_COUNT,
+    DESKTOP_MENU_NONE = -1
+} DesktopMenuItem;
+
+typedef struct {
+    Window window;
+    int x;
+    int y;
+    int width;
+    int height;
+    bool visible;
+    bool pointer_grabbed;
+    bool keyboard_grabbed;
+    DesktopMenuItem selected;
+    DesktopMenuItem armed;
+    unsigned int pressed_button;
+    bool ignore_open_release;
+    MonitorAnchor monitor;
+} DesktopMenu;
+
+typedef enum {
+    SESSION_CONFIRM_YES,
+    SESSION_CONFIRM_NO,
+    SESSION_CONFIRM_CLOSE,
+    SESSION_CONFIRM_NONE = -1
+} SessionConfirmButton;
+
+typedef struct {
+    Window shield;
+    Window window;
+    int x;
+    int y;
+    int width;
+    int height;
+    bool visible;
+    DesktopMenuItem action;
+    SessionConfirmButton selected;
+    SessionConfirmButton armed;
+    unsigned int pressed_button;
+    InternalFocus return_internal_focus;
+    Window return_client;
+    MonitorAnchor monitor;
+} SessionConfirmation;
 
 typedef struct {
     bool compact;
@@ -228,6 +369,7 @@ enum {
 typedef struct {
     DragKind kind;
     Client *client;
+    DesktopIcon *icon;
     int edges;
     int start_root_x;
     int start_root_y;
@@ -235,6 +377,14 @@ typedef struct {
     int start_y;
     int start_width;
     int start_height;
+    int pending_x;
+    int pending_y;
+    int pending_width;
+    int pending_height;
+    bool moved;
+    bool arranged_restore_prepared;
+    bool outline_visible;
+    bool keyboard_grabbed;
 } DragState;
 
 typedef struct {
@@ -257,6 +407,7 @@ typedef struct {
     int launcher_restore_y;
     int launcher_restore_width;
     int launcher_restore_height;
+    MonitorAnchor launcher_layout_monitor;
     int launcher_scroll_row;
     int launcher_selected;
     int launcher_last_click;
@@ -267,7 +418,18 @@ typedef struct {
     DesktopIcon *applications_icon;
     DesktopIcon *control_panel_icon;
     AppList applications;
+    ApplicationRenderedIcon *application_icons;
+    size_t application_icon_count;
+    MonitorGeometry monitors[MAX_MONITORS];
+    size_t monitor_count;
+    MonitorAnchor active_monitor;
+    bool randr_available;
+    int randr_event_base;
+    int randr_error_base;
+    int randr_major;
+    int randr_minor;
     GC gc;
+    Window drag_outline[DRAG_OUTLINE_WINDOW_COUNT];
     XFontStruct *font;
     Cursor arrow_cursor;
     Cursor move_cursor;
@@ -276,10 +438,22 @@ typedef struct {
     IconAssets icon_assets;
     RenderedIcon rendered_icons[ICON_CATEGORY_COUNT][ICON_SIZE_COUNT];
     Win31xSettings settings;
+    Win31xDesktopState desktop_state;
+    bool desktop_state_dirty;
+    uint64_t desktop_state_due_ms;
+    bool launcher_positioned;
+    bool control_panel_positioned;
     Win31xAutoLock auto_lock;
+    Win31xSessionActions session_actions;
     WifiBackend wifi;
     ControlPanel control_panel;
+    RunDialog run_dialog;
+    DesktopMenu desktop_menu;
+    SessionConfirmation session_confirmation;
     InternalFocus internal_focus;
+    unsigned int super_masks[8];
+    size_t super_mask_count;
+    unsigned int ignored_lock_mask;
     Atoms atoms;
     DragState drag;
 } WindowManager;
@@ -292,10 +466,27 @@ static void dismiss_launcher(WindowManager *wm);
 static void dismiss_control_panel(WindowManager *wm);
 static void draw_launcher(WindowManager *wm);
 static void draw_control_panel(WindowManager *wm);
+static void draw_run_dialog(WindowManager *wm);
+static void hide_run_dialog(WindowManager *wm);
+static void dismiss_desktop_menu(WindowManager *wm);
+static void dismiss_session_confirmation(WindowManager *wm, bool restore_focus,
+                                         Time time);
+static void draw_session_confirmation(WindowManager *wm);
+static void refocus_session_confirmation(WindowManager *wm, Time time);
+static void draw_frame(WindowManager *wm, Client *client);
+static void draw_desktop_icon(WindowManager *wm, DesktopIcon *icon);
 static void update_focus_overlays(WindowManager *wm);
 static void activate_internal_window(WindowManager *wm, InternalFocus focus,
                                      Time time);
 static void raise_focused_internal_window(WindowManager *wm);
+static void apply_client_geometry(WindowManager *wm, Client *client);
+static void send_configure_notify(WindowManager *wm, Client *client);
+static void reapply_client_layout(WindowManager *wm, Client *client);
+static void cancel_drag(WindowManager *wm, Time time);
+static void clamp_geometry_to_monitor(const MonitorGeometry *monitor, int *x,
+                                      int *y, int *width, int *height);
+static const MonitorGeometry *monitor_at(const WindowManager *wm,
+                                         size_t index);
 
 static void handle_signal(int signal_number)
 {
@@ -328,6 +519,486 @@ static int runtime_error_handler(Display *display, XErrorEvent *event)
     fprintf(stderr, "win31x: X11 error: %s (request %u.%u, resource 0x%lx)\n",
             message, event->request_code, event->minor_code, event->resourceid);
     return 0;
+}
+
+static bool monitor_geometry_equal(const MonitorGeometry *left,
+                                   const MonitorGeometry *right)
+{
+    return left->name == right->name && left->x == right->x &&
+           left->y == right->y && left->width == right->width &&
+           left->height == right->height && left->primary == right->primary;
+}
+
+static bool monitor_sort_before(const MonitorGeometry *left,
+                                const MonitorGeometry *right)
+{
+    if (left->primary != right->primary)
+        return left->primary;
+    if (left->y != right->y)
+        return left->y < right->y;
+    if (left->x != right->x)
+        return left->x < right->x;
+    if (left->height != right->height)
+        return left->height < right->height;
+    if (left->width != right->width)
+        return left->width < right->width;
+    return left->name < right->name;
+}
+
+static void sort_monitors(MonitorGeometry *monitors, size_t count)
+{
+    size_t index;
+
+    for (index = 1U; index < count; ++index) {
+        MonitorGeometry current = monitors[index];
+        size_t position = index;
+
+        while (position > 0U &&
+               monitor_sort_before(&current, &monitors[position - 1U])) {
+            monitors[position] = monitors[position - 1U];
+            --position;
+        }
+        monitors[position] = current;
+    }
+}
+
+static void add_monitor_geometry(WindowManager *wm, MonitorGeometry *monitors,
+                                 size_t *count, Atom name, int x, int y,
+                                 int width, int height, bool primary)
+{
+    long long right = (long long)x + width;
+    long long bottom = (long long)y + height;
+    size_t index;
+
+    if (width <= 0 || height <= 0 || wm->screen_width <= 0 ||
+        wm->screen_height <= 0)
+        return;
+    if (x < 0)
+        x = 0;
+    if (y < 0)
+        y = 0;
+    if (right > wm->screen_width)
+        right = wm->screen_width;
+    if (bottom > wm->screen_height)
+        bottom = wm->screen_height;
+    if (right <= x || bottom <= y)
+        return;
+    width = (int)(right - x);
+    height = (int)(bottom - y);
+    for (index = 0U; index < *count; ++index) {
+        MonitorGeometry *existing = &monitors[index];
+
+        if (existing->x == x && existing->y == y &&
+            existing->width == width && existing->height == height) {
+            if (primary) {
+                existing->primary = true;
+                existing->name = name;
+            }
+            return;
+        }
+    }
+    if (*count >= MAX_MONITORS)
+        return;
+    monitors[*count] = (MonitorGeometry){
+        name, x, y, width, height, primary
+    };
+    ++*count;
+}
+
+static size_t monitor_override_layout(WindowManager *wm,
+                                      MonitorGeometry *monitors)
+{
+    const char *layout = getenv("WIN31X_TEST_MONITORS");
+    const char *cursor = layout;
+    size_t count = 0U;
+
+    if (layout == NULL || layout[0] == '\0')
+        return 0U;
+    while (*cursor != '\0' && count < MAX_MONITORS) {
+        char name[64];
+        int width;
+        int height;
+        int x;
+        int y;
+        int consumed = 0;
+
+        if (sscanf(cursor, "%dx%d%d%d%n", &width, &height, &x, &y,
+                   &consumed) != 4 || consumed <= 0)
+            return 0U;
+        snprintf(name, sizeof(name), "_WIN31X_MONITOR_%zu", count);
+        add_monitor_geometry(wm, monitors, &count,
+                             XInternAtom(wm->display, name, False), x, y,
+                             width, height, count == 0U);
+        cursor += consumed;
+        if (*cursor == ',')
+            ++cursor;
+        else if (*cursor != '\0')
+            return 0U;
+    }
+    return count;
+}
+
+static bool refresh_monitor_layout(WindowManager *wm)
+{
+    MonitorGeometry detected[MAX_MONITORS];
+    size_t count = monitor_override_layout(wm, detected);
+    bool override_layout = count > 0U;
+    bool randr_has_explicit_monitor = false;
+    size_t index;
+
+    if (count == 0U && wm->randr_available) {
+        int monitor_count = 0;
+        XRRMonitorInfo *information =
+            XRRGetMonitors(wm->display, wm->root, True, &monitor_count);
+        int monitor_index;
+
+        for (monitor_index = 0;
+             information != NULL && monitor_index < monitor_count;
+             ++monitor_index) {
+            XRRMonitorInfo *monitor = &information[monitor_index];
+            size_t previous_count = count;
+
+            add_monitor_geometry(wm, detected, &count, monitor->name,
+                                 monitor->x, monitor->y,
+                                 monitor->width, monitor->height,
+                                 monitor->primary != False);
+            if (count > previous_count && monitor->automatic == False)
+                randr_has_explicit_monitor = true;
+        }
+        if (information != NULL)
+            XRRFreeMonitors(information);
+    }
+    if (!override_layout && count <= 1U &&
+        !randr_has_explicit_monitor && XineramaIsActive(wm->display)) {
+        int screen_count = 0;
+        XineramaScreenInfo *screens =
+            XineramaQueryScreens(wm->display, &screen_count);
+
+        if (screens != NULL && screen_count > 1) {
+            int screen_index;
+
+            count = 0U;
+            for (screen_index = 0; screen_index < screen_count;
+                 ++screen_index) {
+                char name[64];
+
+                snprintf(name, sizeof(name), "_WIN31X_XINERAMA_%d",
+                         screens[screen_index].screen_number);
+                add_monitor_geometry(
+                    wm, detected, &count,
+                    XInternAtom(wm->display, name, False),
+                    screens[screen_index].x_org,
+                    screens[screen_index].y_org,
+                    screens[screen_index].width,
+                    screens[screen_index].height, screen_index == 0);
+            }
+        }
+        if (screens != NULL)
+            XFree(screens);
+    }
+    if (count == 0U) {
+        add_monitor_geometry(wm, detected, &count, None, 0, 0,
+                             wm->screen_width, wm->screen_height, true);
+    }
+    sort_monitors(detected, count);
+    if (count == wm->monitor_count) {
+        for (index = 0U; index < count; ++index) {
+            if (!monitor_geometry_equal(&detected[index],
+                                        &wm->monitors[index]))
+                break;
+        }
+        if (index == count)
+            return false;
+    }
+    memcpy(wm->monitors, detected, count * sizeof(detected[0]));
+    wm->monitor_count = count;
+    return true;
+}
+
+static long long distance_to_monitor(const MonitorGeometry *monitor,
+                                     int x, int y)
+{
+    long long right = (long long)monitor->x + monitor->width - 1;
+    long long bottom = (long long)monitor->y + monitor->height - 1;
+    long long dx = 0;
+    long long dy = 0;
+
+    if (x < monitor->x)
+        dx = (long long)monitor->x - x;
+    else if ((long long)x > right)
+        dx = (long long)x - right;
+    if (y < monitor->y)
+        dy = (long long)monitor->y - y;
+    else if ((long long)y > bottom)
+        dy = (long long)y - bottom;
+    return dx + dy;
+}
+
+static size_t monitor_index_for_point(const WindowManager *wm, int x, int y)
+{
+    size_t best = 0U;
+    long long best_distance = LLONG_MAX;
+    size_t index;
+
+    for (index = 0U; index < wm->monitor_count; ++index) {
+        long long distance = distance_to_monitor(&wm->monitors[index], x, y);
+
+        if (distance < best_distance) {
+            best = index;
+            best_distance = distance;
+        }
+    }
+    return best;
+}
+
+static size_t monitor_index_for_rectangle(const WindowManager *wm, int x,
+                                          int y, int width, int height)
+{
+    size_t center_monitor = monitor_index_for_point(
+        wm, x + (width > 0 ? width / 2 : 0),
+        y + (height > 0 ? height / 2 : 0));
+    size_t best = center_monitor;
+    long long best_area = 0;
+    size_t index;
+
+    for (index = 0U; index < wm->monitor_count; ++index) {
+        const MonitorGeometry *monitor = &wm->monitors[index];
+        long long left = x > monitor->x ? x : monitor->x;
+        long long top = y > monitor->y ? y : monitor->y;
+        long long right = (long long)x + (width > 0 ? width : 1);
+        long long bottom = (long long)y + (height > 0 ? height : 1);
+        long long monitor_right = (long long)monitor->x + monitor->width;
+        long long monitor_bottom = (long long)monitor->y + monitor->height;
+        long long area;
+
+        if (right > monitor_right)
+            right = monitor_right;
+        if (bottom > monitor_bottom)
+            bottom = monitor_bottom;
+        area = right > left && bottom > top
+                   ? (right - left) * (bottom - top)
+                   : 0;
+        if (area > best_area ||
+            (area == best_area && index == center_monitor)) {
+            best = index;
+            best_area = area;
+        }
+    }
+    return best;
+}
+
+static size_t monitor_index_for_anchor(const WindowManager *wm,
+                                       const MonitorAnchor *anchor)
+{
+    size_t index;
+
+    if (anchor != NULL && anchor->valid && anchor->name != None) {
+        for (index = 0U; index < wm->monitor_count; ++index) {
+            if (wm->monitors[index].name == anchor->name)
+                return index;
+        }
+    }
+    if (anchor != NULL && anchor->valid)
+        return monitor_index_for_point(wm, anchor->x, anchor->y);
+    return 0U;
+}
+
+static void set_monitor_anchor(MonitorAnchor *anchor,
+                               const MonitorGeometry *monitor)
+{
+    anchor->name = monitor->name;
+    anchor->x = monitor->x + monitor->width / 2;
+    anchor->y = monitor->y + monitor->height / 2;
+    anchor->valid = true;
+}
+
+static uint64_t monotonic_milliseconds(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+        return 0U;
+    return (uint64_t)now.tv_sec * UINT64_C(1000) +
+           (uint64_t)now.tv_nsec / UINT64_C(1000000);
+}
+
+static void mark_desktop_state_dirty(WindowManager *wm)
+{
+    if (!wm->desktop_state.write_enabled)
+        return;
+    wm->desktop_state_dirty = true;
+    wm->desktop_state_due_ms =
+        monotonic_milliseconds() + DESKTOP_STATE_SAVE_DELAY_MS;
+}
+
+static void flush_desktop_state(WindowManager *wm, bool force)
+{
+    uint64_t now;
+
+    if (!wm->desktop_state_dirty)
+        return;
+    if (!wm->desktop_state.write_enabled) {
+        wm->desktop_state_dirty = false;
+        return;
+    }
+    now = monotonic_milliseconds();
+    if (!force && now != 0U && now < wm->desktop_state_due_ms)
+        return;
+    if (win31x_desktop_state_save(&wm->desktop_state) < 0) {
+        fprintf(stderr, "win31x: could not save desktop layout: %s\n",
+                strerror(errno));
+        wm->desktop_state_due_ms = now + DESKTOP_STATE_SAVE_DELAY_MS;
+        return;
+    }
+    wm->desktop_state_dirty = false;
+}
+
+static void monitor_name(WindowManager *wm, const MonitorGeometry *monitor,
+                         char *name, size_t capacity)
+{
+    char *atom_name;
+
+    if (capacity == 0U)
+        return;
+    name[0] = '\0';
+    if (monitor == NULL || monitor->name == None)
+        return;
+    atom_name = XGetAtomName(wm->display, monitor->name);
+    if (atom_name == NULL)
+        return;
+    snprintf(name, capacity, "%s", atom_name);
+    XFree(atom_name);
+}
+
+static bool monitor_has_saved_name(WindowManager *wm,
+                                   const MonitorGeometry *monitor,
+                                   const char *saved_name)
+{
+    char current[WIN31X_DESKTOP_MONITOR_NAME_MAX + 1U];
+
+    if (saved_name == NULL || saved_name[0] == '\0')
+        return monitor != NULL && monitor->name == None;
+    monitor_name(wm, monitor, current, sizeof(current));
+    return strcmp(current, saved_name) == 0;
+}
+
+static bool placement_monitor_is_available(
+    WindowManager *wm, const Win31xDesktopPlacement *placement)
+{
+    size_t index;
+
+    if (placement == NULL || !placement->valid)
+        return false;
+    if (placement->monitor_name[0] == '\0')
+        return true;
+    for (index = 0U; index < wm->monitor_count; ++index) {
+        if (monitor_has_saved_name(wm, &wm->monitors[index],
+                                   placement->monitor_name))
+            return true;
+    }
+    return false;
+}
+
+static size_t monitor_index_for_placement(
+    WindowManager *wm, const Win31xDesktopPlacement *placement)
+{
+    size_t index;
+
+    if (placement != NULL && placement->valid &&
+        placement->monitor_name[0] != '\0') {
+        for (index = 0U; index < wm->monitor_count; ++index) {
+            if (monitor_has_saved_name(wm, &wm->monitors[index],
+                                       placement->monitor_name))
+                return index;
+        }
+    }
+    if (placement != NULL && placement->valid)
+        return monitor_index_for_point(wm, placement->monitor_center_x,
+                                       placement->monitor_center_y);
+    return 0U;
+}
+
+/* Leave enough headroom for frame decorations and the largest placement
+ * dimension before these coordinates are used by Xlib geometry helpers. */
+static int safe_placement_coordinate(long long value)
+{
+    const long long margin =
+        (long long)WIN31X_DESKTOP_DIMENSION_MAX + FRAME_TOP + FRAME_BOTTOM + 1;
+    const long long minimum = (long long)INT_MIN + margin;
+    const long long maximum = (long long)INT_MAX - margin;
+
+    if (value < minimum)
+        return (int)minimum;
+    if (value > maximum)
+        return (int)maximum;
+    return (int)value;
+}
+
+static void placement_from_geometry(
+    WindowManager *wm, Win31xDesktopPlacement *placement, size_t monitor_index,
+    int x, int y, int width, int height, ClientLayout layout)
+{
+    const MonitorGeometry *monitor = monitor_at(wm, monitor_index);
+
+    win31x_desktop_placement_defaults(placement);
+    if (monitor == NULL || width < 1 || height < 1)
+        return;
+    monitor_name(wm, monitor, placement->monitor_name,
+                 sizeof(placement->monitor_name));
+    placement->monitor_center_x = safe_placement_coordinate(
+        (long long)monitor->x + monitor->width / 2);
+    placement->monitor_center_y = safe_placement_coordinate(
+        (long long)monitor->y + monitor->height / 2);
+    placement->relative_x = safe_placement_coordinate(
+        (long long)x - monitor->x);
+    placement->relative_y = safe_placement_coordinate(
+        (long long)y - monitor->y);
+    placement->width = width;
+    placement->height = height;
+    placement->layout = (Win31xDesktopLayout)layout;
+    placement->valid = true;
+    placement->valid = win31x_desktop_placement_is_valid(placement);
+}
+
+static size_t geometry_from_placement(
+    WindowManager *wm, const Win31xDesktopPlacement *placement, int *x, int *y,
+    int *width, int *height, bool clamp)
+{
+    size_t monitor_index = monitor_index_for_placement(wm, placement);
+    const MonitorGeometry *monitor = monitor_at(wm, monitor_index);
+
+    if (monitor == NULL || placement == NULL || !placement->valid)
+        return monitor_index;
+    *x = safe_placement_coordinate((long long)monitor->x +
+                                   placement->relative_x);
+    *y = safe_placement_coordinate((long long)monitor->y +
+                                   placement->relative_y);
+    *width = placement->width;
+    *height = placement->height;
+    if (clamp)
+        clamp_geometry_to_monitor(monitor, x, y, width, height);
+    return monitor_index;
+}
+
+static void clamp_geometry_to_monitor(const MonitorGeometry *monitor, int *x,
+                                      int *y, int *width, int *height)
+{
+    if (*width < 1)
+        *width = 1;
+    if (*height < 1)
+        *height = 1;
+    if (*width > monitor->width)
+        *width = monitor->width;
+    if (*height > monitor->height)
+        *height = monitor->height;
+    if (*x < monitor->x)
+        *x = monitor->x;
+    if (*y < monitor->y)
+        *y = monitor->y;
+    if (*x > monitor->x + monitor->width - *width)
+        *x = monitor->x + monitor->width - *width;
+    if (*y > monitor->y + monitor->height - *height)
+        *y = monitor->y + monitor->height - *height;
 }
 
 static unsigned long allocate_color(WindowManager *wm, const char *name,
@@ -469,6 +1140,17 @@ fail:
     return -1;
 }
 
+static void free_rendered_icon(WindowManager *wm, RenderedIcon *icon)
+{
+    if (icon == NULL)
+        return;
+    if (icon->color != None)
+        XFreePixmap(wm->display, icon->color);
+    if (icon->mask != None)
+        XFreePixmap(wm->display, icon->mask);
+    memset(icon, 0, sizeof(*icon));
+}
+
 static void free_rendered_icons(WindowManager *wm)
 {
     int category;
@@ -478,11 +1160,7 @@ static void free_rendered_icons(WindowManager *wm)
         for (size = 0; size < ICON_SIZE_COUNT; ++size) {
             RenderedIcon *icon = &wm->rendered_icons[category][size];
 
-            if (icon->color != None)
-                XFreePixmap(wm->display, icon->color);
-            if (icon->mask != None)
-                XFreePixmap(wm->display, icon->mask);
-            memset(icon, 0, sizeof(*icon));
+            free_rendered_icon(wm, icon);
         }
     }
 }
@@ -588,6 +1266,165 @@ static void draw_supplied_icon_centered(WindowManager *wm, Drawable drawable,
                        copy_height, destination_x, destination_y);
 }
 
+static void draw_rendered_icon_centered(WindowManager *wm, Drawable drawable,
+                                        const RenderedIcon *icon, int box_x,
+                                        int box_y, int box_width,
+                                        int box_height)
+{
+    int destination_x;
+    int destination_y;
+
+    if (icon == NULL || icon->color == None || icon->mask == None ||
+        icon->width == 0U || icon->height == 0U)
+        return;
+    destination_x = box_x + (box_width - (int)icon->width) / 2;
+    destination_y = box_y + (box_height - (int)icon->height) / 2;
+    copy_rendered_icon(wm, drawable, icon, 0, 0, icon->width, icon->height,
+                       destination_x, destination_y);
+}
+
+typedef struct {
+    const unsigned long *pixels;
+    unsigned int width;
+    unsigned int height;
+} NetWmIconChoice;
+
+static bool net_wm_icon_is_better(unsigned int candidate_width,
+                                  unsigned int candidate_height,
+                                  const NetWmIconChoice *current,
+                                  unsigned int target)
+{
+    unsigned int candidate_size = candidate_width > candidate_height
+                                      ? candidate_width
+                                      : candidate_height;
+    unsigned int current_size = current->width > current->height
+                                    ? current->width
+                                    : current->height;
+    bool candidate_large = candidate_size >= target;
+    bool current_large = current_size >= target;
+
+    if (current->pixels == NULL)
+        return true;
+    if (candidate_large != current_large)
+        return candidate_large;
+    if (candidate_large)
+        return candidate_size < current_size;
+    return candidate_size > current_size;
+}
+
+static int rendered_net_wm_icon(WindowManager *wm, const unsigned long *data,
+                                unsigned long count, unsigned int target,
+                                RenderedIcon *rendered)
+{
+    NetWmIconChoice choice = {0};
+    unsigned long offset = 0UL;
+    IconImage source = {0};
+    IconImage scaled = {0};
+    size_t pixel_count;
+    size_t index;
+    bool any_alpha = false;
+    bool any_color = false;
+    bool any_visible = false;
+    int result = -1;
+
+    while (count - offset >= 2UL) {
+        unsigned long raw_width = data[offset++];
+        unsigned long raw_height = data[offset++];
+        uint64_t raw_pixels;
+
+        if (raw_width == 0UL || raw_height == 0UL || raw_width > 1024UL ||
+            raw_height > 1024UL)
+            break;
+        raw_pixels = (uint64_t)raw_width * raw_height;
+        if (raw_pixels > count - offset)
+            break;
+        if (net_wm_icon_is_better((unsigned int)raw_width,
+                                  (unsigned int)raw_height, &choice, target)) {
+            choice.pixels = data + offset;
+            choice.width = (unsigned int)raw_width;
+            choice.height = (unsigned int)raw_height;
+        }
+        offset += (unsigned long)raw_pixels;
+    }
+    if (choice.pixels == NULL) {
+        errno = ENOENT;
+        return -1;
+    }
+    pixel_count = (size_t)choice.width * choice.height;
+    source.rgba = malloc(pixel_count * 4U);
+    if (source.rgba == NULL)
+        return -1;
+    source.width = choice.width;
+    source.height = choice.height;
+    for (index = 0U; index < pixel_count; ++index) {
+        unsigned long argb = choice.pixels[index];
+        unsigned char alpha = (unsigned char)((argb >> 24) & 0xffUL);
+        unsigned char red = (unsigned char)((argb >> 16) & 0xffUL);
+        unsigned char green = (unsigned char)((argb >> 8) & 0xffUL);
+        unsigned char blue = (unsigned char)(argb & 0xffUL);
+
+        source.rgba[index * 4U] = red;
+        source.rgba[index * 4U + 1U] = green;
+        source.rgba[index * 4U + 2U] = blue;
+        source.rgba[index * 4U + 3U] = alpha;
+        any_alpha = any_alpha || alpha != 0U;
+        any_visible = any_visible || alpha >= 128U;
+        any_color = any_color || red != 0U || green != 0U || blue != 0U;
+    }
+    /* A few older toolkits accidentally publish RGB with a zero alpha byte. */
+    if (!any_alpha && any_color) {
+        for (index = 0U; index < pixel_count; ++index)
+            source.rgba[index * 4U + 3U] = 255U;
+        any_visible = true;
+    }
+    if (!any_visible) {
+        errno = EINVAL;
+        goto done;
+    }
+    if (icon_image_scale_fit(&source, target, target, &scaled) < 0)
+        goto done;
+    if (create_rendered_icon(wm, &scaled, rendered) < 0)
+        goto done;
+    result = 0;
+
+done:
+    icon_image_free(&scaled);
+    icon_image_free(&source);
+    return result;
+}
+
+static void refresh_client_icon(WindowManager *wm, Client *client)
+{
+    Atom actual_type;
+    int actual_format;
+    unsigned long count;
+    unsigned long bytes_after;
+    unsigned char *value = NULL;
+    RenderedIcon small = {0};
+    RenderedIcon large = {0};
+
+    if (XGetWindowProperty(wm->display, client->window, wm->atoms.net_wm_icon,
+                           0, CLIENT_ICON_PROPERTY_LIMIT, False, XA_CARDINAL,
+                           &actual_type, &actual_format, &count, &bytes_after,
+                           &value) == Success &&
+        actual_type == XA_CARDINAL && actual_format == 32 && value != NULL &&
+        bytes_after == 0UL) {
+        const unsigned long *items = (const unsigned long *)value;
+
+        (void)rendered_net_wm_icon(wm, items, count, 16U, &small);
+        (void)rendered_net_wm_icon(wm, items, count, 48U, &large);
+    }
+    if (value != NULL)
+        XFree(value);
+    free_rendered_icon(wm, &client->actual_icon_small);
+    free_rendered_icon(wm, &client->actual_icon_large);
+    client->actual_icon_small = small;
+    client->actual_icon_large = large;
+    draw_frame(wm, client);
+    if (client->icon != NULL)
+        draw_desktop_icon(wm, client->icon);
+}
+
 static Atom intern(Display *display, const char *name)
 {
     return XInternAtom(display, name, False);
@@ -608,6 +1445,7 @@ static void initialize_atoms(WindowManager *wm)
     a->net_supporting_wm_check = intern(d, "_NET_SUPPORTING_WM_CHECK");
     a->net_wm_name = intern(d, "_NET_WM_NAME");
     a->net_wm_icon_name = intern(d, "_NET_WM_ICON_NAME");
+    a->net_wm_icon = intern(d, "_NET_WM_ICON");
     a->net_client_list = intern(d, "_NET_CLIENT_LIST");
     a->net_active_window = intern(d, "_NET_ACTIVE_WINDOW");
     a->net_close_window = intern(d, "_NET_CLOSE_WINDOW");
@@ -621,6 +1459,9 @@ static void initialize_atoms(WindowManager *wm)
         intern(d, "_NET_WM_STATE_MAXIMIZED_HORZ");
     a->net_wm_state_maximized_vert =
         intern(d, "_NET_WM_STATE_MAXIMIZED_VERT");
+    a->net_wm_desktop_file = intern(d, "_NET_WM_DESKTOP_FILE");
+    a->gtk_application_id = intern(d, "_GTK_APPLICATION_ID");
+    a->wm_window_role = intern(d, "WM_WINDOW_ROLE");
     a->win31x_role = intern(d, "_WIN31X_ROLE");
     a->win31x_client = intern(d, "_WIN31X_CLIENT");
 }
@@ -636,6 +1477,112 @@ static void set_utf8_property(WindowManager *wm, Window window, Atom property,
 static void set_internal_role(WindowManager *wm, Window window, const char *role)
 {
     set_utf8_property(wm, window, wm->atoms.win31x_role, role);
+}
+
+static void initialize_drag_outline(WindowManager *wm)
+{
+    XSetWindowAttributes attributes;
+    size_t index;
+
+    attributes.override_redirect = True;
+    attributes.save_under = True;
+    attributes.background_pixel = wm->theme.black;
+    attributes.event_mask = NoEventMask;
+    for (index = 0U; index < DRAG_OUTLINE_WINDOW_COUNT; ++index) {
+        wm->drag_outline[index] = XCreateWindow(
+            wm->display, wm->root, 0, 0, 1, 1, 0, CopyFromParent,
+            InputOutput, CopyFromParent,
+            CWOverrideRedirect | CWSaveUnder | CWBackPixel | CWEventMask,
+            &attributes);
+        set_internal_role(wm, wm->drag_outline[index], "drag-outline");
+    }
+}
+
+static void raise_drag_outline(WindowManager *wm)
+{
+    size_t index;
+
+    if (!wm->drag.outline_visible)
+        return;
+    for (index = 0U; index < DRAG_OUTLINE_WINDOW_COUNT; ++index)
+        XRaiseWindow(wm->display, wm->drag_outline[index]);
+}
+
+static void show_drag_outline(WindowManager *wm, int x, int y, int width,
+                              int height)
+{
+    int horizontal_thickness = DRAG_OUTLINE_THICKNESS;
+    int vertical_thickness = DRAG_OUTLINE_THICKNESS;
+    int middle_height;
+    int side_y;
+    size_t index;
+
+    if (width < 1 || height < 1)
+        return;
+    if (horizontal_thickness > height)
+        horizontal_thickness = height;
+    if (vertical_thickness > width)
+        vertical_thickness = width;
+    middle_height = height - horizontal_thickness * 2;
+    if (middle_height < 1)
+        middle_height = 1;
+    side_y = y + (height - middle_height) / 2;
+
+    XMoveResizeWindow(wm->display, wm->drag_outline[0], x, y,
+                      (unsigned)width, (unsigned)horizontal_thickness);
+    XMoveResizeWindow(wm->display, wm->drag_outline[1], x,
+                      y + height - horizontal_thickness, (unsigned)width,
+                      (unsigned)horizontal_thickness);
+    XMoveResizeWindow(wm->display, wm->drag_outline[2], x, side_y,
+                      (unsigned)vertical_thickness, (unsigned)middle_height);
+    XMoveResizeWindow(wm->display, wm->drag_outline[3],
+                      x + width - vertical_thickness, side_y,
+                      (unsigned)vertical_thickness, (unsigned)middle_height);
+    if (!wm->drag.outline_visible) {
+        for (index = 0U; index < DRAG_OUTLINE_WINDOW_COUNT; ++index)
+            XMapWindow(wm->display, wm->drag_outline[index]);
+        wm->drag.outline_visible = true;
+    }
+    raise_drag_outline(wm);
+}
+
+static void hide_drag_outline(WindowManager *wm)
+{
+    size_t index;
+
+    if (!wm->drag.outline_visible)
+        return;
+    wm->drag.outline_visible = false;
+    for (index = 0U; index < DRAG_OUTLINE_WINDOW_COUNT; ++index)
+        XUnmapWindow(wm->display, wm->drag_outline[index]);
+}
+
+static void cancel_drag(WindowManager *wm, Time time)
+{
+    bool was_dragging = wm->drag.kind != DRAG_NONE;
+    bool keyboard_grabbed = wm->drag.keyboard_grabbed;
+
+    hide_drag_outline(wm);
+    memset(&wm->drag, 0, sizeof(wm->drag));
+    if (was_dragging)
+        XUngrabPointer(wm->display, time);
+    if (keyboard_grabbed)
+        XUngrabKeyboard(wm->display, time);
+}
+
+static void cancel_drag_and_restore(WindowManager *wm, Time time)
+{
+    DragState drag = wm->drag;
+
+    cancel_drag(wm, time);
+    if (drag.kind == DRAG_RESIZE_CLIENT && drag.client != NULL) {
+        drag.client->x = drag.start_x;
+        drag.client->y = drag.start_y;
+        drag.client->width = drag.start_width;
+        drag.client->height = drag.start_height;
+        apply_client_geometry(wm, drag.client);
+        send_configure_notify(wm, drag.client);
+    }
 }
 
 static char *copy_bytes(const unsigned char *data, unsigned long length)
@@ -699,6 +1646,146 @@ static char *window_class(WindowManager *wm, Window window)
     if (hint.res_class != NULL)
         XFree(hint.res_class);
     return combined;
+}
+
+static char *window_identity_property(WindowManager *wm, Window window,
+                                      Atom property)
+{
+    Atom actual_type;
+    int actual_format;
+    unsigned long item_count;
+    unsigned long bytes_after;
+    unsigned char *value = NULL;
+    char *copy = NULL;
+
+    if (XGetWindowProperty(wm->display, window, property, 0, 256, False,
+                           AnyPropertyType, &actual_type, &actual_format,
+                           &item_count, &bytes_after, &value) == Success &&
+        actual_type != None && actual_format == 8 && value != NULL &&
+        bytes_after == 0UL && item_count > 0UL && item_count <= 192UL &&
+        memchr(value, '\0', item_count) == NULL)
+        copy = copy_bytes(value, item_count);
+    if (value != NULL)
+        XFree(value);
+    return copy;
+}
+
+static bool append_identity_component(char *identity, size_t capacity,
+                                      size_t *used, const char *label,
+                                      const char *value)
+{
+    size_t value_length = value != NULL ? strlen(value) : 0U;
+    int prefix_length;
+
+    prefix_length = snprintf(identity + *used, capacity - *used, "%s%zu:",
+                             label, value_length);
+    if (prefix_length < 0 || (size_t)prefix_length >= capacity - *used ||
+        value_length >= capacity - *used - (size_t)prefix_length)
+        return false;
+    *used += (size_t)prefix_length;
+    memcpy(identity + *used, value, value_length);
+    *used += value_length;
+    identity[*used] = '\0';
+    return true;
+}
+
+static char *window_state_identity(WindowManager *wm, Window window)
+{
+    XClassHint hint = {0};
+    char *application_id = window_identity_property(
+        wm, window, wm->atoms.gtk_application_id);
+    char *desktop_file = NULL;
+    char *role = window_identity_property(wm, window, wm->atoms.wm_window_role);
+    const char *name = "";
+    const char *class_name = "";
+    char identity[WIN31X_DESKTOP_IDENTITY_MAX + 1U -
+                  STATE_IDENTITY_INSTANCE_RESERVE];
+    size_t used = 0U;
+    bool valid = true;
+
+    if (application_id == NULL)
+        desktop_file = window_identity_property(
+            wm, window, wm->atoms.net_wm_desktop_file);
+    (void)XGetClassHint(wm->display, window, &hint);
+    if (hint.res_name != NULL)
+        name = hint.res_name;
+    if (hint.res_class != NULL)
+        class_name = hint.res_class;
+
+    identity[0] = '\0';
+    if (application_id != NULL) {
+        valid = append_identity_component(identity, sizeof(identity), &used,
+                                          "app", application_id);
+    } else if (desktop_file != NULL) {
+        valid = append_identity_component(identity, sizeof(identity), &used,
+                                          "desktop", desktop_file);
+    } else if (name[0] != '\0' || class_name[0] != '\0') {
+        valid = append_identity_component(identity, sizeof(identity), &used,
+                                          "class", class_name) &&
+                append_identity_component(identity, sizeof(identity), &used,
+                                          "name", name);
+    } else {
+        valid = false;
+    }
+    if (valid && role != NULL && role[0] != '\0')
+        valid = append_identity_component(identity, sizeof(identity), &used,
+                                          "role", role);
+
+    if (hint.res_name != NULL)
+        XFree(hint.res_name);
+    if (hint.res_class != NULL)
+        XFree(hint.res_class);
+    free(application_id);
+    free(desktop_file);
+    free(role);
+    return strdup(valid ? identity : "");
+}
+
+static bool state_instance_in_use(const WindowManager *wm,
+                                  const Client *ignored,
+                                  const char *base_identity,
+                                  unsigned int instance)
+{
+    const Client *client;
+
+    for (client = wm->clients; client != NULL; client = client->next) {
+        if (client != ignored && client->state_base_identity != NULL &&
+            strcmp(client->state_base_identity, base_identity) == 0 &&
+            client->state_instance == instance)
+            return true;
+    }
+    return false;
+}
+
+static char *client_state_identity(WindowManager *wm, Client *client,
+                                   const char *base_identity,
+                                   unsigned int *instance_out)
+{
+    char identity[WIN31X_DESKTOP_IDENTITY_MAX + 1U];
+    unsigned int instance = 1U;
+    int written;
+
+    if (base_identity == NULL || base_identity[0] == '\0') {
+        *instance_out = 0U;
+        return strdup("");
+    }
+    while (state_instance_in_use(wm, client, base_identity, instance)) {
+        if (instance == UINT_MAX) {
+            errno = EOVERFLOW;
+            return NULL;
+        }
+        ++instance;
+    }
+    *instance_out = instance;
+    if (instance == 1U)
+        return strdup(base_identity);
+    written = snprintf(identity, sizeof(identity), "instance=%u;%s",
+                       instance, base_identity);
+    if (written < 0 || (size_t)written >= sizeof(identity)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    return strdup(identity);
 }
 
 static Client *client_for_window(WindowManager *wm, Window window)
@@ -793,6 +1880,86 @@ static int frame_width(const Client *client)
 static int frame_height(const Client *client)
 {
     return client->height + FRAME_TOP + FRAME_BOTTOM;
+}
+
+static size_t monitor_index_for_client(const WindowManager *wm,
+                                       const Client *client)
+{
+    return monitor_index_for_rectangle(
+        wm, client->x - FRAME_LEFT, client->y - FRAME_TOP,
+        frame_width(client), frame_height(client));
+}
+
+static size_t pointer_monitor_index(WindowManager *wm)
+{
+    Window root_return;
+    Window child_return;
+    int root_x;
+    int root_y;
+    int window_x;
+    int window_y;
+    unsigned int mask;
+
+    if (XQueryPointer(wm->display, wm->root, &root_return, &child_return,
+                      &root_x, &root_y, &window_x, &window_y, &mask))
+        return monitor_index_for_point(wm, root_x, root_y);
+    return monitor_index_for_anchor(wm, &wm->active_monitor);
+}
+
+static size_t active_monitor_index(WindowManager *wm)
+{
+    if (wm->internal_focus == INTERNAL_FOCUS_APPLICATIONS &&
+        wm->launcher_visible) {
+        return monitor_index_for_rectangle(
+            wm, wm->launcher_x, wm->launcher_y,
+            wm->launcher_width, wm->launcher_height);
+    }
+    if (wm->internal_focus == INTERNAL_FOCUS_CONTROL_PANEL &&
+        wm->control_panel.visible) {
+        return monitor_index_for_rectangle(
+            wm, wm->control_panel.x, wm->control_panel.y,
+            wm->control_panel.width, wm->control_panel.height);
+    }
+    if (wm->internal_focus == INTERNAL_FOCUS_RUN && wm->run_dialog.visible) {
+        return monitor_index_for_rectangle(
+            wm, wm->run_dialog.x, wm->run_dialog.y,
+            wm->run_dialog.width, wm->run_dialog.height);
+    }
+    if (wm->active != NULL && !wm->active->minimized)
+        return monitor_index_for_client(wm, wm->active);
+    if (wm->active_monitor.valid)
+        return monitor_index_for_anchor(wm, &wm->active_monitor);
+    return pointer_monitor_index(wm);
+}
+
+static const MonitorGeometry *monitor_at(const WindowManager *wm,
+                                         size_t index)
+{
+    if (wm->monitor_count == 0U)
+        return NULL;
+    if (index >= wm->monitor_count)
+        index = 0U;
+    return &wm->monitors[index];
+}
+
+static void set_active_monitor(WindowManager *wm, size_t index)
+{
+    const MonitorGeometry *monitor = monitor_at(wm, index);
+
+    if (monitor != NULL)
+        set_monitor_anchor(&wm->active_monitor, monitor);
+}
+
+static void set_active_monitor_from_point(WindowManager *wm, int x, int y)
+{
+    set_active_monitor(wm, monitor_index_for_point(wm, x, y));
+}
+
+static void set_active_monitor_from_client(WindowManager *wm,
+                                           const Client *client)
+{
+    if (client != NULL)
+        set_active_monitor(wm, monitor_index_for_client(wm, client));
 }
 
 static int close_button_x(const Client *client)
@@ -918,8 +2085,13 @@ static void draw_frame(WindowManager *wm, Client *client)
     XFillRectangle(wm->display, client->frame, wm->gc, FRAME_LEFT, TITLE_Y,
                    (unsigned)(width - FRAME_LEFT - FRAME_RIGHT), TITLE_HEIGHT);
 
-    draw_supplied_icon(wm, client->frame, client_icon_category(client),
-                       ICON_SIZE_SMALL, FRAME_LEFT + 2, TITLE_Y + 2);
+    if (client->actual_icon_small.color != None)
+        draw_rendered_icon_centered(wm, client->frame,
+                                    &client->actual_icon_small,
+                                    FRAME_LEFT + 2, TITLE_Y + 2, 16, 16);
+    else
+        draw_supplied_icon(wm, client->frame, client_icon_category(client),
+                           ICON_SIZE_SMALL, FRAME_LEFT + 2, TITLE_Y + 2);
 
     fitted_text(wm, client->title, title_end - 25, title, sizeof(title));
     XSetForeground(wm->display, wm->gc, wm->theme.white);
@@ -953,8 +2125,14 @@ static void draw_desktop_icon(WindowManager *wm, DesktopIcon *icon)
 
     XSetForeground(wm->display, wm->gc, wm->theme.desktop);
     XFillRectangle(wm->display, icon->window, wm->gc, 0, 0, ICON_WIDTH, ICON_HEIGHT);
-    draw_supplied_icon_centered(wm, icon->window, category, ICON_SIZE_LARGE,
-                                0, 5, ICON_WIDTH, 48);
+    if (icon->kind == ICON_MINIMIZED && icon->client != NULL &&
+        icon->client->actual_icon_large.color != None)
+        draw_rendered_icon_centered(wm, icon->window,
+                                    &icon->client->actual_icon_large,
+                                    0, 5, ICON_WIDTH, 48);
+    else
+        draw_supplied_icon_centered(wm, icon->window, category,
+                                    ICON_SIZE_LARGE, 0, 5, ICON_WIDTH, 48);
     draw_centered_text(wm, icon->window, label, ICON_WIDTH / 2 + 1, 70,
                        wm->theme.black, ICON_WIDTH - 4);
     draw_centered_text(wm, icon->window, label, ICON_WIDTH / 2, 69,
@@ -999,6 +2177,10 @@ static void apply_color_scheme(WindowManager *wm, size_t scheme_index,
         draw_launcher(wm);
     if (wm->control_panel.visible)
         draw_control_panel(wm);
+    if (wm->run_dialog.visible)
+        draw_run_dialog(wm);
+    if (wm->session_confirmation.visible)
+        draw_session_confirmation(wm);
 }
 
 static void set_wm_state(WindowManager *wm, Client *client, long state)
@@ -1325,6 +2507,7 @@ static void update_focus_overlays(WindowManager *wm)
         bool intercept = !client->minimized &&
                          (client != wm->active ||
                           wm->internal_focus != INTERNAL_FOCUS_NONE ||
+                          wm->session_confirmation.visible ||
                           active_needs_raise);
 
         if (client->focus_overlay == None)
@@ -1352,6 +2535,7 @@ static void change_active_client(WindowManager *wm, Client *client,
         draw_frame(wm, old_active);
     if (client != NULL)
         draw_frame(wm, client);
+    raise_drag_outline(wm);
 }
 
 static void send_configure_notify(WindowManager *wm, Client *client)
@@ -1595,34 +2779,109 @@ static void apply_client_geometry(WindowManager *wm, Client *client)
 static void reposition_icons(WindowManager *wm)
 {
     DesktopIcon *icon;
-    int index = 0;
-    int columns = (wm->screen_width - ICON_MARGIN * 2 + ICON_GAP) /
-                  (ICON_WIDTH + ICON_GAP);
+    int minimized_counts[MAX_MONITORS] = {0};
 
-    if (columns < 1)
-        columns = 1;
     for (icon = wm->icons; icon != NULL; icon = icon->next) {
+        size_t monitor_index;
+        const MonitorGeometry *monitor;
         int x;
         int y;
 
+        if (icon->manual_position && icon->preferred.valid) {
+            int width;
+            int height;
+
+            monitor_index = geometry_from_placement(
+                wm, &icon->preferred, &x, &y, &width, &height, false);
+            monitor = monitor_at(wm, monitor_index);
+            if (monitor == NULL)
+                continue;
+            width = ICON_WIDTH;
+            height = ICON_HEIGHT;
+            clamp_geometry_to_monitor(monitor, &x, &y, &width, &height);
+            goto position_icon;
+        }
+        monitor_index = icon->kind == ICON_APPLICATIONS ||
+                                icon->kind == ICON_CONTROL_PANEL
+                            ? 0U
+                            : monitor_index_for_anchor(wm, &icon->monitor);
+        monitor = monitor_at(wm, monitor_index);
+        if (monitor == NULL)
+            continue;
         if (icon->kind == ICON_APPLICATIONS) {
-            x = ICON_MARGIN;
-            y = ICON_MARGIN;
+            x = monitor->x + ICON_MARGIN;
+            y = monitor->y + ICON_MARGIN;
         } else if (icon->kind == ICON_CONTROL_PANEL) {
-            x = ICON_MARGIN;
-            y = ICON_MARGIN + ICON_HEIGHT + ICON_GAP;
+            x = monitor->x + ICON_MARGIN;
+            y = monitor->y + ICON_MARGIN + ICON_HEIGHT + ICON_GAP;
         } else {
+            int columns;
+            int rows;
+            int slot;
+            int column;
+            int row;
+
             if (icon->client == NULL || !icon->client->minimized)
                 continue;
-            int column = index % columns;
-            int row = index / columns;
-            x = ICON_MARGIN + column * (ICON_WIDTH + ICON_GAP);
-            y = wm->screen_height - ICON_MARGIN - ICON_HEIGHT -
+            columns = (monitor->width - ICON_MARGIN * 2 + ICON_GAP) /
+                      (ICON_WIDTH + ICON_GAP);
+            rows = (monitor->height - ICON_MARGIN * 2 + ICON_GAP) /
+                   (ICON_HEIGHT + ICON_GAP);
+            if (columns < 1)
+                columns = 1;
+            if (rows < 1)
+                rows = 1;
+            slot = minimized_counts[monitor_index]++;
+            column = slot % columns;
+            row = slot / columns;
+            if (row >= rows)
+                row = rows - 1;
+            x = monitor->x + ICON_MARGIN +
+                column * (ICON_WIDTH + ICON_GAP);
+            y = monitor->y + monitor->height - ICON_MARGIN - ICON_HEIGHT -
                 row * (ICON_HEIGHT + ICON_GAP);
-            ++index;
         }
+        if (x + ICON_WIDTH > monitor->x + monitor->width)
+            x = monitor->x + monitor->width - ICON_WIDTH;
+        if (y + ICON_HEIGHT > monitor->y + monitor->height)
+            y = monitor->y + monitor->height - ICON_HEIGHT;
+        if (x < monitor->x)
+            x = monitor->x;
+        if (y < monitor->y)
+            y = monitor->y;
+position_icon:
+        icon->x = x;
+        icon->y = y;
+        set_monitor_anchor(&icon->monitor, monitor);
         XMoveWindow(wm->display, icon->window, x, y);
         XLowerWindow(wm->display, icon->window);
+    }
+}
+
+static void remember_desktop_icon_position(WindowManager *wm,
+                                           DesktopIcon *icon)
+{
+    size_t monitor_index;
+    Win31xDesktopPlacement *saved = NULL;
+
+    if (icon == NULL)
+        return;
+    monitor_index = monitor_index_for_rectangle(
+        wm, icon->x, icon->y, ICON_WIDTH, ICON_HEIGHT);
+    placement_from_geometry(wm, &icon->preferred, monitor_index, icon->x,
+                            icon->y, ICON_WIDTH, ICON_HEIGHT,
+                            CLIENT_LAYOUT_NORMAL);
+    if (!icon->preferred.valid)
+        return;
+    icon->manual_position = true;
+    set_monitor_anchor(&icon->monitor, monitor_at(wm, monitor_index));
+    if (icon->kind == ICON_APPLICATIONS)
+        saved = &wm->desktop_state.applications_icon;
+    else if (icon->kind == ICON_CONTROL_PANEL)
+        saved = &wm->desktop_state.control_panel_icon;
+    if (saved != NULL) {
+        *saved = icon->preferred;
+        mark_desktop_state_dirty(wm);
     }
 }
 
@@ -1637,7 +2896,8 @@ static DesktopIcon *create_desktop_icon(WindowManager *wm, IconKind kind,
         return NULL;
     attributes.override_redirect = True;
     attributes.background_pixel = wm->theme.desktop;
-    attributes.event_mask = ExposureMask | ButtonPressMask;
+    attributes.event_mask = ExposureMask | ButtonPressMask |
+                            ButtonReleaseMask | PointerMotionMask;
     attributes.cursor = wm->arrow_cursor;
     icon->window = XCreateWindow(wm->display, wm->root, 0, 0, ICON_WIDTH,
                                  ICON_HEIGHT, 0, CopyFromParent, InputOutput,
@@ -1645,6 +2905,21 @@ static DesktopIcon *create_desktop_icon(WindowManager *wm, IconKind kind,
                                  CWEventMask | CWCursor, &attributes);
     icon->kind = kind;
     icon->client = client;
+    if (kind == ICON_APPLICATIONS &&
+        wm->desktop_state.applications_icon.valid) {
+        icon->preferred = wm->desktop_state.applications_icon;
+        icon->manual_position = true;
+    } else if (kind == ICON_CONTROL_PANEL &&
+               wm->desktop_state.control_panel_icon.valid) {
+        icon->preferred = wm->desktop_state.control_panel_icon;
+        icon->manual_position = true;
+    }
+    if (client != NULL)
+        set_monitor_anchor(&icon->monitor,
+                           monitor_at(wm, monitor_index_for_client(wm,
+                                                                  client)));
+    else
+        set_monitor_anchor(&icon->monitor, monitor_at(wm, 0U));
     icon->next = wm->icons;
     wm->icons = icon;
     if (kind == ICON_APPLICATIONS)
@@ -1670,6 +2945,8 @@ static void destroy_desktop_icon(WindowManager *wm, DesktopIcon *target)
 
     if (target == NULL)
         return;
+    if (wm->drag.kind == DRAG_MOVE_ICON && wm->drag.icon == target)
+        cancel_drag(wm, CurrentTime);
     for (cursor = &wm->icons; *cursor != NULL; cursor = &(*cursor)->next) {
         if (*cursor == target) {
             *cursor = target->next;
@@ -1714,6 +2991,11 @@ static void focus_client(WindowManager *wm, Client *client, Time time)
 
     if (client == NULL || client->minimized)
         return;
+    if (wm->session_confirmation.visible) {
+        refocus_session_confirmation(wm, time);
+        return;
+    }
+    set_active_monitor_from_client(wm, client);
     leaving_internal = wm->internal_focus != INTERNAL_FOCUS_NONE;
     wm->internal_focus = INTERNAL_FOCUS_NONE;
     change_active_client(wm, client, true);
@@ -1744,6 +3026,8 @@ static void focus_client(WindowManager *wm, Client *client, Time time)
             draw_launcher(wm);
         if (wm->control_panel.visible)
             draw_control_panel(wm);
+        if (wm->run_dialog.visible)
+            draw_run_dialog(wm);
     }
 }
 
@@ -1752,15 +3036,37 @@ static void activate_internal_window(WindowManager *wm, InternalFocus focus,
 {
     Window window;
 
+    if (wm->session_confirmation.visible) {
+        refocus_session_confirmation(wm, time);
+        return;
+    }
     if (focus == INTERNAL_FOCUS_APPLICATIONS && wm->launcher_visible) {
         window = wm->launcher;
     } else if (focus == INTERNAL_FOCUS_CONTROL_PANEL &&
                wm->control_panel.visible) {
         window = wm->control_panel.window;
+    } else if (focus == INTERNAL_FOCUS_RUN && wm->run_dialog.visible) {
+        window = wm->run_dialog.window;
     } else {
         return;
     }
     wm->internal_focus = focus;
+    if (focus == INTERNAL_FOCUS_APPLICATIONS) {
+        set_active_monitor(
+            wm, monitor_index_for_rectangle(
+                    wm, wm->launcher_x, wm->launcher_y,
+                    wm->launcher_width, wm->launcher_height));
+    } else if (focus == INTERNAL_FOCUS_CONTROL_PANEL) {
+        set_active_monitor(
+            wm, monitor_index_for_rectangle(
+                    wm, wm->control_panel.x, wm->control_panel.y,
+                    wm->control_panel.width, wm->control_panel.height));
+    } else {
+        set_active_monitor(
+            wm, monitor_index_for_rectangle(
+                    wm, wm->run_dialog.x, wm->run_dialog.y,
+                    wm->run_dialog.width, wm->run_dialog.height));
+    }
     publish_active_client(wm, NULL);
     update_focus_overlays(wm);
     if (wm->active != NULL)
@@ -1769,6 +3075,8 @@ static void activate_internal_window(WindowManager *wm, InternalFocus focus,
         draw_launcher(wm);
     if (wm->control_panel.visible)
         draw_control_panel(wm);
+    if (wm->run_dialog.visible)
+        draw_run_dialog(wm);
     XRaiseWindow(wm->display, window);
     XSetInputFocus(wm->display, window, RevertToPointerRoot, time);
 }
@@ -1864,9 +3172,7 @@ static void cancel_client_drag(WindowManager *wm, Client *client)
 {
     if (wm->drag.client != client)
         return;
-    wm->drag.kind = DRAG_NONE;
-    wm->drag.client = NULL;
-    XUngrabPointer(wm->display, CurrentTime);
+    cancel_drag(wm, CurrentTime);
 }
 
 static void minimize_client_window(WindowManager *wm, Client *client,
@@ -1878,8 +3184,12 @@ static void minimize_client_window(WindowManager *wm, Client *client,
     if (show_desktop_icon) {
         if (client->icon == NULL)
             client->icon = create_desktop_icon(wm, ICON_MINIMIZED, client);
-        else
+        else {
+            set_monitor_anchor(
+                &client->icon->monitor,
+                monitor_at(wm, monitor_index_for_client(wm, client)));
             XMapWindow(wm->display, client->icon->window);
+        }
     } else if (client->icon != NULL) {
         XUnmapWindow(wm->display, client->icon->window);
     }
@@ -1974,8 +3284,12 @@ static void expose_orphaned_transients(WindowManager *wm, Window owner)
         client->minimized_with_owner = None;
         if (client->icon == NULL)
             client->icon = create_desktop_icon(wm, ICON_MINIMIZED, client);
-        else
+        else {
+            set_monitor_anchor(
+                &client->icon->monitor,
+                monitor_at(wm, monitor_index_for_client(wm, client)));
             XMapWindow(wm->display, client->icon->window);
+        }
         set_wm_state(wm, client, IconicState);
     }
     reposition_icons(wm);
@@ -2032,8 +3346,12 @@ static void remove_client(WindowManager *wm, Client *client, bool destroyed,
         client->focus_overlay = None;
     }
     XDestroyWindow(wm->display, client->frame);
+    free_rendered_icon(wm, &client->actual_icon_small);
+    free_rendered_icon(wm, &client->actual_icon_large);
     free(client->title);
     free(client->class_name);
+    free(client->state_base_identity);
+    free(client->state_identity);
     free(client);
     update_client_list(wm);
     if (was_active && wm->internal_focus == INTERNAL_FOCUS_NONE)
@@ -2051,20 +3369,22 @@ static void set_frame_extents(WindowManager *wm, Client *client)
 
 static void keep_client_on_screen(WindowManager *wm, Client *client)
 {
+    const MonitorGeometry *monitor = monitor_at(
+        wm, monitor_index_for_client(wm, client));
     int outer_width = frame_width(client);
-    int outer_height = frame_height(client);
     int frame_x = client->x - FRAME_LEFT;
     int frame_y = client->y - FRAME_TOP;
 
-    if (frame_y < 0)
-        client->y = FRAME_TOP;
-    if (frame_x > wm->screen_width - 48)
-        client->x = wm->screen_width - 48 + FRAME_LEFT;
-    if (frame_x + outer_width < 48)
-        client->x = 48 - outer_width + FRAME_LEFT;
-    if (frame_y > wm->screen_height - TITLE_HEIGHT)
-        client->y = wm->screen_height - TITLE_HEIGHT + FRAME_TOP;
-    (void)outer_height;
+    if (monitor == NULL)
+        return;
+    if (frame_y < monitor->y)
+        client->y = monitor->y + FRAME_TOP;
+    if (frame_x > monitor->x + monitor->width - 48)
+        client->x = monitor->x + monitor->width - 48 + FRAME_LEFT;
+    if (frame_x + outer_width < monitor->x + 48)
+        client->x = monitor->x + 48 - outer_width + FRAME_LEFT;
+    if (frame_y > monitor->y + monitor->height - TITLE_HEIGHT)
+        client->y = monitor->y + monitor->height - TITLE_HEIGHT + FRAME_TOP;
 }
 
 static void remember_client_geometry(Client *client)
@@ -2076,18 +3396,186 @@ static void remember_client_geometry(Client *client)
     client->restore_valid = true;
 }
 
+static void capture_client_placement(WindowManager *wm, Client *client,
+                                     bool replace_monitor_fallback)
+{
+    Win31xDesktopPlacement placement;
+    size_t monitor_index;
+    int x;
+    int y;
+    int width;
+    int height;
+
+    if (client == NULL || !client->state_persistable ||
+        client->state_identity == NULL || client->state_identity[0] == '\0')
+        return;
+    if (client->state_monitor_fallback && !replace_monitor_fallback)
+        return;
+    if (replace_monitor_fallback)
+        client->state_monitor_fallback = false;
+    if (client->layout == CLIENT_LAYOUT_NORMAL) {
+        x = client->x;
+        y = client->y;
+        width = client->width;
+        height = client->height;
+        monitor_index = monitor_index_for_rectangle(
+            wm, x - FRAME_LEFT, y - FRAME_TOP, frame_width(client),
+            frame_height(client));
+    } else if (client->restore_valid) {
+        x = client->restore_x;
+        y = client->restore_y;
+        width = client->restore_width;
+        height = client->restore_height;
+        monitor_index = client->layout_monitor.valid
+                            ? monitor_index_for_anchor(wm,
+                                                       &client->layout_monitor)
+                            : monitor_index_for_rectangle(
+                                  wm, x - FRAME_LEFT, y - FRAME_TOP,
+                                  width + FRAME_LEFT + FRAME_RIGHT,
+                                  height + FRAME_TOP + FRAME_BOTTOM);
+    } else {
+        return;
+    }
+    placement_from_geometry(wm, &placement, monitor_index, x, y, width,
+                            height, client->layout);
+    if (!placement.valid)
+        return;
+    placement.layout_before_maximize =
+        (Win31xDesktopLayout)client->layout_before_maximize;
+    if (win31x_desktop_state_upsert_client(
+            &wm->desktop_state, client->state_identity, &placement) < 0) {
+        if (errno != ENOSPC)
+            fprintf(stderr, "win31x: could not remember window layout: %s\n",
+                    strerror(errno));
+        return;
+    }
+    mark_desktop_state_dirty(wm);
+}
+
+static ClientLayout restore_client_placement(WindowManager *wm, Client *client,
+                                              size_t *layout_monitor)
+{
+    const Win31xDesktopClientRecord *record;
+    const MonitorGeometry *monitor;
+    int x;
+    int y;
+    int width;
+    int height;
+
+    *layout_monitor = 0U;
+    if (!client->state_persistable || client->state_identity == NULL ||
+        client->state_identity[0] == '\0')
+        return CLIENT_LAYOUT_NORMAL;
+    record = win31x_desktop_state_find_client(&wm->desktop_state,
+                                               client->state_identity);
+    if (record == NULL || !record->placement.valid)
+        return CLIENT_LAYOUT_NORMAL;
+    client->layout_before_maximize =
+        (ClientLayout)record->placement.layout_before_maximize;
+    client->state_monitor_fallback =
+        !placement_monitor_is_available(wm, &record->placement);
+    *layout_monitor = geometry_from_placement(
+        wm, &record->placement, &x, &y, &width, &height, false);
+    monitor = monitor_at(wm, *layout_monitor);
+    if (monitor == NULL)
+        return CLIENT_LAYOUT_NORMAL;
+    if (width > monitor->width - FRAME_LEFT - FRAME_RIGHT)
+        width = monitor->width - FRAME_LEFT - FRAME_RIGHT;
+    if (height > monitor->height - FRAME_TOP - FRAME_BOTTOM)
+        height = monitor->height - FRAME_TOP - FRAME_BOTTOM;
+    if (width < 1)
+        width = 1;
+    if (height < 1)
+        height = 1;
+    client->x = x;
+    client->y = y;
+    client->width = width;
+    client->height = height;
+    constrain_client_size(wm, client, &client->width, &client->height);
+    keep_client_on_screen(wm, client);
+    client->state_restored = true;
+    return (ClientLayout)record->placement.layout;
+}
+
+static bool reflow_client_to_saved_placement(WindowManager *wm, Client *client)
+{
+    const Win31xDesktopClientRecord *record;
+    const MonitorGeometry *monitor;
+    size_t monitor_index;
+    int x;
+    int y;
+    int width;
+    int height;
+
+    if (!client->state_persistable || client->state_identity == NULL)
+        return false;
+    record = win31x_desktop_state_find_client(&wm->desktop_state,
+                                               client->state_identity);
+    if (record == NULL || !record->placement.valid ||
+        (ClientLayout)record->placement.layout != client->layout)
+        return false;
+    client->layout_before_maximize =
+        (ClientLayout)record->placement.layout_before_maximize;
+    client->state_monitor_fallback =
+        !placement_monitor_is_available(wm, &record->placement);
+    monitor_index = geometry_from_placement(
+        wm, &record->placement, &x, &y, &width, &height, false);
+    monitor = monitor_at(wm, monitor_index);
+    if (monitor == NULL)
+        return false;
+    if (width > monitor->width - FRAME_LEFT - FRAME_RIGHT)
+        width = monitor->width - FRAME_LEFT - FRAME_RIGHT;
+    if (height > monitor->height - FRAME_TOP - FRAME_BOTTOM)
+        height = monitor->height - FRAME_TOP - FRAME_BOTTOM;
+    if (width < 1)
+        width = 1;
+    if (height < 1)
+        height = 1;
+    constrain_client_size(wm, client, &width, &height);
+    if (client->layout == CLIENT_LAYOUT_NORMAL) {
+        client->x = x;
+        client->y = y;
+        client->width = width;
+        client->height = height;
+        keep_client_on_screen(wm, client);
+        apply_client_geometry(wm, client);
+        send_configure_notify(wm, client);
+    } else {
+        client->restore_x = x;
+        client->restore_y = y;
+        client->restore_width = width;
+        client->restore_height = height;
+        client->restore_valid = true;
+        set_monitor_anchor(&client->layout_monitor, monitor);
+        reapply_client_layout(wm, client);
+    }
+    return true;
+}
+
 static void apply_client_layout_geometry(WindowManager *wm, Client *client)
 {
-    int outer_x = 0;
-    int outer_width = wm->screen_width;
+    size_t monitor_index = client->layout_monitor.valid
+                               ? monitor_index_for_anchor(
+                                     wm, &client->layout_monitor)
+                               : monitor_index_for_client(wm, client);
+    const MonitorGeometry *monitor = monitor_at(wm, monitor_index);
+    int outer_x;
+    int outer_width;
     int width;
-    int height = wm->screen_height - FRAME_TOP - FRAME_BOTTOM;
+    int height;
+
+    if (monitor == NULL)
+        return;
+    set_monitor_anchor(&client->layout_monitor, monitor);
+    outer_x = monitor->x;
+    outer_width = monitor->width;
+    height = monitor->height - FRAME_TOP - FRAME_BOTTOM;
 
     if (client->layout == CLIENT_LAYOUT_SNAP_LEFT) {
-        outer_width = wm->screen_width / 2;
+        outer_width = monitor->width / 2;
     } else if (client->layout == CLIENT_LAYOUT_SNAP_RIGHT) {
-        outer_x = wm->screen_width / 2;
-        outer_width = wm->screen_width - outer_x;
+        outer_x = monitor->x + monitor->width / 2;
+        outer_width = monitor->width - monitor->width / 2;
     }
     width = outer_width - FRAME_LEFT - FRAME_RIGHT;
     if (width < 1)
@@ -2097,7 +3585,7 @@ static void apply_client_layout_geometry(WindowManager *wm, Client *client)
     constrain_client_size(wm, client, &width, &height);
     client->width = width;
     client->height = height;
-    client->y = FRAME_TOP;
+    client->y = monitor->y + FRAME_TOP;
     if (client->layout == CLIENT_LAYOUT_SNAP_RIGHT) {
         client->x = outer_x + outer_width - frame_width(client) + FRAME_LEFT;
     } else {
@@ -2137,9 +3625,15 @@ static void set_client_layout(WindowManager *wm, Client *client,
             client->height = client->restore_height;
         }
         client->restore_valid = false;
+        client->layout_monitor.valid = false;
         constrain_client_size(wm, client, &client->width, &client->height);
         keep_client_on_screen(wm, client);
     } else {
+        if (!client->layout_monitor.valid) {
+            set_monitor_anchor(
+                &client->layout_monitor,
+                monitor_at(wm, monitor_index_for_client(wm, client)));
+        }
         if (client->layout == CLIENT_LAYOUT_NORMAL)
             remember_client_geometry(client);
         client->layout = layout;
@@ -2157,6 +3651,7 @@ static void toggle_client_maximize(WindowManager *wm, Client *client)
                       client->layout == CLIENT_LAYOUT_MAXIMIZED
                           ? CLIENT_LAYOUT_NORMAL
                           : CLIENT_LAYOUT_MAXIMIZED);
+    capture_client_placement(wm, client, true);
 }
 
 static void normalize_client_layout(WindowManager *wm, Client *client)
@@ -2166,53 +3661,9 @@ static void normalize_client_layout(WindowManager *wm, Client *client)
     client->layout = CLIENT_LAYOUT_NORMAL;
     client->layout_before_maximize = CLIENT_LAYOUT_NORMAL;
     client->restore_valid = false;
+    client->layout_monitor.valid = false;
     set_maximized_state(wm, client, false);
     draw_frame(wm, client);
-}
-
-static void restore_client_for_move(WindowManager *wm, Client *client,
-                                    int pointer_x, int pointer_y)
-{
-    int old_frame_x;
-    int old_frame_y;
-    int old_frame_width;
-    int pointer_offset_x;
-    int pointer_offset_y;
-    int new_frame_width;
-
-    if (client->layout == CLIENT_LAYOUT_NORMAL)
-        return;
-    old_frame_x = client->x - FRAME_LEFT;
-    old_frame_y = client->y - FRAME_TOP;
-    old_frame_width = frame_width(client);
-    pointer_offset_x = pointer_x - old_frame_x;
-    pointer_offset_y = pointer_y - old_frame_y;
-    if (pointer_offset_x < 0)
-        pointer_offset_x = 0;
-    if (pointer_offset_x > old_frame_width)
-        pointer_offset_x = old_frame_width;
-    if (pointer_offset_y < 0)
-        pointer_offset_y = 0;
-    if (pointer_offset_y >= TITLE_Y + TITLE_HEIGHT)
-        pointer_offset_y = TITLE_Y + TITLE_HEIGHT - 1;
-    client->layout = CLIENT_LAYOUT_NORMAL;
-    client->layout_before_maximize = CLIENT_LAYOUT_NORMAL;
-    if (client->restore_valid) {
-        client->width = client->restore_width;
-        client->height = client->restore_height;
-    }
-    client->restore_valid = false;
-    constrain_client_size(wm, client, &client->width, &client->height);
-    new_frame_width = frame_width(client);
-    client->x = pointer_x -
-                    (int)((long long)pointer_offset_x * new_frame_width /
-                          (old_frame_width > 0 ? old_frame_width : 1)) +
-                FRAME_LEFT;
-    client->y = pointer_y - pointer_offset_y + FRAME_TOP;
-    keep_client_on_screen(wm, client);
-    set_maximized_state(wm, client, false);
-    apply_client_geometry(wm, client);
-    send_configure_notify(wm, client);
 }
 
 static void handle_normal_hints_change(WindowManager *wm, Client *client)
@@ -2241,6 +3692,7 @@ static void handle_normal_hints_change(WindowManager *wm, Client *client)
     keep_client_on_screen(wm, client);
     apply_client_geometry(wm, client);
     send_configure_notify(wm, client);
+    capture_client_placement(wm, client, false);
 }
 
 static Client *manage_window(WindowManager *wm, Window window, bool startup)
@@ -2250,6 +3702,10 @@ static Client *manage_window(WindowManager *wm, Window window, bool startup)
     XSetWindowAttributes overlay_attributes;
     XWMHints *hints;
     Client *client;
+    ClientLayout saved_layout = CLIENT_LAYOUT_NORMAL;
+    ClientLayout saved_layout_before_maximize = CLIENT_LAYOUT_NORMAL;
+    size_t saved_layout_monitor = 0U;
+    Window state_transient = None;
     bool initially_iconic = false;
     bool initially_maximized;
 
@@ -2266,8 +3722,16 @@ static Client *manage_window(WindowManager *wm, Window window, bool startup)
                               wm->atoms.net_wm_state_maximized_horz) ||
         net_wm_state_contains(wm, window,
                               wm->atoms.net_wm_state_maximized_vert);
+    client->initial_maximize_precedence = initially_maximized;
     client->title = window_title(wm, window);
     client->class_name = window_class(wm, window);
+    client->state_base_identity = window_state_identity(wm, window);
+    client->state_identity = client_state_identity(
+        wm, client, client->state_base_identity, &client->state_instance);
+    client->state_persistable =
+        client->state_identity != NULL && client->state_identity[0] != '\0' &&
+        (!XGetTransientForHint(wm->display, window, &state_transient) ||
+         state_transient == None);
     client->width = attributes.width;
     client->height = attributes.height;
     client->saved_border = (unsigned)attributes.border_width;
@@ -2282,6 +3746,9 @@ static Client *manage_window(WindowManager *wm, Window window, bool startup)
         initially_iconic = true;
     if (hints != NULL)
         XFree(hints);
+    saved_layout = restore_client_placement(wm, client,
+                                            &saved_layout_monitor);
+    saved_layout_before_maximize = client->layout_before_maximize;
     keep_client_on_screen(wm, client);
 
     frame_attributes.override_redirect = False;
@@ -2322,10 +3789,34 @@ static Client *manage_window(WindowManager *wm, Window window, bool startup)
     client->next = wm->clients;
     wm->clients = client;
     refresh_client_transient_for(wm, client);
+    if (client->transient_for != None)
+        client->state_persistable = false;
     set_frame_extents(wm, client);
     update_client_list(wm);
-    if (initially_maximized)
+    refresh_client_icon(wm, client);
+    /* An explicit initial maximize wins the saved mode, while the saved mode
+     * and monitor remain the target restored by the maximize button. */
+    if (initially_maximized) {
+        if (client->state_restored) {
+            set_monitor_anchor(&client->layout_monitor,
+                               monitor_at(wm, saved_layout_monitor));
+        }
         set_client_layout(wm, client, CLIENT_LAYOUT_MAXIMIZED);
+        if (client->state_restored) {
+            client->layout_before_maximize =
+                saved_layout == CLIENT_LAYOUT_MAXIMIZED
+                    ? saved_layout_before_maximize
+                    : saved_layout;
+        }
+    } else if (saved_layout != CLIENT_LAYOUT_NORMAL) {
+        set_monitor_anchor(&client->layout_monitor,
+                           monitor_at(wm, saved_layout_monitor));
+        set_client_layout(wm, client, saved_layout);
+        if (saved_layout == CLIENT_LAYOUT_MAXIMIZED)
+            client->layout_before_maximize = saved_layout_before_maximize;
+    }
+    if (!client->state_restored)
+        capture_client_placement(wm, client, false);
 
     if (initially_iconic) {
         client->minimized = true;
@@ -2389,6 +3880,52 @@ static IconCategory application_icon_category(const AppEntry *entry)
     return category;
 }
 
+static void free_application_icons(WindowManager *wm)
+{
+    size_t index;
+
+    for (index = 0U; index < wm->application_icon_count; ++index)
+        free_rendered_icon(wm, &wm->application_icons[index].rendered);
+    free(wm->application_icons);
+    wm->application_icons = NULL;
+    wm->application_icon_count = 0U;
+}
+
+static const RenderedIcon *application_rendered_icon(WindowManager *wm,
+                                                     size_t index)
+{
+    ApplicationRenderedIcon *cached;
+    const AppEntry *entry;
+    char *path = NULL;
+    IconImage source = {0};
+    IconImage scaled = {0};
+
+    if (index >= wm->applications.len ||
+        index >= wm->application_icon_count || wm->application_icons == NULL)
+        return NULL;
+    cached = &wm->application_icons[index];
+    if (cached->state == APPLICATION_ICON_READY)
+        return &cached->rendered;
+    if (cached->state == APPLICATION_ICON_FAILED)
+        return NULL;
+    cached->state = APPLICATION_ICON_FAILED;
+    entry = &wm->applications.entries[index];
+    if (entry->icon == NULL || entry->icon[0] == '\0' ||
+        app_icon_resolve(entry->icon, 48U, &path) < 0)
+        goto done;
+    if (icon_image_load_file(path, &source) < 0 ||
+        icon_image_scale_fit(&source, 48U, 48U, &scaled) < 0 ||
+        create_rendered_icon(wm, &scaled, &cached->rendered) < 0)
+        goto done;
+    cached->state = APPLICATION_ICON_READY;
+
+done:
+    free(path);
+    icon_image_free(&scaled);
+    icon_image_free(&source);
+    return cached->state == APPLICATION_ICON_READY ? &cached->rendered : NULL;
+}
+
 static void draw_launcher(WindowManager *wm)
 {
     int width = wm->launcher_width;
@@ -2436,6 +3973,8 @@ static void draw_launcher(WindowManager *wm)
         int cell_x = 10 + column * LAUNCHER_CELL_WIDTH;
         int cell_y = 34 + row * LAUNCHER_CELL_HEIGHT;
         const AppEntry *entry = &wm->applications.entries[index];
+        const RenderedIcon *actual_icon =
+            application_rendered_icon(wm, (size_t)index);
 
         if (index == wm->launcher_selected) {
             XSetForeground(wm->display, wm->gc, wm->theme.silver);
@@ -2447,10 +3986,15 @@ static void draw_launcher(WindowManager *wm)
                            cell_x + 2, cell_y + 1,
                            LAUNCHER_CELL_WIDTH - 6, LAUNCHER_CELL_HEIGHT - 5);
         }
-        draw_supplied_icon_centered(wm, wm->launcher,
-                                    application_icon_category(entry),
-                                    ICON_SIZE_LARGE, cell_x, cell_y + 5,
-                                    LAUNCHER_CELL_WIDTH, 48);
+        if (actual_icon != NULL)
+            draw_rendered_icon_centered(wm, wm->launcher, actual_icon,
+                                        cell_x, cell_y + 5,
+                                        LAUNCHER_CELL_WIDTH, 48);
+        else
+            draw_supplied_icon_centered(wm, wm->launcher,
+                                        application_icon_category(entry),
+                                        ICON_SIZE_LARGE, cell_x, cell_y + 5,
+                                        LAUNCHER_CELL_WIDTH, 48);
         draw_centered_text(wm, wm->launcher,
                            entry->name,
                            cell_x + LAUNCHER_CELL_WIDTH / 2, cell_y + 68,
@@ -2467,18 +4011,19 @@ static void draw_launcher(WindowManager *wm)
                 footer, (int)strlen(footer));
 }
 
-static void screen_layout_geometry(const WindowManager *wm, ClientLayout layout,
-                                   int *x, int *y, int *width, int *height)
+static void screen_layout_geometry(const MonitorGeometry *monitor,
+                                   ClientLayout layout, int *x, int *y,
+                                   int *width, int *height)
 {
-    *x = 0;
-    *y = 0;
-    *width = wm->screen_width;
-    *height = wm->screen_height;
+    *x = monitor->x;
+    *y = monitor->y;
+    *width = monitor->width;
+    *height = monitor->height;
     if (layout == CLIENT_LAYOUT_SNAP_LEFT) {
-        *width = wm->screen_width / 2;
+        *width = monitor->width / 2;
     } else if (layout == CLIENT_LAYOUT_SNAP_RIGHT) {
-        *x = wm->screen_width / 2;
-        *width = wm->screen_width - *x;
+        *x = monitor->x + monitor->width / 2;
+        *width = monitor->width - monitor->width / 2;
     }
     if (*width < 1)
         *width = 1;
@@ -2489,25 +4034,143 @@ static void screen_layout_geometry(const WindowManager *wm, ClientLayout layout,
 static void clamp_internal_geometry(const WindowManager *wm, int *x, int *y,
                                     int *width, int *height)
 {
-    int maximum_width = wm->screen_width > 0 ? wm->screen_width : 1;
-    int maximum_height = wm->screen_height > 0 ? wm->screen_height : 1;
+    const MonitorGeometry *monitor = monitor_at(
+        wm, monitor_index_for_rectangle(wm, *x, *y, *width, *height));
 
-    if (*width < 1)
-        *width = 1;
-    if (*height < 1)
-        *height = 1;
-    if (*width > maximum_width)
-        *width = maximum_width;
-    if (*height > maximum_height)
-        *height = maximum_height;
-    if (*x < 0)
-        *x = 0;
-    if (*y < 0)
-        *y = 0;
-    if (*x > maximum_width - *width)
-        *x = maximum_width - *width;
-    if (*y > maximum_height - *height)
-        *y = maximum_height - *height;
+    if (monitor != NULL)
+        clamp_geometry_to_monitor(monitor, x, y, width, height);
+}
+
+static void restore_launcher_placement(WindowManager *wm)
+{
+    const Win31xDesktopPlacement *saved = &wm->desktop_state.launcher;
+    size_t monitor_index;
+    int x;
+    int y;
+    int width;
+    int height;
+
+    if (!saved->valid)
+        return;
+    monitor_index = geometry_from_placement(wm, saved, &x, &y, &width,
+                                            &height, true);
+    wm->launcher_x = x;
+    wm->launcher_y = y;
+    wm->launcher_width = width;
+    wm->launcher_height = height;
+    wm->launcher_layout = (ClientLayout)saved->layout;
+    wm->launcher_layout_before_maximize =
+        (ClientLayout)saved->layout_before_maximize;
+    if (wm->launcher_layout != CLIENT_LAYOUT_NORMAL) {
+        wm->launcher_restore_x = x;
+        wm->launcher_restore_y = y;
+        wm->launcher_restore_width = width;
+        wm->launcher_restore_height = height;
+        wm->launcher_restore_valid = true;
+        set_monitor_anchor(&wm->launcher_layout_monitor,
+                           monitor_at(wm, monitor_index));
+        screen_layout_geometry(monitor_at(wm, monitor_index),
+                               wm->launcher_layout, &wm->launcher_x,
+                               &wm->launcher_y, &wm->launcher_width,
+                               &wm->launcher_height);
+    }
+    wm->launcher_positioned = true;
+}
+
+static void remember_launcher_placement(WindowManager *wm)
+{
+    size_t monitor_index;
+    int x = wm->launcher_x;
+    int y = wm->launcher_y;
+    int width = wm->launcher_width;
+    int height = wm->launcher_height;
+
+    if (wm->launcher_layout != CLIENT_LAYOUT_NORMAL &&
+        wm->launcher_restore_valid) {
+        x = wm->launcher_restore_x;
+        y = wm->launcher_restore_y;
+        width = wm->launcher_restore_width;
+        height = wm->launcher_restore_height;
+    }
+    monitor_index = wm->launcher_layout != CLIENT_LAYOUT_NORMAL &&
+                            wm->launcher_layout_monitor.valid
+                        ? monitor_index_for_anchor(
+                              wm, &wm->launcher_layout_monitor)
+                        : monitor_index_for_rectangle(wm, x, y, width,
+                                                      height);
+    placement_from_geometry(wm, &wm->desktop_state.launcher, monitor_index,
+                            x, y, width, height, wm->launcher_layout);
+    if (wm->desktop_state.launcher.valid) {
+        wm->desktop_state.launcher.layout_before_maximize =
+            (Win31xDesktopLayout)wm->launcher_layout_before_maximize;
+        mark_desktop_state_dirty(wm);
+    }
+}
+
+static void restore_control_panel_placement(WindowManager *wm)
+{
+    ControlPanel *panel = &wm->control_panel;
+    const Win31xDesktopPlacement *saved = &wm->desktop_state.control_panel;
+    size_t monitor_index;
+    int x;
+    int y;
+    int width;
+    int height;
+
+    if (!saved->valid)
+        return;
+    monitor_index = geometry_from_placement(wm, saved, &x, &y, &width,
+                                            &height, true);
+    panel->x = x;
+    panel->y = y;
+    panel->width = width;
+    panel->height = height;
+    panel->layout = (ClientLayout)saved->layout;
+    panel->layout_before_maximize =
+        (ClientLayout)saved->layout_before_maximize;
+    if (panel->layout != CLIENT_LAYOUT_NORMAL) {
+        panel->restore_x = x;
+        panel->restore_y = y;
+        panel->restore_width = width;
+        panel->restore_height = height;
+        panel->restore_valid = true;
+        set_monitor_anchor(&panel->layout_monitor,
+                           monitor_at(wm, monitor_index));
+        screen_layout_geometry(monitor_at(wm, monitor_index), panel->layout,
+                               &panel->x, &panel->y, &panel->width,
+                               &panel->height);
+    }
+    wm->control_panel_positioned = true;
+}
+
+static void remember_control_panel_placement(WindowManager *wm)
+{
+    ControlPanel *panel = &wm->control_panel;
+    size_t monitor_index;
+    int x = panel->x;
+    int y = panel->y;
+    int width = panel->width;
+    int height = panel->height;
+
+    if (panel->layout != CLIENT_LAYOUT_NORMAL && panel->restore_valid) {
+        x = panel->restore_x;
+        y = panel->restore_y;
+        width = panel->restore_width;
+        height = panel->restore_height;
+    }
+    monitor_index = panel->layout != CLIENT_LAYOUT_NORMAL &&
+                            panel->layout_monitor.valid
+                        ? monitor_index_for_anchor(wm,
+                                                   &panel->layout_monitor)
+                        : monitor_index_for_rectangle(wm, x, y, width,
+                                                      height);
+    placement_from_geometry(wm, &wm->desktop_state.control_panel,
+                            monitor_index, x, y, width, height, panel->layout);
+    if (wm->desktop_state.control_panel.valid) {
+        wm->desktop_state.control_panel.layout_before_maximize =
+            (Win31xDesktopLayout)panel->layout_before_maximize;
+        mark_desktop_state_dirty(wm);
+    }
 }
 
 static void apply_launcher_layout(WindowManager *wm, ClientLayout layout)
@@ -2530,9 +4193,20 @@ static void apply_launcher_layout(WindowManager *wm, ClientLayout layout)
             wm->launcher_height = wm->launcher_restore_height;
         }
         wm->launcher_restore_valid = false;
+        wm->launcher_layout_monitor.valid = false;
         clamp_internal_geometry(wm, &wm->launcher_x, &wm->launcher_y,
                                 &wm->launcher_width, &wm->launcher_height);
     } else {
+        const MonitorGeometry *monitor;
+
+        if (!wm->launcher_layout_monitor.valid) {
+            set_monitor_anchor(
+                &wm->launcher_layout_monitor,
+                monitor_at(wm, monitor_index_for_rectangle(
+                                   wm, wm->launcher_x, wm->launcher_y,
+                                   wm->launcher_width,
+                                   wm->launcher_height)));
+        }
         if (wm->launcher_layout == CLIENT_LAYOUT_NORMAL) {
             wm->launcher_restore_x = wm->launcher_x;
             wm->launcher_restore_y = wm->launcher_y;
@@ -2541,8 +4215,13 @@ static void apply_launcher_layout(WindowManager *wm, ClientLayout layout)
             wm->launcher_restore_valid = true;
         }
         wm->launcher_layout = layout;
-        screen_layout_geometry(wm, layout, &wm->launcher_x, &wm->launcher_y,
-                               &wm->launcher_width, &wm->launcher_height);
+        monitor = monitor_at(
+            wm, monitor_index_for_anchor(wm,
+                                         &wm->launcher_layout_monitor));
+        set_monitor_anchor(&wm->launcher_layout_monitor, monitor);
+        screen_layout_geometry(monitor, layout, &wm->launcher_x,
+                               &wm->launcher_y, &wm->launcher_width,
+                               &wm->launcher_height);
     }
     clamp_launcher_scroll(wm);
     XMoveResizeWindow(wm->display, wm->launcher, wm->launcher_x, wm->launcher_y,
@@ -2557,73 +4236,40 @@ static void toggle_launcher_maximize(WindowManager *wm)
         wm, wm->launcher_layout == CLIENT_LAYOUT_MAXIMIZED
                 ? CLIENT_LAYOUT_NORMAL
                 : CLIENT_LAYOUT_MAXIMIZED);
+    remember_launcher_placement(wm);
 }
 
-static void restore_launcher_for_move(WindowManager *wm, int pointer_x,
-                                      int pointer_y)
+static void position_launcher_on_monitor(WindowManager *wm,
+                                         size_t monitor_index)
 {
-    int old_x = wm->launcher_x;
-    int old_y = wm->launcher_y;
-    int old_width = wm->launcher_width;
-    int offset_x;
-    int offset_y;
-
-    if (wm->launcher_layout == CLIENT_LAYOUT_NORMAL)
-        return;
-    offset_x = pointer_x - old_x;
-    offset_y = pointer_y - old_y;
-    if (offset_x < 0)
-        offset_x = 0;
-    if (offset_x > old_width)
-        offset_x = old_width;
-    if (offset_y < 0)
-        offset_y = 0;
-    if (offset_y >= TITLE_Y + TITLE_HEIGHT)
-        offset_y = TITLE_Y + TITLE_HEIGHT - 1;
-    wm->launcher_layout = CLIENT_LAYOUT_NORMAL;
-    wm->launcher_layout_before_maximize = CLIENT_LAYOUT_NORMAL;
-    if (wm->launcher_restore_valid) {
-        wm->launcher_width = wm->launcher_restore_width;
-        wm->launcher_height = wm->launcher_restore_height;
-    }
-    wm->launcher_restore_valid = false;
-    wm->launcher_x = pointer_x -
-                     (int)((long long)offset_x * wm->launcher_width /
-                           (old_width > 0 ? old_width : 1));
-    wm->launcher_y = pointer_y - offset_y;
-    clamp_internal_geometry(wm, &wm->launcher_x, &wm->launcher_y,
-                            &wm->launcher_width, &wm->launcher_height);
-    XMoveResizeWindow(wm->display, wm->launcher, wm->launcher_x, wm->launcher_y,
-                      (unsigned)wm->launcher_width,
-                      (unsigned)wm->launcher_height);
-    draw_launcher(wm);
-}
-
-static void position_launcher(WindowManager *wm)
-{
-    int available_width = wm->screen_width - 24;
-    int available_height = wm->screen_height - 24;
+    const MonitorGeometry *monitor = monitor_at(wm, monitor_index);
+    int available_width = monitor->width - 24;
+    int available_height = monitor->height - 24;
 
     wm->launcher_layout = CLIENT_LAYOUT_NORMAL;
     wm->launcher_layout_before_maximize = CLIENT_LAYOUT_NORMAL;
     wm->launcher_restore_valid = false;
+    wm->launcher_layout_monitor.valid = false;
     wm->launcher_width = available_width >= 260
                              ? (available_width < LAUNCHER_DEFAULT_WIDTH
                                     ? available_width
                                     : LAUNCHER_DEFAULT_WIDTH)
-                             : wm->screen_width;
+                             : monitor->width;
     wm->launcher_height = available_height >= 180
                               ? (available_height < LAUNCHER_DEFAULT_HEIGHT
                                      ? available_height
                                      : LAUNCHER_DEFAULT_HEIGHT)
-                              : wm->screen_height;
+                              : monitor->height;
     if (wm->launcher_width < 1)
         wm->launcher_width = 1;
     if (wm->launcher_height < 1)
         wm->launcher_height = 1;
     clamp_launcher_scroll(wm);
-    wm->launcher_x = (wm->screen_width - wm->launcher_width) / 2;
-    wm->launcher_y = (wm->screen_height - wm->launcher_height) / 2;
+    wm->launcher_x = monitor->x +
+                     (monitor->width - wm->launcher_width) / 2;
+    wm->launcher_y = monitor->y +
+                     (monitor->height - wm->launcher_height) / 2;
+    wm->launcher_positioned = true;
     XMoveResizeWindow(wm->display, wm->launcher, wm->launcher_x, wm->launcher_y,
                       (unsigned)wm->launcher_width,
                       (unsigned)wm->launcher_height);
@@ -2636,11 +4282,8 @@ static void dismiss_launcher(WindowManager *wm)
     wm->launcher_visible = false;
     if (wm->internal_focus == INTERNAL_FOCUS_APPLICATIONS)
         wm->internal_focus = INTERNAL_FOCUS_NONE;
-    if (wm->drag.kind == DRAG_MOVE_LAUNCHER) {
-        wm->drag.kind = DRAG_NONE;
-        wm->drag.client = NULL;
-        XUngrabPointer(wm->display, CurrentTime);
-    }
+    if (wm->drag.kind == DRAG_MOVE_LAUNCHER)
+        cancel_drag(wm, CurrentTime);
     XUnmapWindow(wm->display, wm->launcher);
     update_focus_overlays(wm);
 }
@@ -2652,6 +4295,10 @@ static void focus_after_internal_close(WindowManager *wm, bool was_focused,
 
     if (!was_focused)
         return;
+    if (wm->run_dialog.visible) {
+        activate_internal_window(wm, INTERNAL_FOCUS_RUN, time);
+        return;
+    }
     if (wm->launcher_visible) {
         activate_internal_window(wm, INTERNAL_FOCUS_APPLICATIONS, time);
         return;
@@ -2683,23 +4330,38 @@ static void hide_launcher(WindowManager *wm)
     focus_after_internal_close(wm, was_focused, CurrentTime);
 }
 
-static void show_launcher(WindowManager *wm)
+static void show_launcher_on_monitor(WindowManager *wm, size_t monitor_index)
 {
     if (wm->launcher_visible) {
         activate_internal_window(wm, INTERNAL_FOCUS_APPLICATIONS, CurrentTime);
         return;
     }
+    free_application_icons(wm);
     apps_free(&wm->applications);
     if (apps_load(&wm->applications) < 0)
         fprintf(stderr, "win31x: could not load application entries: %s\n",
                 strerror(errno));
+    if (wm->applications.len > 0U) {
+        wm->application_icons =
+            calloc(wm->applications.len, sizeof(*wm->application_icons));
+        if (wm->application_icons != NULL)
+            wm->application_icon_count = wm->applications.len;
+    }
     wm->launcher_scroll_row = 0;
     wm->launcher_selected = wm->applications.len == 0 ? -1 : 0;
     wm->launcher_last_click = -1;
     wm->launcher_visible = true;
-    position_launcher(wm);
+    if (!wm->launcher_positioned) {
+        position_launcher_on_monitor(wm, monitor_index);
+        remember_launcher_placement(wm);
+    }
     XMapWindow(wm->display, wm->launcher);
     activate_internal_window(wm, INTERNAL_FOCUS_APPLICATIONS, CurrentTime);
+}
+
+static void show_launcher(WindowManager *wm)
+{
+    show_launcher_on_monitor(wm, active_monitor_index(wm));
 }
 
 static void launch_selected_application(WindowManager *wm)
@@ -2721,12 +4383,14 @@ static void initialize_launcher(WindowManager *wm)
     wm->launcher_height = LAUNCHER_DEFAULT_HEIGHT;
     wm->launcher_selected = -1;
     wm->launcher_last_click = -1;
+    restore_launcher_placement(wm);
     attributes.override_redirect = True;
     attributes.background_pixel = wm->theme.silver;
     attributes.event_mask = ExposureMask | ButtonPressMask | ButtonReleaseMask |
                             PointerMotionMask | KeyPressMask;
     attributes.cursor = wm->arrow_cursor;
-    wm->launcher = XCreateWindow(wm->display, wm->root, 0, 0,
+    wm->launcher = XCreateWindow(wm->display, wm->root, wm->launcher_x,
+                                 wm->launcher_y,
                                  (unsigned)wm->launcher_width,
                                  (unsigned)wm->launcher_height, 0,
                                  CopyFromParent, InputOutput, CopyFromParent,
@@ -2734,7 +4398,6 @@ static void initialize_launcher(WindowManager *wm)
                                  CWCursor, &attributes);
     set_internal_role(wm, wm->launcher, "applications-window");
     set_utf8_property(wm, wm->launcher, wm->atoms.net_wm_name, "Applications");
-    position_launcher(wm);
 }
 
 static int control_content_x(void)
@@ -3270,9 +4933,19 @@ static void apply_control_panel_layout(WindowManager *wm, ClientLayout layout)
             panel->height = panel->restore_height;
         }
         panel->restore_valid = false;
+        panel->layout_monitor.valid = false;
         clamp_internal_geometry(wm, &panel->x, &panel->y, &panel->width,
                                 &panel->height);
     } else {
+        const MonitorGeometry *monitor;
+
+        if (!panel->layout_monitor.valid) {
+            set_monitor_anchor(
+                &panel->layout_monitor,
+                monitor_at(wm, monitor_index_for_rectangle(
+                                   wm, panel->x, panel->y, panel->width,
+                                   panel->height)));
+        }
         if (panel->layout == CLIENT_LAYOUT_NORMAL) {
             panel->restore_x = panel->x;
             panel->restore_y = panel->y;
@@ -3281,7 +4954,10 @@ static void apply_control_panel_layout(WindowManager *wm, ClientLayout layout)
             panel->restore_valid = true;
         }
         panel->layout = layout;
-        screen_layout_geometry(wm, layout, &panel->x, &panel->y,
+        monitor = monitor_at(
+            wm, monitor_index_for_anchor(wm, &panel->layout_monitor));
+        set_monitor_anchor(&panel->layout_monitor, monitor);
+        screen_layout_geometry(monitor, layout, &panel->x, &panel->y,
                                &panel->width, &panel->height);
     }
     if (!control_wifi_layout_available(panel))
@@ -3297,75 +4973,40 @@ static void toggle_control_panel_maximize(WindowManager *wm)
         wm, wm->control_panel.layout == CLIENT_LAYOUT_MAXIMIZED
                 ? CLIENT_LAYOUT_NORMAL
                 : CLIENT_LAYOUT_MAXIMIZED);
+    remember_control_panel_placement(wm);
 }
 
-static void restore_control_panel_for_move(WindowManager *wm, int pointer_x,
-                                           int pointer_y)
+static void position_control_panel_on_monitor(WindowManager *wm,
+                                              size_t monitor_index)
 {
     ControlPanel *panel = &wm->control_panel;
-    int old_x = panel->x;
-    int old_y = panel->y;
-    int old_width = panel->width;
-    int offset_x;
-    int offset_y;
-
-    if (panel->layout == CLIENT_LAYOUT_NORMAL)
-        return;
-    offset_x = pointer_x - old_x;
-    offset_y = pointer_y - old_y;
-    if (offset_x < 0)
-        offset_x = 0;
-    if (offset_x > old_width)
-        offset_x = old_width;
-    if (offset_y < 0)
-        offset_y = 0;
-    if (offset_y >= TITLE_Y + TITLE_HEIGHT)
-        offset_y = TITLE_Y + TITLE_HEIGHT - 1;
-    panel->layout = CLIENT_LAYOUT_NORMAL;
-    panel->layout_before_maximize = CLIENT_LAYOUT_NORMAL;
-    if (panel->restore_valid) {
-        panel->width = panel->restore_width;
-        panel->height = panel->restore_height;
-    }
-    panel->restore_valid = false;
-    panel->x = pointer_x -
-               (int)((long long)offset_x * panel->width /
-                     (old_width > 0 ? old_width : 1));
-    panel->y = pointer_y - offset_y;
-    clamp_internal_geometry(wm, &panel->x, &panel->y, &panel->width,
-                            &panel->height);
-    XMoveResizeWindow(wm->display, panel->window, panel->x, panel->y,
-                      (unsigned)panel->width, (unsigned)panel->height);
-    draw_control_panel(wm);
-}
-
-static void position_control_panel(WindowManager *wm)
-{
-    ControlPanel *panel = &wm->control_panel;
-    int available_width = wm->screen_width - 24;
-    int available_height = wm->screen_height - 24;
+    const MonitorGeometry *monitor = monitor_at(wm, monitor_index);
+    int available_width = monitor->width - 24;
+    int available_height = monitor->height - 24;
 
     panel->layout = CLIENT_LAYOUT_NORMAL;
     panel->layout_before_maximize = CLIENT_LAYOUT_NORMAL;
     panel->restore_valid = false;
+    panel->layout_monitor.valid = false;
     panel->width = available_width >= 320
                        ? (available_width < CONTROL_PANEL_DEFAULT_WIDTH
                               ? available_width
                               : CONTROL_PANEL_DEFAULT_WIDTH)
-                       : wm->screen_width;
+                       : monitor->width;
     panel->height = available_height >= 300
                         ? (available_height < CONTROL_PANEL_DEFAULT_HEIGHT
                                ? available_height
                                : CONTROL_PANEL_DEFAULT_HEIGHT)
-                        : wm->screen_height;
+                        : monitor->height;
     if (panel->width < 1)
         panel->width = 1;
     if (panel->height < 1)
         panel->height = 1;
     if (!control_wifi_layout_available(panel))
         clear_control_password(panel);
-    panel->x = (wm->screen_width - panel->width) / 2;
-    panel->y = (wm->screen_height - panel->height) / 2;
+    panel->x = monitor->x + (monitor->width - panel->width) / 2;
+    panel->y = monitor->y + (monitor->height - panel->height) / 2;
+    wm->control_panel_positioned = true;
     XMoveResizeWindow(wm->display, panel->window, panel->x, panel->y,
                       (unsigned)panel->width, (unsigned)panel->height);
 }
@@ -3380,11 +5021,8 @@ static void dismiss_control_panel(WindowManager *wm)
     clear_control_password(panel);
     if (wm->internal_focus == INTERNAL_FOCUS_CONTROL_PANEL)
         wm->internal_focus = INTERNAL_FOCUS_NONE;
-    if (wm->drag.kind == DRAG_MOVE_CONTROL_PANEL) {
-        wm->drag.kind = DRAG_NONE;
-        wm->drag.client = NULL;
-        XUngrabPointer(wm->display, CurrentTime);
-    }
+    if (wm->drag.kind == DRAG_MOVE_CONTROL_PANEL)
+        cancel_drag(wm, CurrentTime);
     XUnmapWindow(wm->display, panel->window);
     update_focus_overlays(wm);
 }
@@ -3400,7 +5038,8 @@ static void hide_control_panel(WindowManager *wm)
     focus_after_internal_close(wm, was_focused, CurrentTime);
 }
 
-static void show_control_panel(WindowManager *wm)
+static void show_control_panel_on_monitor(WindowManager *wm,
+                                          size_t monitor_index)
 {
     ControlPanel *panel = &wm->control_panel;
 
@@ -3410,7 +5049,10 @@ static void show_control_panel(WindowManager *wm)
     }
     clear_control_password(panel);
     panel->visible = true;
-    position_control_panel(wm);
+    if (!wm->control_panel_positioned) {
+        position_control_panel_on_monitor(wm, monitor_index);
+        remember_control_panel_placement(wm);
+    }
     XMapWindow(wm->display, panel->window);
     activate_internal_window(wm, INTERNAL_FOCUS_CONTROL_PANEL, CurrentTime);
     if (panel->section == CONTROL_SECTION_WIFI &&
@@ -3426,21 +5068,1234 @@ static void initialize_control_panel(WindowManager *wm)
 
     panel->width = CONTROL_PANEL_DEFAULT_WIDTH;
     panel->height = CONTROL_PANEL_DEFAULT_HEIGHT;
-    panel->section = CONTROL_SECTION_WIFI;
+    panel->section = (ControlSection)wm->settings.control_panel_section;
     panel->wifi_selected = -1;
+    restore_control_panel_placement(wm);
     attributes.override_redirect = True;
     attributes.background_pixel = wm->theme.silver;
     attributes.event_mask = ExposureMask | ButtonPressMask | ButtonReleaseMask |
                             PointerMotionMask | KeyPressMask;
     attributes.cursor = wm->arrow_cursor;
     panel->window = XCreateWindow(
-        wm->display, wm->root, 0, 0, (unsigned)panel->width,
+        wm->display, wm->root, panel->x, panel->y, (unsigned)panel->width,
         (unsigned)panel->height, 0, CopyFromParent, InputOutput, CopyFromParent,
         CWOverrideRedirect | CWBackPixel | CWEventMask | CWCursor, &attributes);
     set_internal_role(wm, panel->window, "control-panel-window");
     set_utf8_property(wm, panel->window, wm->atoms.net_wm_name,
                       "Control Panel");
-    position_control_panel(wm);
+}
+
+static int run_button_y(const RunDialog *dialog)
+{
+    return dialog->height - 39;
+}
+
+static int run_cancel_button_x(const RunDialog *dialog)
+{
+    return dialog->width - 91;
+}
+
+static int run_open_button_x(const RunDialog *dialog)
+{
+    return run_cancel_button_x(dialog) - 86;
+}
+
+static void draw_run_dialog(WindowManager *wm)
+{
+    RunDialog *dialog = &wm->run_dialog;
+    bool compact = dialog->width < 260 || dialog->height < 140;
+    int edit_x = compact ? 8 : 78;
+    int edit_y = compact ? 35 : 62;
+    int edit_width = dialog->width - edit_x - (compact ? 8 : 16);
+    int edit_height = dialog->height - edit_y - 4;
+    const char *visible;
+    int text_width;
+
+    if (dialog->window == None)
+        return;
+    XSetForeground(wm->display, wm->gc, wm->theme.silver);
+    XFillRectangle(wm->display, dialog->window, wm->gc, 0, 0,
+                   (unsigned)dialog->width, (unsigned)dialog->height);
+    draw_bevel(wm, dialog->window, 0, 0, dialog->width, dialog->height, false);
+    if (dialog->width > 6) {
+        XSetForeground(wm->display, wm->gc,
+                       wm->internal_focus == INTERNAL_FOCUS_RUN
+                           ? wm->theme.active_title
+                           : wm->theme.dark_gray);
+        XFillRectangle(wm->display, dialog->window, wm->gc, 3, 3,
+                       (unsigned)(dialog->width - 6), TITLE_HEIGHT);
+    }
+    if (dialog->width >= 48) {
+        draw_supplied_icon(wm, dialog->window, ICON_CATEGORY_EXECUTABLE,
+                           ICON_SIZE_SMALL, 7, 5);
+        draw_text(wm, dialog->window, 28, 17, wm->theme.white, "Run");
+    }
+    if (dialog->width >= TITLE_BUTTON + 12)
+        draw_title_button(wm, dialog->window,
+                          internal_close_button_x(dialog->width), 4,
+                          TITLE_GLYPH_CLOSE);
+
+    if (!compact) {
+        draw_supplied_icon_centered(wm, dialog->window,
+                                    ICON_CATEGORY_EXECUTABLE,
+                                    ICON_SIZE_LARGE, 13, 43, 52, 52);
+        draw_text(wm, dialog->window, edit_x, 49, wm->theme.black,
+                  "Type the name of a program to open:");
+    }
+    if (edit_width < 1)
+        edit_width = 1;
+    if (edit_height > 25)
+        edit_height = 25;
+    if (edit_height < 3)
+        return;
+    XSetForeground(wm->display, wm->gc, wm->theme.white);
+    XFillRectangle(wm->display, dialog->window, wm->gc, edit_x, edit_y,
+                   (unsigned)edit_width, (unsigned)edit_height);
+    draw_bevel(wm, dialog->window, edit_x - 1, edit_y - 1,
+               edit_width + 2, edit_height + 2, true);
+    visible = dialog->command;
+    while (*visible != '\0' &&
+           XTextWidth(wm->font, visible, (int)strlen(visible)) >
+               edit_width - 10)
+        ++visible;
+    draw_text(wm, dialog->window, edit_x + 5,
+              edit_y + (edit_height > 18 ? 17 : edit_height - 2),
+              wm->theme.black, visible);
+    if (wm->internal_focus == INTERNAL_FOCUS_RUN && edit_height > 6) {
+        text_width = XTextWidth(wm->font, visible, (int)strlen(visible));
+        XSetForeground(wm->display, wm->gc, wm->theme.black);
+        XDrawLine(wm->display, dialog->window, wm->gc,
+                  edit_x + 5 + text_width, edit_y + 3,
+                  edit_x + 5 + text_width, edit_y + edit_height - 3);
+    }
+    if (!compact && dialog->status[0] != '\0')
+        draw_text(wm, dialog->window, edit_x, 108, wm->theme.dark_gray,
+                  dialog->status);
+    if (!compact) {
+        draw_button(wm, dialog->window, run_open_button_x(dialog),
+                    run_button_y(dialog), 78, 26, "Run", false,
+                    dialog->command_length > 0U);
+        draw_button(wm, dialog->window, run_cancel_button_x(dialog),
+                    run_button_y(dialog), 78, 26, "Cancel", false, true);
+    }
+}
+
+static void position_run_dialog(WindowManager *wm)
+{
+    RunDialog *dialog = &wm->run_dialog;
+    size_t monitor_index = dialog->monitor.valid
+                               ? monitor_index_for_anchor(wm,
+                                                          &dialog->monitor)
+                               : active_monitor_index(wm);
+    const MonitorGeometry *monitor = monitor_at(wm, monitor_index);
+
+    set_monitor_anchor(&dialog->monitor, monitor);
+    dialog->width = monitor->width - 24 < RUN_DIALOG_DEFAULT_WIDTH
+                        ? monitor->width - 24
+                        : RUN_DIALOG_DEFAULT_WIDTH;
+    dialog->height = monitor->height - 24 < RUN_DIALOG_DEFAULT_HEIGHT
+                         ? monitor->height - 24
+                         : RUN_DIALOG_DEFAULT_HEIGHT;
+    if (dialog->width < 260)
+        dialog->width = monitor->width > 0 ? monitor->width : 1;
+    if (dialog->height < 130)
+        dialog->height = monitor->height > 0 ? monitor->height : 1;
+    dialog->x = monitor->x + (monitor->width - dialog->width) / 2;
+    dialog->y = monitor->y + (monitor->height - dialog->height) / 2;
+    clamp_geometry_to_monitor(monitor, &dialog->x, &dialog->y,
+                              &dialog->width, &dialog->height);
+    dialog->positioned = true;
+    XMoveResizeWindow(wm->display, dialog->window, dialog->x, dialog->y,
+                      (unsigned)dialog->width, (unsigned)dialog->height);
+}
+
+static void restore_run_dialog_placement(WindowManager *wm)
+{
+    RunDialog *dialog = &wm->run_dialog;
+    const Win31xDesktopPlacement *saved = &wm->desktop_state.run_dialog;
+    size_t monitor_index;
+
+    if (!saved->valid)
+        return;
+    monitor_index = geometry_from_placement(
+        wm, saved, &dialog->x, &dialog->y, &dialog->width, &dialog->height,
+        true);
+    set_monitor_anchor(&dialog->monitor, monitor_at(wm, monitor_index));
+    dialog->positioned = true;
+}
+
+static void remember_run_dialog_placement(WindowManager *wm)
+{
+    RunDialog *dialog = &wm->run_dialog;
+    size_t monitor_index;
+
+    if (!dialog->positioned)
+        return;
+    monitor_index = monitor_index_for_rectangle(
+        wm, dialog->x, dialog->y, dialog->width, dialog->height);
+    placement_from_geometry(wm, &wm->desktop_state.run_dialog,
+                            monitor_index, dialog->x, dialog->y,
+                            dialog->width, dialog->height,
+                            CLIENT_LAYOUT_NORMAL);
+    if (wm->desktop_state.run_dialog.valid)
+        mark_desktop_state_dirty(wm);
+}
+
+static void dismiss_run_dialog(WindowManager *wm)
+{
+    RunDialog *dialog = &wm->run_dialog;
+
+    if (!dialog->visible)
+        return;
+    dialog->visible = false;
+    if (wm->internal_focus == INTERNAL_FOCUS_RUN)
+        wm->internal_focus = INTERNAL_FOCUS_NONE;
+    if (wm->drag.kind == DRAG_MOVE_RUN)
+        cancel_drag(wm, CurrentTime);
+    XUnmapWindow(wm->display, dialog->window);
+    update_focus_overlays(wm);
+}
+
+static void remember_run_return_focus(WindowManager *wm)
+{
+    RunDialog *dialog = &wm->run_dialog;
+
+    if (wm->internal_focus == INTERNAL_FOCUS_RUN)
+        return;
+    dialog->return_internal_focus = wm->internal_focus;
+    dialog->return_client =
+        wm->internal_focus == INTERNAL_FOCUS_NONE && wm->active != NULL
+            ? wm->active->window
+            : None;
+}
+
+static void restore_run_return_focus(WindowManager *wm, bool was_focused,
+                                     Time time)
+{
+    RunDialog *dialog = &wm->run_dialog;
+    InternalFocus internal = dialog->return_internal_focus;
+    Window client_window = dialog->return_client;
+    Client *client = client_window != None
+                         ? client_for_client_window(wm, client_window)
+                         : NULL;
+
+    dialog->return_internal_focus = INTERNAL_FOCUS_NONE;
+    dialog->return_client = None;
+    if (!was_focused)
+        return;
+    if (internal == INTERNAL_FOCUS_APPLICATIONS && wm->launcher_visible) {
+        activate_internal_window(wm, INTERNAL_FOCUS_APPLICATIONS, time);
+        return;
+    }
+    if (internal == INTERNAL_FOCUS_CONTROL_PANEL &&
+        wm->control_panel.visible) {
+        activate_internal_window(wm, INTERNAL_FOCUS_CONTROL_PANEL, time);
+        return;
+    }
+    if (client != NULL && !client->minimized) {
+        focus_client(wm, client, time);
+        return;
+    }
+    focus_after_internal_close(wm, true, time);
+}
+
+static void hide_run_dialog(WindowManager *wm)
+{
+    bool was_focused;
+
+    if (!wm->run_dialog.visible)
+        return;
+    was_focused = wm->internal_focus == INTERNAL_FOCUS_RUN;
+    dismiss_run_dialog(wm);
+    restore_run_return_focus(wm, was_focused, CurrentTime);
+}
+
+static void show_run_dialog(WindowManager *wm)
+{
+    RunDialog *dialog = &wm->run_dialog;
+
+    remember_run_return_focus(wm);
+    if (dialog->visible) {
+        activate_internal_window(wm, INTERNAL_FOCUS_RUN, CurrentTime);
+        return;
+    }
+    dialog->status[0] = '\0';
+    dialog->visible = true;
+    if (!dialog->positioned) {
+        set_monitor_anchor(&dialog->monitor,
+                           monitor_at(wm, active_monitor_index(wm)));
+        position_run_dialog(wm);
+        remember_run_dialog_placement(wm);
+    } else {
+        XMoveResizeWindow(wm->display, dialog->window, dialog->x, dialog->y,
+                          (unsigned)dialog->width,
+                          (unsigned)dialog->height);
+    }
+    XMapWindow(wm->display, dialog->window);
+    activate_internal_window(wm, INTERNAL_FOCUS_RUN, CurrentTime);
+    draw_run_dialog(wm);
+}
+
+static void execute_run_command(WindowManager *wm)
+{
+    RunDialog *dialog = &wm->run_dialog;
+
+    if (dialog->command_length == 0U) {
+        snprintf(dialog->status, sizeof(dialog->status),
+                 "Enter a program name or path.");
+        draw_run_dialog(wm);
+        return;
+    }
+    if (app_launch_command(dialog->command) < 0) {
+        snprintf(dialog->status, sizeof(dialog->status), "Could not run: %s",
+                 strerror(errno));
+        draw_run_dialog(wm);
+        return;
+    }
+    memset(dialog->command, 0, sizeof(dialog->command));
+    dialog->command_length = 0U;
+    dialog->status[0] = '\0';
+    hide_run_dialog(wm);
+}
+
+static void initialize_run_dialog(WindowManager *wm)
+{
+    RunDialog *dialog = &wm->run_dialog;
+    XSetWindowAttributes attributes;
+
+    dialog->width = RUN_DIALOG_DEFAULT_WIDTH;
+    dialog->height = RUN_DIALOG_DEFAULT_HEIGHT;
+    restore_run_dialog_placement(wm);
+    attributes.override_redirect = True;
+    attributes.background_pixel = wm->theme.silver;
+    attributes.event_mask = ExposureMask | ButtonPressMask | ButtonReleaseMask |
+                            PointerMotionMask | KeyPressMask;
+    attributes.cursor = wm->arrow_cursor;
+    dialog->window = XCreateWindow(
+        wm->display, wm->root, dialog->x, dialog->y, (unsigned)dialog->width,
+        (unsigned)dialog->height, 0, CopyFromParent, InputOutput,
+        CopyFromParent, CWOverrideRedirect | CWBackPixel | CWEventMask |
+                            CWCursor,
+        &attributes);
+    set_internal_role(wm, dialog->window, "run-window");
+    set_utf8_property(wm, dialog->window, wm->atoms.net_wm_name, "Run");
+}
+
+static int desktop_menu_item_y(DesktopMenuItem item)
+{
+    switch (item) {
+    case DESKTOP_MENU_LOCK:
+        return 4;
+    case DESKTOP_MENU_LOG_OUT:
+        return 37;
+    case DESKTOP_MENU_RESTART:
+        return 63;
+    case DESKTOP_MENU_SHUT_DOWN:
+        return 89;
+    default:
+        return -1;
+    }
+}
+
+static const char *desktop_menu_item_label(DesktopMenuItem item)
+{
+    switch (item) {
+    case DESKTOP_MENU_LOCK:
+        return "Lock";
+    case DESKTOP_MENU_LOG_OUT:
+        return "Log Out";
+    case DESKTOP_MENU_RESTART:
+        return "Restart";
+    case DESKTOP_MENU_SHUT_DOWN:
+        return "Shut Down";
+    default:
+        return "";
+    }
+}
+
+static bool desktop_menu_item_enabled(const WindowManager *wm,
+                                      DesktopMenuItem item)
+{
+    if (item == DESKTOP_MENU_LOCK)
+        return wm->auto_lock.locker_available &&
+               wm->auto_lock.direct_pid <= 0;
+    if (item == DESKTOP_MENU_LOG_OUT)
+        return true;
+    if (item == DESKTOP_MENU_RESTART || item == DESKTOP_MENU_SHUT_DOWN)
+        return wm->session_actions.available &&
+               wm->session_actions.child_pid <= 0;
+    return false;
+}
+
+static DesktopMenuItem desktop_menu_item_at(const WindowManager *wm,
+                                            int root_x, int root_y)
+{
+    const DesktopMenu *menu = &wm->desktop_menu;
+    int local_x = root_x - menu->x;
+    int local_y = root_y - menu->y;
+    int item;
+
+    if (!menu->visible || local_x < 4 || local_x >= menu->width - 4)
+        return DESKTOP_MENU_NONE;
+    for (item = 0; item < DESKTOP_MENU_ITEM_COUNT; ++item) {
+        int y = desktop_menu_item_y((DesktopMenuItem)item);
+
+        if (local_y >= y && local_y < y + DESKTOP_MENU_ITEM_HEIGHT)
+            return (DesktopMenuItem)item;
+    }
+    return DESKTOP_MENU_NONE;
+}
+
+static void draw_desktop_menu(WindowManager *wm)
+{
+    DesktopMenu *menu = &wm->desktop_menu;
+    int item;
+
+    if (menu->window == None)
+        return;
+    XSetForeground(wm->display, wm->gc, wm->theme.silver);
+    XFillRectangle(wm->display, menu->window, wm->gc, 0, 0,
+                   (unsigned)menu->width, (unsigned)menu->height);
+    draw_bevel(wm, menu->window, 0, 0, menu->width, menu->height, false);
+    if (menu->width > 15 && menu->height > 34) {
+        XSetForeground(wm->display, wm->gc, wm->theme.dark_gray);
+        XDrawLine(wm->display, menu->window, wm->gc, 7, 33,
+                  menu->width - 8, 33);
+        XSetForeground(wm->display, wm->gc, wm->theme.white);
+        XDrawLine(wm->display, menu->window, wm->gc, 7, 34,
+                  menu->width - 8, 34);
+    }
+    for (item = 0; item < DESKTOP_MENU_ITEM_COUNT; ++item) {
+        DesktopMenuItem current = (DesktopMenuItem)item;
+        bool enabled = desktop_menu_item_enabled(wm, current);
+        bool selected = enabled && menu->selected == current;
+        int y = desktop_menu_item_y(current);
+        int row_height = DESKTOP_MENU_ITEM_HEIGHT;
+        unsigned long text_color;
+
+        if (menu->width <= 8 || y >= menu->height)
+            continue;
+        if (y + row_height > menu->height)
+            row_height = menu->height - y;
+        XSetForeground(wm->display, wm->gc,
+                       selected ? wm->theme.active_title : wm->theme.silver);
+        XFillRectangle(wm->display, menu->window, wm->gc, 4, y,
+                       (unsigned)(menu->width - 8),
+                       (unsigned)row_height);
+        if (selected)
+            text_color = wm->theme.white;
+        else if (enabled)
+            text_color = wm->theme.black;
+        else
+            text_color = wm->theme.dark_gray;
+        if (menu->width > 22 && y + 18 < menu->height)
+            draw_text(wm, menu->window, 15, y + 18, text_color,
+                      desktop_menu_item_label(current));
+    }
+}
+
+static void dismiss_desktop_menu(WindowManager *wm)
+{
+    DesktopMenu *menu = &wm->desktop_menu;
+
+    if (menu->keyboard_grabbed) {
+        XUngrabKeyboard(wm->display, CurrentTime);
+        menu->keyboard_grabbed = false;
+    }
+    if (menu->pointer_grabbed) {
+        XUngrabPointer(wm->display, CurrentTime);
+        menu->pointer_grabbed = false;
+    }
+    if (menu->visible) {
+        menu->visible = false;
+        XUnmapWindow(wm->display, menu->window);
+    }
+    menu->selected = DESKTOP_MENU_NONE;
+    menu->armed = DESKTOP_MENU_NONE;
+    menu->pressed_button = 0U;
+    menu->ignore_open_release = false;
+}
+
+static void show_desktop_menu(WindowManager *wm, int root_x, int root_y,
+                              Time time)
+{
+    DesktopMenu *menu = &wm->desktop_menu;
+    size_t monitor_index = monitor_index_for_point(wm, root_x, root_y);
+    const MonitorGeometry *monitor = monitor_at(wm, monitor_index);
+    int pointer_result;
+
+    if (wm->session_confirmation.visible) {
+        refocus_session_confirmation(wm, time);
+        return;
+    }
+    set_active_monitor_from_point(wm, root_x, root_y);
+    set_monitor_anchor(&menu->monitor, monitor);
+    dismiss_desktop_menu(wm);
+    menu->width = monitor->width < DESKTOP_MENU_WIDTH
+                      ? monitor->width
+                      : DESKTOP_MENU_WIDTH;
+    menu->height = monitor->height < DESKTOP_MENU_HEIGHT
+                       ? monitor->height
+                       : DESKTOP_MENU_HEIGHT;
+    if (menu->width < 1)
+        menu->width = 1;
+    if (menu->height < 1)
+        menu->height = 1;
+    menu->x = root_x;
+    menu->y = root_y;
+    if (menu->x + menu->width > monitor->x + monitor->width)
+        menu->x = monitor->x + monitor->width - menu->width;
+    if (menu->y + menu->height > monitor->y + monitor->height)
+        menu->y = monitor->y + monitor->height - menu->height;
+    if (menu->x < monitor->x)
+        menu->x = monitor->x;
+    if (menu->y < monitor->y)
+        menu->y = monitor->y;
+    menu->selected = DESKTOP_MENU_NONE;
+    menu->armed = DESKTOP_MENU_NONE;
+    menu->pressed_button = 0U;
+    menu->ignore_open_release = true;
+    XMoveResizeWindow(wm->display, menu->window, menu->x, menu->y,
+                      (unsigned)menu->width, (unsigned)menu->height);
+    XMapRaised(wm->display, menu->window);
+    menu->visible = true;
+    draw_desktop_menu(wm);
+    pointer_result = XGrabPointer(
+        wm->display, menu->window, False,
+        ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
+        GrabModeAsync, GrabModeAsync, None, wm->arrow_cursor, CurrentTime);
+    if (pointer_result != GrabSuccess) {
+        dismiss_desktop_menu(wm);
+        return;
+    }
+    menu->pointer_grabbed = true;
+    if (XGrabKeyboard(wm->display, menu->window, False, GrabModeAsync,
+                      GrabModeAsync, CurrentTime) == GrabSuccess)
+        menu->keyboard_grabbed = true;
+}
+
+static const char *session_confirmation_title(DesktopMenuItem action)
+{
+    switch (action) {
+    case DESKTOP_MENU_LOG_OUT:
+        return "Confirm Log Out";
+    case DESKTOP_MENU_RESTART:
+        return "Confirm Restart";
+    case DESKTOP_MENU_SHUT_DOWN:
+        return "Confirm Shut Down";
+    default:
+        return "Confirm Session Action";
+    }
+}
+
+static const char *session_confirmation_prompt(DesktopMenuItem action)
+{
+    switch (action) {
+    case DESKTOP_MENU_LOG_OUT:
+        return "Log out of this session now?";
+    case DESKTOP_MENU_RESTART:
+        return "Restart the computer now?";
+    case DESKTOP_MENU_SHUT_DOWN:
+        return "Shut down the computer now?";
+    default:
+        return "Continue with this session action?";
+    }
+}
+
+static int session_confirmation_horizontal_margin(
+    const SessionConfirmation *dialog)
+{
+    int full_width = SESSION_CONFIRM_BUTTON_WIDTH * 2 +
+                     SESSION_CONFIRM_BUTTON_GAP +
+                     SESSION_CONFIRM_BUTTON_MARGIN * 2;
+
+    return dialog->width >= full_width ? SESSION_CONFIRM_BUTTON_MARGIN : 4;
+}
+
+static int session_confirmation_button_gap(const SessionConfirmation *dialog)
+{
+    return dialog->width >= 32 ? SESSION_CONFIRM_BUTTON_GAP : 2;
+}
+
+static int session_confirmation_button_width(
+    const SessionConfirmation *dialog)
+{
+    int margin = session_confirmation_horizontal_margin(dialog);
+    int available = dialog->width - margin * 2 -
+                    session_confirmation_button_gap(dialog);
+    int width = available / 2;
+
+    if (width > SESSION_CONFIRM_BUTTON_WIDTH)
+        width = SESSION_CONFIRM_BUTTON_WIDTH;
+    return width > 0 ? width : 0;
+}
+
+static int session_confirmation_vertical_margin(
+    const SessionConfirmation *dialog)
+{
+    int full_height = TITLE_HEIGHT + 8 + SESSION_CONFIRM_BUTTON_HEIGHT +
+                      SESSION_CONFIRM_BUTTON_MARGIN;
+
+    return dialog->height >= full_height ? SESSION_CONFIRM_BUTTON_MARGIN : 4;
+}
+
+static int session_confirmation_button_height(
+    const SessionConfirmation *dialog)
+{
+    int margin = session_confirmation_vertical_margin(dialog);
+    int height = dialog->height - margin - (TITLE_HEIGHT + 8);
+
+    if (height > SESSION_CONFIRM_BUTTON_HEIGHT)
+        height = SESSION_CONFIRM_BUTTON_HEIGHT;
+    return height > 0 ? height : 0;
+}
+
+static int session_confirmation_button_y(const SessionConfirmation *dialog)
+{
+    int height = session_confirmation_button_height(dialog);
+    int margin = session_confirmation_vertical_margin(dialog);
+
+    return dialog->height - height - margin;
+}
+
+static int session_confirmation_no_button_x(const SessionConfirmation *dialog)
+{
+    return dialog->width -
+           session_confirmation_horizontal_margin(dialog) -
+           session_confirmation_button_width(dialog);
+}
+
+static int session_confirmation_yes_button_x(
+    const SessionConfirmation *dialog)
+{
+    return session_confirmation_no_button_x(dialog) -
+           session_confirmation_button_gap(dialog) -
+           session_confirmation_button_width(dialog);
+}
+
+static bool session_confirmation_buttons_visible(
+    const SessionConfirmation *dialog)
+{
+    int button_y = session_confirmation_button_y(dialog);
+    int yes_x = session_confirmation_yes_button_x(dialog);
+    int no_x = session_confirmation_no_button_x(dialog);
+    int button_width = session_confirmation_button_width(dialog);
+    int button_height = session_confirmation_button_height(dialog);
+
+    return button_width >= 8 && button_height >= 8 && yes_x >= 0 &&
+           no_x > yes_x && button_y >= TITLE_HEIGHT + 8;
+}
+
+static bool session_confirmation_close_visible(
+    const SessionConfirmation *dialog)
+{
+    return dialog->width >= TITLE_BUTTON + 12 &&
+           dialog->height >= 4 + TITLE_BUTTON;
+}
+
+static bool session_confirmation_close_at(const SessionConfirmation *dialog,
+                                          int root_x, int root_y)
+{
+    int x = root_x - dialog->x;
+    int y = root_y - dialog->y;
+
+    return dialog->visible && session_confirmation_close_visible(dialog) &&
+           point_in_rectangle(x, y,
+                              internal_close_button_x(dialog->width), 4,
+                              TITLE_BUTTON, TITLE_BUTTON);
+}
+
+static SessionConfirmButton session_confirmation_button_at(
+    const SessionConfirmation *dialog, int root_x, int root_y)
+{
+    int x = root_x - dialog->x;
+    int y = root_y - dialog->y;
+    int button_y = session_confirmation_button_y(dialog);
+    int button_width = session_confirmation_button_width(dialog);
+    int button_height = session_confirmation_button_height(dialog);
+
+    if (!dialog->visible || !session_confirmation_buttons_visible(dialog))
+        return SESSION_CONFIRM_NONE;
+    if (point_in_rectangle(x, y,
+                           session_confirmation_yes_button_x(dialog),
+                           button_y, button_width, button_height))
+        return SESSION_CONFIRM_YES;
+    if (point_in_rectangle(x, y,
+                           session_confirmation_no_button_x(dialog),
+                           button_y, button_width, button_height))
+        return SESSION_CONFIRM_NO;
+    return SESSION_CONFIRM_NONE;
+}
+
+static void position_session_confirmation(WindowManager *wm)
+{
+    SessionConfirmation *dialog = &wm->session_confirmation;
+    size_t monitor_index = dialog->monitor.valid
+                               ? monitor_index_for_anchor(wm,
+                                                          &dialog->monitor)
+                               : active_monitor_index(wm);
+    const MonitorGeometry *monitor = monitor_at(wm, monitor_index);
+    int available_width = monitor->width - 24;
+    int available_height = monitor->height - 24;
+
+    set_monitor_anchor(&dialog->monitor, monitor);
+    dialog->width = available_width < SESSION_CONFIRM_DEFAULT_WIDTH
+                        ? available_width
+                        : SESSION_CONFIRM_DEFAULT_WIDTH;
+    dialog->height = available_height < SESSION_CONFIRM_DEFAULT_HEIGHT
+                         ? available_height
+                         : SESSION_CONFIRM_DEFAULT_HEIGHT;
+    if (dialog->width < 230)
+        dialog->width = monitor->width > 0 ? monitor->width : 1;
+    if (dialog->height < 120)
+        dialog->height = monitor->height > 0 ? monitor->height : 1;
+    dialog->x = monitor->x + (monitor->width - dialog->width) / 2;
+    dialog->y = monitor->y + (monitor->height - dialog->height) / 2;
+    clamp_geometry_to_monitor(monitor, &dialog->x, &dialog->y,
+                              &dialog->width, &dialog->height);
+    XMoveResizeWindow(wm->display, dialog->shield, 0, 0,
+                      (unsigned)(wm->screen_width > 0 ? wm->screen_width : 1),
+                      (unsigned)(wm->screen_height > 0 ? wm->screen_height
+                                                       : 1));
+    XMoveResizeWindow(wm->display, dialog->window, dialog->x, dialog->y,
+                      (unsigned)dialog->width, (unsigned)dialog->height);
+}
+
+static void draw_session_confirmation(WindowManager *wm)
+{
+    SessionConfirmation *dialog = &wm->session_confirmation;
+    const char *title = session_confirmation_title(dialog->action);
+    const char *prompt = session_confirmation_prompt(dialog->action);
+    int button_y = session_confirmation_button_y(dialog);
+    int yes_x = session_confirmation_yes_button_x(dialog);
+    int no_x = session_confirmation_no_button_x(dialog);
+    int button_width = session_confirmation_button_width(dialog);
+    int button_height = session_confirmation_button_height(dialog);
+    char fitted[160];
+
+    if (dialog->window == None)
+        return;
+    XSetForeground(wm->display, wm->gc, wm->theme.silver);
+    XFillRectangle(wm->display, dialog->window, wm->gc, 0, 0,
+                   (unsigned)dialog->width, (unsigned)dialog->height);
+    draw_bevel(wm, dialog->window, 0, 0, dialog->width, dialog->height, false);
+    if (dialog->width > 6) {
+        XSetForeground(wm->display, wm->gc, wm->theme.active_title);
+        XFillRectangle(wm->display, dialog->window, wm->gc, 3, 3,
+                       (unsigned)(dialog->width - 6), TITLE_HEIGHT);
+    }
+    if (dialog->width >= 48) {
+        draw_supplied_icon(wm, dialog->window, ICON_CATEGORY_HELP,
+                           ICON_SIZE_SMALL, 7, 5);
+        fitted_text(wm, title, dialog->width - 54, fitted, sizeof(fitted));
+        draw_text(wm, dialog->window, 28, 17, wm->theme.white, fitted);
+    }
+    if (session_confirmation_close_visible(dialog))
+        draw_title_button(wm, dialog->window,
+                          internal_close_button_x(dialog->width), 4,
+                          TITLE_GLYPH_CLOSE);
+
+    if (dialog->width >= 280 && dialog->height >= 130) {
+        draw_supplied_icon_centered(wm, dialog->window, ICON_CATEGORY_HELP,
+                                    ICON_SIZE_LARGE, 17, 43, 42, 48);
+        fitted_text(wm, prompt, dialog->width - 82, fitted, sizeof(fitted));
+        draw_text(wm, dialog->window, 70, 64, wm->theme.black, fitted);
+        fitted_text(wm, "Unsaved work may be lost.", dialog->width - 82,
+                    fitted, sizeof(fitted));
+        draw_text(wm, dialog->window, 70, 88, wm->theme.dark_gray, fitted);
+    } else {
+        int prompt_baseline = button_y - 8;
+
+        if (prompt_baseline > 58)
+            prompt_baseline = 58;
+        if (prompt_baseline >= TITLE_HEIGHT + 8) {
+            fitted_text(wm, prompt, dialog->width - 20, fitted,
+                        sizeof(fitted));
+            draw_centered_text(wm, dialog->window, fitted,
+                               dialog->width / 2, prompt_baseline,
+                               wm->theme.black, dialog->width - 20);
+        }
+    }
+
+    if (session_confirmation_buttons_visible(dialog)) {
+        bool yes_pressed = dialog->pressed_button == Button1 &&
+                           dialog->armed == SESSION_CONFIRM_YES;
+        bool no_pressed = dialog->pressed_button == Button1 &&
+                          dialog->armed == SESSION_CONFIRM_NO;
+
+        draw_button(wm, dialog->window, yes_x, button_y,
+                    button_width, button_height, "Yes", yes_pressed, true);
+        draw_button(wm, dialog->window, no_x, button_y,
+                    button_width, button_height, "No", no_pressed, true);
+        XSetForeground(wm->display, wm->gc, wm->theme.black);
+        if (dialog->selected == SESSION_CONFIRM_YES)
+            XDrawRectangle(wm->display, dialog->window, wm->gc, yes_x + 3,
+                           button_y + 3, (unsigned)(button_width - 7),
+                           (unsigned)(button_height - 7));
+        else if (dialog->selected == SESSION_CONFIRM_NO)
+            XDrawRectangle(wm->display, dialog->window, wm->gc, no_x + 3,
+                           button_y + 3, (unsigned)(button_width - 7),
+                           (unsigned)(button_height - 7));
+    }
+}
+
+static void restore_session_confirmation_focus(WindowManager *wm,
+                                               InternalFocus saved_internal,
+                                               Window saved_client, Time time)
+{
+    Client *client;
+
+    if (saved_internal == INTERNAL_FOCUS_APPLICATIONS &&
+        wm->launcher_visible) {
+        activate_internal_window(wm, INTERNAL_FOCUS_APPLICATIONS, time);
+        return;
+    }
+    if (saved_internal == INTERNAL_FOCUS_CONTROL_PANEL &&
+        wm->control_panel.visible) {
+        activate_internal_window(wm, INTERNAL_FOCUS_CONTROL_PANEL, time);
+        return;
+    }
+    if (saved_internal == INTERNAL_FOCUS_RUN && wm->run_dialog.visible) {
+        activate_internal_window(wm, INTERNAL_FOCUS_RUN, time);
+        return;
+    }
+    client = client_for_client_window(wm, saved_client);
+    if (client != NULL && !client->minimized) {
+        focus_client(wm, client, time);
+        return;
+    }
+    client = next_visible_client(wm, NULL);
+    if (saved_client != None && client != NULL) {
+        focus_client(wm, client, time);
+        return;
+    }
+    wm->internal_focus = INTERNAL_FOCUS_NONE;
+    change_active_client(wm, NULL, false);
+    XSetInputFocus(wm->display, wm->root, RevertToPointerRoot, time);
+}
+
+static void dismiss_session_confirmation(WindowManager *wm, bool restore_focus,
+                                         Time time)
+{
+    SessionConfirmation *dialog = &wm->session_confirmation;
+    InternalFocus saved_internal = dialog->return_internal_focus;
+    Window saved_client = dialog->return_client;
+
+    if (dialog->visible) {
+        dialog->visible = false;
+        XUnmapWindow(wm->display, dialog->window);
+        XUnmapWindow(wm->display, dialog->shield);
+    }
+    dialog->pressed_button = 0U;
+    dialog->armed = SESSION_CONFIRM_NONE;
+    dialog->selected = SESSION_CONFIRM_NO;
+    dialog->action = DESKTOP_MENU_NONE;
+    dialog->return_internal_focus = INTERNAL_FOCUS_NONE;
+    dialog->return_client = None;
+    dialog->monitor.valid = false;
+    if (restore_focus)
+        restore_session_confirmation_focus(wm, saved_internal, saved_client,
+                                           time);
+}
+
+static void refocus_session_confirmation(WindowManager *wm, Time time)
+{
+    SessionConfirmation *dialog = &wm->session_confirmation;
+
+    if (!dialog->visible)
+        return;
+    XRaiseWindow(wm->display, dialog->shield);
+    XRaiseWindow(wm->display, dialog->window);
+    XSetInputFocus(wm->display, dialog->window, RevertToPointerRoot, time);
+}
+
+static bool session_confirmation_should_yield_to_window(
+    WindowManager *wm, Window window)
+{
+    SessionConfirmation *dialog = &wm->session_confirmation;
+    const MonitorGeometry *monitor;
+    XWindowAttributes attributes;
+    long long right;
+    long long bottom;
+
+    if (window == None || window == dialog->window ||
+        window == dialog->shield || window == wm->launcher ||
+        window == wm->control_panel.window ||
+        window == wm->run_dialog.window ||
+        window == wm->desktop_menu.window || window == wm->support_window ||
+        !XGetWindowAttributes(wm->display, window, &attributes) ||
+        !attributes.override_redirect || attributes.class != InputOutput ||
+        attributes.map_state == IsUnmapped)
+        return false;
+    monitor = monitor_at(
+        wm, monitor_index_for_anchor(wm, &dialog->monitor));
+    if (monitor == NULL)
+        return false;
+    right = (long long)attributes.x + attributes.width +
+            attributes.border_width * 2LL;
+    bottom = (long long)attributes.y + attributes.height +
+             attributes.border_width * 2LL;
+    return attributes.x <= monitor->x && attributes.y <= monitor->y &&
+           right >= monitor->x + monitor->width &&
+           bottom >= monitor->y + monitor->height;
+}
+
+static void confirm_session_action(WindowManager *wm, Time time)
+{
+    DesktopMenuItem action = wm->session_confirmation.action;
+    Win31xSessionAction system_action;
+
+    if (!wm->session_confirmation.visible)
+        return;
+    if (!desktop_menu_item_enabled(wm, action)) {
+        XBell(wm->display, 0);
+        dismiss_session_confirmation(wm, true, time);
+        return;
+    }
+    flush_desktop_state(wm, true);
+    dismiss_session_confirmation(wm, action != DESKTOP_MENU_LOG_OUT, time);
+    if (action == DESKTOP_MENU_LOG_OUT) {
+        keep_running = 0;
+        return;
+    }
+    system_action = action == DESKTOP_MENU_RESTART
+                        ? WIN31X_SESSION_ACTION_RESTART
+                        : WIN31X_SESSION_ACTION_SHUT_DOWN;
+    if (win31x_session_action_start(&wm->session_actions, system_action) < 0)
+        fprintf(stderr, "win31x: could not request the system action: %s\n",
+                strerror(errno));
+}
+
+static void show_session_confirmation(WindowManager *wm,
+                                      DesktopMenuItem action, Time time)
+{
+    SessionConfirmation *dialog = &wm->session_confirmation;
+
+    if (action != DESKTOP_MENU_LOG_OUT && action != DESKTOP_MENU_RESTART &&
+        action != DESKTOP_MENU_SHUT_DOWN)
+        return;
+    if (!desktop_menu_item_enabled(wm, action)) {
+        XBell(wm->display, 0);
+        return;
+    }
+    dismiss_session_confirmation(wm, false, time);
+    if (wm->desktop_menu.monitor.valid)
+        dialog->monitor = wm->desktop_menu.monitor;
+    else
+        set_monitor_anchor(&dialog->monitor,
+                           monitor_at(wm, active_monitor_index(wm)));
+    dialog->return_internal_focus = wm->internal_focus;
+    dialog->return_client = wm->internal_focus == INTERNAL_FOCUS_NONE &&
+                                    wm->active != NULL
+                                ? wm->active->window
+                                : None;
+    dialog->action = action;
+    dialog->selected = SESSION_CONFIRM_NO;
+    dialog->armed = SESSION_CONFIRM_NONE;
+    dialog->pressed_button = 0U;
+    position_session_confirmation(wm);
+    set_utf8_property(wm, dialog->window, wm->atoms.net_wm_name,
+                      session_confirmation_title(action));
+    XMapRaised(wm->display, dialog->shield);
+    XMapRaised(wm->display, dialog->window);
+    dialog->visible = true;
+    draw_session_confirmation(wm);
+    refocus_session_confirmation(wm, time);
+}
+
+static void handle_session_confirmation_button(WindowManager *wm,
+                                               XButtonEvent *event)
+{
+    SessionConfirmation *dialog = &wm->session_confirmation;
+    SessionConfirmButton button;
+
+    if (event->button != Button1) {
+        XBell(wm->display, 0);
+        return;
+    }
+    button = session_confirmation_close_at(dialog, event->x_root,
+                                           event->y_root)
+                 ? SESSION_CONFIRM_CLOSE
+                 : session_confirmation_button_at(dialog, event->x_root,
+                                                  event->y_root);
+    dialog->pressed_button = event->button;
+    dialog->armed = button;
+    if (button == SESSION_CONFIRM_YES || button == SESSION_CONFIRM_NO)
+        dialog->selected = button;
+    else if (button == SESSION_CONFIRM_NONE)
+        XBell(wm->display, 0);
+    draw_session_confirmation(wm);
+}
+
+static void handle_session_confirmation_button_release(WindowManager *wm,
+                                                       XButtonEvent *event)
+{
+    SessionConfirmation *dialog = &wm->session_confirmation;
+    SessionConfirmButton armed;
+    SessionConfirmButton released;
+
+    if (dialog->pressed_button == 0U ||
+        event->button != dialog->pressed_button)
+        return;
+    armed = dialog->armed;
+    released = session_confirmation_close_at(dialog, event->x_root,
+                                             event->y_root)
+                   ? SESSION_CONFIRM_CLOSE
+                   : session_confirmation_button_at(
+                         dialog, event->x_root, event->y_root);
+    dialog->pressed_button = 0U;
+    dialog->armed = SESSION_CONFIRM_NONE;
+    if (armed == released && armed == SESSION_CONFIRM_YES) {
+        confirm_session_action(wm, event->time);
+        return;
+    }
+    if (armed == released && armed == SESSION_CONFIRM_NO) {
+        dismiss_session_confirmation(wm, true, event->time);
+        return;
+    }
+    if (armed == released && armed == SESSION_CONFIRM_CLOSE) {
+        dismiss_session_confirmation(wm, true, event->time);
+        return;
+    }
+    draw_session_confirmation(wm);
+}
+
+static void handle_session_confirmation_motion(WindowManager *wm,
+                                               XMotionEvent *event)
+{
+    SessionConfirmation *dialog = &wm->session_confirmation;
+    SessionConfirmButton button;
+
+    if (dialog->pressed_button != 0U)
+        return;
+    button = session_confirmation_button_at(dialog, event->x_root,
+                                            event->y_root);
+    if (button != SESSION_CONFIRM_NONE && dialog->selected != button) {
+        dialog->selected = button;
+        draw_session_confirmation(wm);
+    }
+}
+
+static bool handle_session_confirmation_key(WindowManager *wm, KeySym key,
+                                            unsigned int state, Time time)
+{
+    SessionConfirmation *dialog = &wm->session_confirmation;
+
+    if (!dialog->visible)
+        return false;
+    if (key == XK_Escape || key == XK_n || key == XK_N ||
+        (key == XK_F4 && (state & Mod1Mask) != 0U)) {
+        dismiss_session_confirmation(wm, true, time);
+        return true;
+    }
+    if (key == XK_y || key == XK_Y) {
+        confirm_session_action(wm, time);
+        return true;
+    }
+    if (key == XK_Left || key == XK_Right || key == XK_Tab) {
+        dialog->selected = dialog->selected == SESSION_CONFIRM_YES
+                               ? SESSION_CONFIRM_NO
+                               : SESSION_CONFIRM_YES;
+        draw_session_confirmation(wm);
+        return true;
+    }
+    if (key == XK_Return || key == XK_KP_Enter) {
+        if (dialog->selected == SESSION_CONFIRM_YES)
+            confirm_session_action(wm, time);
+        else
+            dismiss_session_confirmation(wm, true, time);
+        return true;
+    }
+    XBell(wm->display, 0);
+    return true;
+}
+
+static void initialize_session_confirmation(WindowManager *wm)
+{
+    SessionConfirmation *dialog = &wm->session_confirmation;
+    XSetWindowAttributes attributes;
+    XSetWindowAttributes shield_attributes;
+
+    dialog->width = SESSION_CONFIRM_DEFAULT_WIDTH;
+    dialog->height = SESSION_CONFIRM_DEFAULT_HEIGHT;
+    dialog->action = DESKTOP_MENU_NONE;
+    dialog->selected = SESSION_CONFIRM_NO;
+    dialog->armed = SESSION_CONFIRM_NONE;
+    shield_attributes.override_redirect = True;
+    shield_attributes.event_mask = ButtonPressMask | ButtonReleaseMask |
+                                   PointerMotionMask;
+    shield_attributes.cursor = wm->arrow_cursor;
+    dialog->shield = XCreateWindow(
+        wm->display, wm->root, 0, 0,
+        (unsigned)(wm->screen_width > 0 ? wm->screen_width : 1),
+        (unsigned)(wm->screen_height > 0 ? wm->screen_height : 1), 0, 0,
+        InputOnly, CopyFromParent,
+        CWOverrideRedirect | CWEventMask | CWCursor, &shield_attributes);
+    set_internal_role(wm, dialog->shield, "session-confirmation-shield");
+    attributes.override_redirect = True;
+    attributes.background_pixel = wm->theme.silver;
+    attributes.event_mask = ExposureMask | ButtonPressMask |
+                            ButtonReleaseMask | PointerMotionMask |
+                            KeyPressMask;
+    attributes.cursor = wm->arrow_cursor;
+    dialog->window = XCreateWindow(
+        wm->display, wm->root, 0, 0, (unsigned)dialog->width,
+        (unsigned)dialog->height, 0, CopyFromParent, InputOutput,
+        CopyFromParent, CWOverrideRedirect | CWBackPixel | CWEventMask |
+                            CWCursor,
+        &attributes);
+    set_internal_role(wm, dialog->window, "session-confirmation");
+    set_utf8_property(wm, dialog->window, wm->atoms.net_wm_name,
+                      "Confirm Session Action");
+    position_session_confirmation(wm);
+}
+
+static void execute_desktop_menu_item(WindowManager *wm,
+                                      DesktopMenuItem item, Time time)
+{
+    if (!desktop_menu_item_enabled(wm, item)) {
+        XBell(wm->display, 0);
+        return;
+    }
+    dismiss_desktop_menu(wm);
+    if (item == DESKTOP_MENU_LOCK) {
+        if (win31x_auto_lock_lock_now(&wm->auto_lock) < 0)
+            fprintf(stderr, "win31x: could not lock the session: %s\n",
+                    strerror(errno));
+        return;
+    }
+    show_session_confirmation(wm, item, time);
+}
+
+static void handle_desktop_menu_button(WindowManager *wm,
+                                       XButtonEvent *event)
+{
+    DesktopMenuItem item;
+
+    wm->desktop_menu.ignore_open_release = false;
+    wm->desktop_menu.pressed_button = event->button;
+    wm->desktop_menu.armed = DESKTOP_MENU_NONE;
+    if (event->button != Button1)
+        return;
+    item = desktop_menu_item_at(wm, event->x_root, event->y_root);
+    if (item != DESKTOP_MENU_NONE &&
+        desktop_menu_item_enabled(wm, item)) {
+        wm->desktop_menu.armed = item;
+        wm->desktop_menu.selected = item;
+        draw_desktop_menu(wm);
+    }
+}
+
+static void handle_desktop_menu_button_release(WindowManager *wm,
+                                               XButtonEvent *event)
+{
+    DesktopMenu *menu = &wm->desktop_menu;
+    DesktopMenuItem released_item;
+    DesktopMenuItem armed;
+
+    if (event->button == Button3 && menu->ignore_open_release) {
+        menu->ignore_open_release = false;
+        return;
+    }
+    if (menu->pressed_button == 0U ||
+        event->button != menu->pressed_button)
+        return;
+    armed = menu->armed;
+    menu->pressed_button = 0U;
+    menu->armed = DESKTOP_MENU_NONE;
+    released_item = desktop_menu_item_at(wm, event->x_root, event->y_root);
+    if (event->button == Button1 && armed != DESKTOP_MENU_NONE &&
+        released_item == armed && desktop_menu_item_enabled(wm, armed)) {
+        execute_desktop_menu_item(wm, armed, event->time);
+        return;
+    }
+    dismiss_desktop_menu(wm);
+}
+
+static void handle_desktop_menu_motion(WindowManager *wm,
+                                       XMotionEvent *event)
+{
+    DesktopMenuItem item = desktop_menu_item_at(
+        wm, event->x_root, event->y_root);
+
+    if (item != DESKTOP_MENU_NONE &&
+        !desktop_menu_item_enabled(wm, item))
+        item = DESKTOP_MENU_NONE;
+    if (wm->desktop_menu.selected != item) {
+        wm->desktop_menu.selected = item;
+        draw_desktop_menu(wm);
+    }
+}
+
+static DesktopMenuItem next_desktop_menu_item(const WindowManager *wm,
+                                              int direction)
+{
+    int item = wm->desktop_menu.selected;
+    int attempts;
+
+    for (attempts = 0; attempts < DESKTOP_MENU_ITEM_COUNT; ++attempts) {
+        if (item < 0)
+            item = direction > 0 ? 0 : DESKTOP_MENU_ITEM_COUNT - 1;
+        else
+            item = (item + direction + DESKTOP_MENU_ITEM_COUNT) %
+                   DESKTOP_MENU_ITEM_COUNT;
+        if (desktop_menu_item_enabled(wm, (DesktopMenuItem)item))
+            return (DesktopMenuItem)item;
+    }
+    return DESKTOP_MENU_NONE;
+}
+
+static bool handle_desktop_menu_key(WindowManager *wm, KeySym key, Time time)
+{
+    DesktopMenu *menu = &wm->desktop_menu;
+
+    if (menu->pressed_button != 0U || menu->ignore_open_release) {
+        menu->armed = DESKTOP_MENU_NONE;
+        return true;
+    }
+    if (key == XK_Escape) {
+        dismiss_desktop_menu(wm);
+        return true;
+    }
+    if (key == XK_Up || key == XK_Down) {
+        menu->selected = next_desktop_menu_item(
+            wm, key == XK_Up ? -1 : 1);
+        draw_desktop_menu(wm);
+        return true;
+    }
+    if ((key == XK_Return || key == XK_KP_Enter) &&
+        menu->selected != DESKTOP_MENU_NONE) {
+        execute_desktop_menu_item(wm, menu->selected, time);
+        return true;
+    }
+    dismiss_desktop_menu(wm);
+    return false;
+}
+
+static void initialize_desktop_menu(WindowManager *wm)
+{
+    DesktopMenu *menu = &wm->desktop_menu;
+    XSetWindowAttributes attributes;
+
+    menu->width = DESKTOP_MENU_WIDTH;
+    menu->height = DESKTOP_MENU_HEIGHT;
+    menu->selected = DESKTOP_MENU_NONE;
+    menu->armed = DESKTOP_MENU_NONE;
+    attributes.override_redirect = True;
+    attributes.background_pixel = wm->theme.silver;
+    attributes.event_mask = ExposureMask | ButtonPressMask |
+                            ButtonReleaseMask | PointerMotionMask |
+                            KeyPressMask;
+    attributes.cursor = wm->arrow_cursor;
+    menu->window = XCreateWindow(
+        wm->display, wm->root, 0, 0, (unsigned)menu->width,
+        (unsigned)menu->height, 0, CopyFromParent, InputOutput,
+        CopyFromParent, CWOverrideRedirect | CWBackPixel | CWEventMask |
+                            CWCursor,
+        &attributes);
+    set_internal_role(wm, menu->window, "desktop-menu");
+    set_utf8_property(wm, menu->window, wm->atoms.net_wm_name,
+                      "Desktop Menu");
 }
 
 static void raise_focused_internal_window(WindowManager *wm)
@@ -3451,6 +6306,16 @@ static void raise_focused_internal_window(WindowManager *wm)
     else if (wm->internal_focus == INTERNAL_FOCUS_CONTROL_PANEL &&
              wm->control_panel.visible)
         XRaiseWindow(wm->display, wm->control_panel.window);
+    else if (wm->internal_focus == INTERNAL_FOCUS_RUN &&
+             wm->run_dialog.visible)
+        XRaiseWindow(wm->display, wm->run_dialog.window);
+    if (wm->desktop_menu.visible)
+        XRaiseWindow(wm->display, wm->desktop_menu.window);
+    raise_drag_outline(wm);
+    if (wm->session_confirmation.visible) {
+        XRaiseWindow(wm->display, wm->session_confirmation.shield);
+        XRaiseWindow(wm->display, wm->session_confirmation.window);
+    }
 }
 
 static void initialize_ewmh(WindowManager *wm)
@@ -3458,6 +6323,7 @@ static void initialize_ewmh(WindowManager *wm)
     Atom supported[] = {
         wm->atoms.net_supporting_wm_check,
         wm->atoms.net_wm_name,
+        wm->atoms.net_wm_icon,
         wm->atoms.net_client_list,
         wm->atoms.net_active_window,
         wm->atoms.net_close_window,
@@ -3501,41 +6367,109 @@ static void grab_shortcuts(WindowManager *wm)
     KeyCode tab = XKeysymToKeycode(wm->display, XK_Tab);
     KeyCode f2 = XKeysymToKeycode(wm->display, XK_F2);
     KeyCode f4 = XKeysymToKeycode(wm->display, XK_F4);
+    KeyCode r = XKeysymToKeycode(wm->display, XK_r);
     KeyCode num_lock = XKeysymToKeycode(wm->display, XK_Num_Lock);
+    KeyCode scroll_lock = XKeysymToKeycode(wm->display, XK_Scroll_Lock);
     XModifierKeymap *mapping = XGetModifierMapping(wm->display);
     unsigned num_lock_mask = 0;
-    unsigned lock_combinations[4];
+    unsigned scroll_lock_mask = 0;
+    unsigned lock_combinations[8];
+    size_t lock_combination_count = 0U;
     size_t index;
     int modifier;
     int key;
 
+    wm->super_mask_count = 0U;
     if (mapping != NULL) {
         for (modifier = 0; modifier < 8; ++modifier) {
             for (key = 0; key < mapping->max_keypermod; ++key) {
-                if (num_lock != 0 &&
-                    mapping->modifiermap[modifier * mapping->max_keypermod + key] ==
-                        num_lock)
+                KeyCode code = mapping->modifiermap[
+                    modifier * mapping->max_keypermod + key];
+                KeySym symbol;
+                unsigned int mask = 1U << modifier;
+                size_t mask_index;
+
+                if (num_lock != 0 && code == num_lock)
                     num_lock_mask = 1U << modifier;
+                if (scroll_lock != 0 && code == scroll_lock)
+                    scroll_lock_mask = 1U << modifier;
+                if (code == 0)
+                    continue;
+                symbol = XkbKeycodeToKeysym(wm->display, code, 0, 0);
+                if (symbol != XK_Super_L && symbol != XK_Super_R)
+                    continue;
+                for (mask_index = 0U; mask_index < wm->super_mask_count;
+                     ++mask_index) {
+                    if (wm->super_masks[mask_index] == mask)
+                        break;
+                }
+                if (mask_index == wm->super_mask_count &&
+                    wm->super_mask_count < sizeof(wm->super_masks) /
+                                                   sizeof(wm->super_masks[0]))
+                    wm->super_masks[wm->super_mask_count++] = mask;
             }
         }
         XFreeModifiermap(mapping);
     }
-    lock_combinations[0] = 0;
-    lock_combinations[1] = LockMask;
-    lock_combinations[2] = num_lock_mask;
-    lock_combinations[3] = LockMask | num_lock_mask;
+    if (wm->super_mask_count == 0U)
+        wm->super_masks[wm->super_mask_count++] = Mod4Mask;
+    wm->ignored_lock_mask = LockMask | num_lock_mask | scroll_lock_mask;
+    {
+        unsigned int bits;
+
+        for (bits = 0U; bits < 8U; ++bits) {
+            unsigned int combination =
+                ((bits & 1U) != 0U ? LockMask : 0U) |
+                ((bits & 2U) != 0U ? num_lock_mask : 0U) |
+                ((bits & 4U) != 0U ? scroll_lock_mask : 0U);
+            size_t existing;
+
+            for (existing = 0U; existing < lock_combination_count;
+                 ++existing) {
+                if (lock_combinations[existing] == combination)
+                    break;
+            }
+            if (existing == lock_combination_count)
+                lock_combinations[lock_combination_count++] = combination;
+        }
+    }
 
     XUngrabKey(wm->display, AnyKey, AnyModifier, wm->root);
-    for (index = 0; index < sizeof(lock_combinations) /
-                                  sizeof(lock_combinations[0]); ++index) {
+    for (index = 0; index < lock_combination_count; ++index) {
         unsigned modifiers = Mod1Mask | lock_combinations[index];
-        XGrabKey(wm->display, tab, modifiers, wm->root, True,
-                 GrabModeAsync, GrabModeAsync);
-        XGrabKey(wm->display, f2, modifiers, wm->root, True,
-                 GrabModeAsync, GrabModeAsync);
-        XGrabKey(wm->display, f4, modifiers, wm->root, True,
-                 GrabModeAsync, GrabModeAsync);
+        size_t super_index;
+
+        if (tab != 0)
+            XGrabKey(wm->display, tab, modifiers, wm->root, True,
+                     GrabModeAsync, GrabModeAsync);
+        if (f2 != 0)
+            XGrabKey(wm->display, f2, modifiers, wm->root, True,
+                     GrabModeAsync, GrabModeAsync);
+        if (f4 != 0)
+            XGrabKey(wm->display, f4, modifiers, wm->root, True,
+                     GrabModeAsync, GrabModeAsync);
+        if (r == 0)
+            continue;
+        for (super_index = 0U; super_index < wm->super_mask_count;
+             ++super_index) {
+            XGrabKey(wm->display, r,
+                     wm->super_masks[super_index] | lock_combinations[index],
+                     wm->root, True, GrabModeAsync, GrabModeAsync);
+        }
     }
+}
+
+static bool key_event_has_super(const WindowManager *wm,
+                                const XKeyEvent *event)
+{
+    size_t index;
+    unsigned int state = event->state & ~wm->ignored_lock_mask;
+
+    for (index = 0U; index < wm->super_mask_count; ++index) {
+        if (state == wm->super_masks[index])
+            return true;
+    }
+    return false;
 }
 
 static void adopt_existing_windows(WindowManager *wm)
@@ -3645,10 +6579,15 @@ static void handle_configure_request(WindowManager *wm, XConfigureRequestEvent *
                 wm, root, preferred, managed_client_count(wm) + 1);
         }
     }
+    if (wm->active == client)
+        set_active_monitor_from_client(wm, client);
     raise_focused_internal_window(wm);
     if (event->value_mask & (CWSibling | CWStackMode))
         update_focus_overlays(wm);
     send_configure_notify(wm, client);
+    if (!arranged &&
+        (event->value_mask & (CWX | CWY | CWWidth | CWHeight)) != 0U)
+        capture_client_placement(wm, client, false);
 }
 
 static int frame_resize_edges(Client *client, int x, int y)
@@ -3668,11 +6607,148 @@ static int frame_resize_edges(Client *client, int x, int y)
     return edges;
 }
 
-static void start_drag(WindowManager *wm, DragKind kind, Client *client, int edges,
-                       int root_x, int root_y)
+static void clamp_drag_position(const WindowManager *wm, int width, int *x,
+                                int *y)
 {
+    if (*x > wm->screen_width - 48)
+        *x = wm->screen_width - 48;
+    if (*x + width < 48)
+        *x = 48 - width;
+    if (*y < 0)
+        *y = 0;
+    if (*y > wm->screen_height - TITLE_HEIGHT)
+        *y = wm->screen_height - TITLE_HEIGHT;
+}
+
+static void prepare_launcher_drag_restore(WindowManager *wm, int pointer_x,
+                                          int pointer_y)
+{
+    int old_x = wm->launcher_x;
+    int old_y = wm->launcher_y;
+    int old_width = wm->launcher_width;
+    int offset_x = pointer_x - old_x;
+    int offset_y = pointer_y - old_y;
+    int width = wm->launcher_restore_valid ? wm->launcher_restore_width
+                                           : wm->launcher_width;
+    int height = wm->launcher_restore_valid ? wm->launcher_restore_height
+                                            : wm->launcher_height;
+    int x;
+    int y;
+
+    if (offset_x < 0)
+        offset_x = 0;
+    if (offset_x > old_width)
+        offset_x = old_width;
+    if (offset_y < 0)
+        offset_y = 0;
+    if (offset_y >= TITLE_Y + TITLE_HEIGHT)
+        offset_y = TITLE_Y + TITLE_HEIGHT - 1;
+    x = pointer_x -
+        (int)((long long)offset_x * width / (old_width > 0 ? old_width : 1));
+    y = pointer_y - offset_y;
+    clamp_internal_geometry(wm, &x, &y, &width, &height);
+    wm->drag.start_root_x = pointer_x;
+    wm->drag.start_root_y = pointer_y;
+    wm->drag.start_x = x;
+    wm->drag.start_y = y;
+    wm->drag.start_width = width;
+    wm->drag.start_height = height;
+    wm->drag.pending_x = x;
+    wm->drag.pending_y = y;
+    wm->drag.pending_width = width;
+    wm->drag.pending_height = height;
+    wm->drag.arranged_restore_prepared = true;
+}
+
+static void prepare_control_panel_drag_restore(WindowManager *wm,
+                                               int pointer_x, int pointer_y)
+{
+    ControlPanel *panel = &wm->control_panel;
+    int old_x = panel->x;
+    int old_y = panel->y;
+    int old_width = panel->width;
+    int offset_x = pointer_x - old_x;
+    int offset_y = pointer_y - old_y;
+    int width = panel->restore_valid ? panel->restore_width : panel->width;
+    int height = panel->restore_valid ? panel->restore_height : panel->height;
+    int x;
+    int y;
+
+    if (offset_x < 0)
+        offset_x = 0;
+    if (offset_x > old_width)
+        offset_x = old_width;
+    if (offset_y < 0)
+        offset_y = 0;
+    if (offset_y >= TITLE_Y + TITLE_HEIGHT)
+        offset_y = TITLE_Y + TITLE_HEIGHT - 1;
+    x = pointer_x -
+        (int)((long long)offset_x * width / (old_width > 0 ? old_width : 1));
+    y = pointer_y - offset_y;
+    clamp_internal_geometry(wm, &x, &y, &width, &height);
+    wm->drag.start_root_x = pointer_x;
+    wm->drag.start_root_y = pointer_y;
+    wm->drag.start_x = x;
+    wm->drag.start_y = y;
+    wm->drag.start_width = width;
+    wm->drag.start_height = height;
+    wm->drag.pending_x = x;
+    wm->drag.pending_y = y;
+    wm->drag.pending_width = width;
+    wm->drag.pending_height = height;
+    wm->drag.arranged_restore_prepared = true;
+}
+
+static void prepare_client_drag_restore(WindowManager *wm, Client *client,
+                                        int pointer_x, int pointer_y)
+{
+    int old_frame_x = client->x - FRAME_LEFT;
+    int old_frame_y = client->y - FRAME_TOP;
+    int old_frame_width = frame_width(client);
+    int offset_x = pointer_x - old_frame_x;
+    int offset_y = pointer_y - old_frame_y;
+    int width = client->restore_valid ? client->restore_width : client->width;
+    int height = client->restore_valid ? client->restore_height : client->height;
+    int new_frame_width;
+    int frame_x;
+    int frame_y;
+
+    if (offset_x < 0)
+        offset_x = 0;
+    if (offset_x > old_frame_width)
+        offset_x = old_frame_width;
+    if (offset_y < 0)
+        offset_y = 0;
+    if (offset_y >= TITLE_Y + TITLE_HEIGHT)
+        offset_y = TITLE_Y + TITLE_HEIGHT - 1;
+    constrain_client_size(wm, client, &width, &height);
+    new_frame_width = width + FRAME_LEFT + FRAME_RIGHT;
+    frame_x = pointer_x -
+              (int)((long long)offset_x * new_frame_width /
+                    (old_frame_width > 0 ? old_frame_width : 1));
+    frame_y = pointer_y - offset_y;
+    clamp_drag_position(wm, new_frame_width, &frame_x, &frame_y);
+    wm->drag.start_root_x = pointer_x;
+    wm->drag.start_root_y = pointer_y;
+    wm->drag.start_x = frame_x + FRAME_LEFT;
+    wm->drag.start_y = frame_y + FRAME_TOP;
+    wm->drag.start_width = width;
+    wm->drag.start_height = height;
+    wm->drag.pending_x = wm->drag.start_x;
+    wm->drag.pending_y = wm->drag.start_y;
+    wm->drag.pending_width = width;
+    wm->drag.pending_height = height;
+    wm->drag.arranged_restore_prepared = true;
+}
+
+static void start_drag(WindowManager *wm, DragKind kind, Client *client,
+                       DesktopIcon *icon, int edges, int root_x, int root_y)
+{
+    if (wm->drag.kind != DRAG_NONE)
+        cancel_drag(wm, CurrentTime);
     wm->drag.kind = kind;
     wm->drag.client = client;
+    wm->drag.icon = icon;
     wm->drag.edges = edges;
     wm->drag.start_root_x = root_x;
     wm->drag.start_root_y = root_y;
@@ -3681,21 +6757,42 @@ static void start_drag(WindowManager *wm, DragKind kind, Client *client, int edg
         wm->drag.start_y = client->y;
         wm->drag.start_width = client->width;
         wm->drag.start_height = client->height;
+    } else if (kind == DRAG_MOVE_ICON && icon != NULL) {
+        wm->drag.start_x = icon->x;
+        wm->drag.start_y = icon->y;
+        wm->drag.start_width = ICON_WIDTH;
+        wm->drag.start_height = ICON_HEIGHT;
     } else if (kind == DRAG_MOVE_CONTROL_PANEL) {
         wm->drag.start_x = wm->control_panel.x;
         wm->drag.start_y = wm->control_panel.y;
+        wm->drag.start_width = wm->control_panel.width;
+        wm->drag.start_height = wm->control_panel.height;
+    } else if (kind == DRAG_MOVE_RUN) {
+        wm->drag.start_x = wm->run_dialog.x;
+        wm->drag.start_y = wm->run_dialog.y;
+        wm->drag.start_width = wm->run_dialog.width;
+        wm->drag.start_height = wm->run_dialog.height;
     } else {
         wm->drag.start_x = wm->launcher_x;
         wm->drag.start_y = wm->launcher_y;
+        wm->drag.start_width = wm->launcher_width;
+        wm->drag.start_height = wm->launcher_height;
     }
+    wm->drag.pending_x = wm->drag.start_x;
+    wm->drag.pending_y = wm->drag.start_y;
+    wm->drag.pending_width = wm->drag.start_width;
+    wm->drag.pending_height = wm->drag.start_height;
     if (XGrabPointer(wm->display, wm->root, False,
                      PointerMotionMask | ButtonReleaseMask, GrabModeAsync,
                      GrabModeAsync, None,
                      kind == DRAG_RESIZE_CLIENT ? wm->resize_cursor : wm->move_cursor,
                      CurrentTime) != GrabSuccess) {
-        wm->drag.kind = DRAG_NONE;
-        wm->drag.client = NULL;
+        memset(&wm->drag, 0, sizeof(wm->drag));
+        return;
     }
+    wm->drag.keyboard_grabbed =
+        XGrabKeyboard(wm->display, wm->root, False, GrabModeAsync,
+                      GrabModeAsync, CurrentTime) == GrabSuccess;
 }
 
 static void handle_frame_button(WindowManager *wm, Client *client,
@@ -3721,14 +6818,14 @@ static void handle_frame_button(WindowManager *wm, Client *client,
             minimize_client(wm, client);
             return;
         }
-        start_drag(wm, DRAG_MOVE_CLIENT, client, 0,
+        start_drag(wm, DRAG_MOVE_CLIENT, client, NULL, 0,
                    event->x_root, event->y_root);
         return;
     }
     edges = frame_resize_edges(client, event->x, event->y);
     if (edges != 0) {
         normalize_client_layout(wm, client);
-        start_drag(wm, DRAG_RESIZE_CLIENT, client, edges,
+        start_drag(wm, DRAG_RESIZE_CLIENT, client, NULL, edges,
                    event->x_root, event->y_root);
     }
 }
@@ -3758,7 +6855,7 @@ static void handle_launcher_button(WindowManager *wm, XButtonEvent *event)
         return;
     }
     if (event->y < 25) {
-        start_drag(wm, DRAG_MOVE_LAUNCHER, NULL, 0,
+        start_drag(wm, DRAG_MOVE_LAUNCHER, NULL, NULL, 0,
                    event->x_root, event->y_root);
         return;
     }
@@ -3877,7 +6974,7 @@ static void handle_control_panel_button(WindowManager *wm,
         return;
     }
     if (event->y < 25) {
-        start_drag(wm, DRAG_MOVE_CONTROL_PANEL, NULL, 0,
+        start_drag(wm, DRAG_MOVE_CONTROL_PANEL, NULL, NULL, 0,
                    event->x_root, event->y_root);
         return;
     }
@@ -3887,6 +6984,9 @@ static void handle_control_panel_button(WindowManager *wm,
                                CONTROL_PANEL_NAV_WIDTH - 7,
                                control_nav_item_height(panel))) {
             panel->section = (ControlSection)section;
+            wm->settings.control_panel_section =
+                (Win31xControlPanelSection)panel->section;
+            save_settings(wm);
             clear_control_password(panel);
             if (panel->section == CONTROL_SECTION_WIFI)
                 start_wifi_scan(wm);
@@ -4001,18 +7101,81 @@ static void handle_control_panel_button(WindowManager *wm,
     }
 }
 
+static void handle_run_button(WindowManager *wm, XButtonEvent *event)
+{
+    RunDialog *dialog = &wm->run_dialog;
+
+    if (event->button != Button1)
+        return;
+    if (dialog->width >= TITLE_BUTTON + 12 && event->y < 25 &&
+        event->x >= internal_close_button_x(dialog->width)) {
+        hide_run_dialog(wm);
+        return;
+    }
+    if (event->y < 25) {
+        start_drag(wm, DRAG_MOVE_RUN, NULL, NULL, 0, event->x_root,
+                   event->y_root);
+        return;
+    }
+    if (dialog->width >= 260 && dialog->height >= 140 &&
+        point_in_rectangle(event->x, event->y, run_open_button_x(dialog),
+                           run_button_y(dialog), 78, 26)) {
+        execute_run_command(wm);
+        return;
+    }
+    if (dialog->width >= 260 && dialog->height >= 140 &&
+        point_in_rectangle(event->x, event->y, run_cancel_button_x(dialog),
+                           run_button_y(dialog), 78, 26))
+        hide_run_dialog(wm);
+}
+
+static void activate_desktop_icon(WindowManager *wm, DesktopIcon *icon,
+                                  Time time)
+{
+    size_t monitor_index;
+
+    if (icon == NULL)
+        return;
+    monitor_index = monitor_index_for_anchor(wm, &icon->monitor);
+    set_active_monitor(wm, monitor_index);
+    if (icon->kind == ICON_APPLICATIONS)
+        show_launcher_on_monitor(wm, monitor_index);
+    else if (icon->kind == ICON_CONTROL_PANEL)
+        show_control_panel_on_monitor(wm, monitor_index);
+    else
+        restore_client(wm, icon->client, time);
+}
+
 static void handle_button_press(WindowManager *wm, XButtonEvent *event)
 {
-    DesktopIcon *icon = icon_for_window(wm, event->window);
+    DesktopIcon *icon;
     Client *client;
 
+    if (wm->session_confirmation.visible) {
+        if (event->send_event) {
+            refocus_session_confirmation(wm, event->time);
+            return;
+        }
+        handle_session_confirmation_button(wm, event);
+        return;
+    }
+    if (wm->desktop_menu.visible) {
+        handle_desktop_menu_button(wm, event);
+        return;
+    }
+    if (event->window == wm->root && event->subwindow == None &&
+        event->button == Button3) {
+        show_desktop_menu(wm, event->x_root, event->y_root, event->time);
+        return;
+    }
+    icon = icon_for_window(wm, event->window);
     if (icon != NULL && event->button == Button1) {
-        if (icon->kind == ICON_APPLICATIONS)
-            show_launcher(wm);
-        else if (icon->kind == ICON_CONTROL_PANEL)
-            show_control_panel(wm);
-        else
-            restore_client(wm, icon->client, event->time);
+        if (event->send_event) {
+            activate_desktop_icon(wm, icon, event->time);
+            return;
+        }
+        start_drag(wm, DRAG_MOVE_ICON, NULL, icon, 0, event->x_root,
+                   event->y_root);
         return;
     }
     if (event->window == wm->launcher) {
@@ -4023,6 +7186,12 @@ static void handle_button_press(WindowManager *wm, XButtonEvent *event)
     if (event->window == wm->control_panel.window) {
         activate_internal_window(wm, INTERNAL_FOCUS_CONTROL_PANEL, event->time);
         handle_control_panel_button(wm, event);
+        return;
+    }
+    if (event->window == wm->run_dialog.window) {
+        remember_run_return_focus(wm);
+        activate_internal_window(wm, INTERNAL_FOCUS_RUN, event->time);
+        handle_run_button(wm, event);
         return;
     }
     client = client_for_window(wm, event->window);
@@ -4045,71 +7214,105 @@ static void handle_motion(WindowManager *wm, XMotionEvent *event)
     int dx;
     int dy;
 
+    if (wm->session_confirmation.visible) {
+        if (event->send_event) {
+            refocus_session_confirmation(wm, event->time);
+            return;
+        }
+        handle_session_confirmation_motion(wm, event);
+        return;
+    }
+    if (wm->desktop_menu.visible) {
+        handle_desktop_menu_motion(wm, event);
+        return;
+    }
     if (wm->drag.kind == DRAG_NONE)
         return;
     if (wm->drag.kind == DRAG_MOVE_LAUNCHER &&
-        wm->launcher_layout != CLIENT_LAYOUT_NORMAL) {
-        restore_launcher_for_move(wm, event->x_root, event->y_root);
-        wm->drag.start_root_x = event->x_root;
-        wm->drag.start_root_y = event->y_root;
-        wm->drag.start_x = wm->launcher_x;
-        wm->drag.start_y = wm->launcher_y;
+        wm->launcher_layout != CLIENT_LAYOUT_NORMAL &&
+        !wm->drag.arranged_restore_prepared) {
+        prepare_launcher_drag_restore(wm, event->x_root, event->y_root);
     } else if (wm->drag.kind == DRAG_MOVE_CONTROL_PANEL &&
-               wm->control_panel.layout != CLIENT_LAYOUT_NORMAL) {
-        restore_control_panel_for_move(wm, event->x_root, event->y_root);
-        wm->drag.start_root_x = event->x_root;
-        wm->drag.start_root_y = event->y_root;
-        wm->drag.start_x = wm->control_panel.x;
-        wm->drag.start_y = wm->control_panel.y;
+               wm->control_panel.layout != CLIENT_LAYOUT_NORMAL &&
+               !wm->drag.arranged_restore_prepared) {
+        prepare_control_panel_drag_restore(wm, event->x_root, event->y_root);
     } else if (wm->drag.kind == DRAG_MOVE_CLIENT && wm->drag.client != NULL &&
-               wm->drag.client->layout != CLIENT_LAYOUT_NORMAL) {
-        restore_client_for_move(wm, wm->drag.client, event->x_root,
-                                event->y_root);
-        wm->drag.start_root_x = event->x_root;
-        wm->drag.start_root_y = event->y_root;
-        wm->drag.start_x = wm->drag.client->x;
-        wm->drag.start_y = wm->drag.client->y;
-        wm->drag.start_width = wm->drag.client->width;
-        wm->drag.start_height = wm->drag.client->height;
+               wm->drag.client->layout != CLIENT_LAYOUT_NORMAL &&
+               !wm->drag.arranged_restore_prepared) {
+        prepare_client_drag_restore(wm, wm->drag.client, event->x_root,
+                                    event->y_root);
     }
     dx = event->x_root - wm->drag.start_root_x;
     dy = event->y_root - wm->drag.start_root_y;
+    if (wm->drag.kind == DRAG_MOVE_ICON) {
+        const MonitorGeometry *monitor;
+        int x;
+        int y;
+        int width = ICON_WIDTH;
+        int height = ICON_HEIGHT;
+
+        if (!wm->drag.moved && abs(dx) < ICON_DRAG_SLOP &&
+            abs(dy) < ICON_DRAG_SLOP)
+            return;
+        wm->drag.moved = true;
+        x = wm->drag.start_x + dx;
+        y = wm->drag.start_y + dy;
+        monitor = monitor_at(
+            wm, monitor_index_for_point(wm, event->x_root, event->y_root));
+        if (monitor != NULL)
+            clamp_geometry_to_monitor(monitor, &x, &y, &width, &height);
+        wm->drag.pending_x = x;
+        wm->drag.pending_y = y;
+        show_drag_outline(wm, x, y, ICON_WIDTH, ICON_HEIGHT);
+        return;
+    }
+    wm->drag.moved = true;
     if (wm->drag.kind == DRAG_MOVE_LAUNCHER) {
-        wm->launcher_x = wm->drag.start_x + dx;
-        wm->launcher_y = wm->drag.start_y + dy;
-        if (wm->launcher_x > wm->screen_width - 48)
-            wm->launcher_x = wm->screen_width - 48;
-        if (wm->launcher_x + wm->launcher_width < 48)
-            wm->launcher_x = 48 - wm->launcher_width;
-        if (wm->launcher_y < 0)
-            wm->launcher_y = 0;
-        if (wm->launcher_y > wm->screen_height - TITLE_HEIGHT)
-            wm->launcher_y = wm->screen_height - TITLE_HEIGHT;
-        XMoveWindow(wm->display, wm->launcher, wm->launcher_x, wm->launcher_y);
+        int x = wm->drag.start_x + dx;
+        int y = wm->drag.start_y + dy;
+
+        clamp_drag_position(wm, wm->drag.start_width, &x, &y);
+        wm->drag.pending_x = x;
+        wm->drag.pending_y = y;
+        show_drag_outline(wm, x, y, wm->drag.pending_width,
+                          wm->drag.pending_height);
         return;
     }
     if (wm->drag.kind == DRAG_MOVE_CONTROL_PANEL) {
-        ControlPanel *panel = &wm->control_panel;
+        int x = wm->drag.start_x + dx;
+        int y = wm->drag.start_y + dy;
 
-        panel->x = wm->drag.start_x + dx;
-        panel->y = wm->drag.start_y + dy;
-        if (panel->x > wm->screen_width - 48)
-            panel->x = wm->screen_width - 48;
-        if (panel->x + panel->width < 48)
-            panel->x = 48 - panel->width;
-        if (panel->y < 0)
-            panel->y = 0;
-        if (panel->y > wm->screen_height - TITLE_HEIGHT)
-            panel->y = wm->screen_height - TITLE_HEIGHT;
-        XMoveWindow(wm->display, panel->window, panel->x, panel->y);
+        clamp_drag_position(wm, wm->drag.start_width, &x, &y);
+        wm->drag.pending_x = x;
+        wm->drag.pending_y = y;
+        show_drag_outline(wm, x, y, wm->drag.pending_width,
+                          wm->drag.pending_height);
+        return;
+    }
+    if (wm->drag.kind == DRAG_MOVE_RUN) {
+        int x = wm->drag.start_x + dx;
+        int y = wm->drag.start_y + dy;
+
+        clamp_drag_position(wm, wm->drag.start_width, &x, &y);
+        wm->drag.pending_x = x;
+        wm->drag.pending_y = y;
+        show_drag_outline(wm, x, y, wm->drag.pending_width,
+                          wm->drag.pending_height);
         return;
     }
     if (wm->drag.client == NULL)
         return;
     if (wm->drag.kind == DRAG_MOVE_CLIENT) {
-        wm->drag.client->x = wm->drag.start_x + dx;
-        wm->drag.client->y = wm->drag.start_y + dy;
-        keep_client_on_screen(wm, wm->drag.client);
+        int frame_x = wm->drag.start_x + dx - FRAME_LEFT;
+        int frame_y = wm->drag.start_y + dy - FRAME_TOP;
+        int outer_width = wm->drag.start_width + FRAME_LEFT + FRAME_RIGHT;
+        int outer_height = wm->drag.start_height + FRAME_TOP + FRAME_BOTTOM;
+
+        clamp_drag_position(wm, outer_width, &frame_x, &frame_y);
+        wm->drag.pending_x = frame_x + FRAME_LEFT;
+        wm->drag.pending_y = frame_y + FRAME_TOP;
+        show_drag_outline(wm, frame_x, frame_y, outer_width, outer_height);
+        return;
     } else if (wm->drag.kind == DRAG_RESIZE_CLIENT) {
         Client *client = wm->drag.client;
         int new_x = wm->drag.start_x;
@@ -4144,32 +7347,169 @@ static void handle_motion(WindowManager *wm, XMotionEvent *event)
 }
 
 static ClientLayout snap_layout_for_release(const WindowManager *wm,
-                                            int root_x)
+                                            int root_x, int root_y,
+                                            size_t *monitor_index)
 {
-    if (root_x <= SNAP_THRESHOLD)
+    const MonitorGeometry *monitor;
+    int right;
+
+    *monitor_index = monitor_index_for_point(wm, root_x, root_y);
+    monitor = monitor_at(wm, *monitor_index);
+    if (monitor == NULL)
+        return CLIENT_LAYOUT_NORMAL;
+    if (root_y < monitor->y ||
+        root_y >= monitor->y + monitor->height)
+        return CLIENT_LAYOUT_NORMAL;
+    if (root_x >= monitor->x - SNAP_THRESHOLD &&
+        root_x <= monitor->x + SNAP_THRESHOLD)
         return CLIENT_LAYOUT_SNAP_LEFT;
-    if (root_x >= wm->screen_width - 1 - SNAP_THRESHOLD)
+    right = monitor->x + monitor->width - 1;
+    if (root_x >= right - SNAP_THRESHOLD &&
+        root_x <= right + SNAP_THRESHOLD)
         return CLIENT_LAYOUT_SNAP_RIGHT;
     return CLIENT_LAYOUT_NORMAL;
 }
 
 static void finish_drag(WindowManager *wm, XButtonEvent *event)
 {
-    DragKind kind = wm->drag.kind;
-    Client *client = wm->drag.client;
-    ClientLayout snap = snap_layout_for_release(wm, event->x_root);
+    DragState drag;
+    size_t snap_monitor;
+    ClientLayout snap = snap_layout_for_release(
+        wm, event->x_root, event->y_root, &snap_monitor);
 
-    wm->drag.kind = DRAG_NONE;
-    wm->drag.client = NULL;
-    XUngrabPointer(wm->display, event->time);
-    if (snap == CLIENT_LAYOUT_NORMAL)
+    if (event->button != Button1)
         return;
-    if (kind == DRAG_MOVE_CLIENT && client != NULL)
-        set_client_layout(wm, client, snap);
-    else if (kind == DRAG_MOVE_LAUNCHER)
-        apply_launcher_layout(wm, snap);
-    else if (kind == DRAG_MOVE_CONTROL_PANEL)
-        apply_control_panel_layout(wm, snap);
+    drag = wm->drag;
+    cancel_drag(wm, event->time);
+    if (drag.kind == DRAG_MOVE_ICON && drag.icon != NULL) {
+        int release_dx = event->x_root - drag.start_root_x;
+        int release_dy = event->y_root - drag.start_root_y;
+        bool moved = drag.moved || abs(release_dx) >= ICON_DRAG_SLOP ||
+                     abs(release_dy) >= ICON_DRAG_SLOP;
+
+        if (!moved) {
+            activate_desktop_icon(wm, drag.icon, event->time);
+        } else {
+            const MonitorGeometry *monitor = monitor_at(wm, snap_monitor);
+            int width = ICON_WIDTH;
+            int height = ICON_HEIGHT;
+
+            drag.icon->x = drag.start_x + release_dx;
+            drag.icon->y = drag.start_y + release_dy;
+            if (monitor != NULL)
+                clamp_geometry_to_monitor(monitor, &drag.icon->x,
+                                          &drag.icon->y, &width, &height);
+            set_active_monitor(wm, snap_monitor);
+            XMoveWindow(wm->display, drag.icon->window, drag.icon->x,
+                        drag.icon->y);
+            XLowerWindow(wm->display, drag.icon->window);
+            remember_desktop_icon_position(wm, drag.icon);
+        }
+        return;
+    }
+    if (drag.kind == DRAG_RESIZE_CLIENT) {
+        if (drag.moved && drag.client != NULL)
+            capture_client_placement(wm, drag.client, true);
+        return;
+    }
+    if (!drag.moved)
+        return;
+    set_active_monitor(wm, snap_monitor);
+
+    if (drag.kind == DRAG_MOVE_CLIENT && drag.client != NULL) {
+        Client *client = drag.client;
+
+        client->layout = CLIENT_LAYOUT_NORMAL;
+        client->layout_before_maximize = CLIENT_LAYOUT_NORMAL;
+        client->restore_valid = false;
+        client->layout_monitor.valid = false;
+        client->x = drag.pending_x;
+        client->y = drag.pending_y;
+        if (drag.arranged_restore_prepared) {
+            client->width = drag.pending_width;
+            client->height = drag.pending_height;
+        }
+        if (snap != CLIENT_LAYOUT_NORMAL) {
+            set_monitor_anchor(&client->layout_monitor,
+                               monitor_at(wm, snap_monitor));
+            set_client_layout(wm, client, snap);
+        } else {
+            set_maximized_state(wm, client, false);
+            keep_client_on_screen(wm, client);
+            apply_client_geometry(wm, client);
+            send_configure_notify(wm, client);
+        }
+        capture_client_placement(wm, client, true);
+    } else if (drag.kind == DRAG_MOVE_LAUNCHER) {
+        wm->launcher_layout = CLIENT_LAYOUT_NORMAL;
+        wm->launcher_layout_before_maximize = CLIENT_LAYOUT_NORMAL;
+        wm->launcher_restore_valid = false;
+        wm->launcher_layout_monitor.valid = false;
+        wm->launcher_x = drag.pending_x;
+        wm->launcher_y = drag.pending_y;
+        wm->launcher_width = drag.pending_width;
+        wm->launcher_height = drag.pending_height;
+        if (snap != CLIENT_LAYOUT_NORMAL) {
+            set_monitor_anchor(&wm->launcher_layout_monitor,
+                               monitor_at(wm, snap_monitor));
+            apply_launcher_layout(wm, snap);
+        } else {
+            clamp_internal_geometry(wm, &wm->launcher_x, &wm->launcher_y,
+                                    &wm->launcher_width,
+                                    &wm->launcher_height);
+            clamp_launcher_scroll(wm);
+            XMoveResizeWindow(wm->display, wm->launcher, wm->launcher_x,
+                              wm->launcher_y, (unsigned)wm->launcher_width,
+                              (unsigned)wm->launcher_height);
+            draw_launcher(wm);
+        }
+        remember_launcher_placement(wm);
+    } else if (drag.kind == DRAG_MOVE_CONTROL_PANEL) {
+        ControlPanel *panel = &wm->control_panel;
+
+        panel->layout = CLIENT_LAYOUT_NORMAL;
+        panel->layout_before_maximize = CLIENT_LAYOUT_NORMAL;
+        panel->restore_valid = false;
+        panel->layout_monitor.valid = false;
+        panel->x = drag.pending_x;
+        panel->y = drag.pending_y;
+        panel->width = drag.pending_width;
+        panel->height = drag.pending_height;
+        if (snap != CLIENT_LAYOUT_NORMAL) {
+            set_monitor_anchor(&panel->layout_monitor,
+                               monitor_at(wm, snap_monitor));
+            apply_control_panel_layout(wm, snap);
+        } else {
+            clamp_internal_geometry(wm, &panel->x, &panel->y,
+                                    &panel->width, &panel->height);
+            if (!control_wifi_layout_available(panel))
+                clear_control_password(panel);
+            XMoveResizeWindow(wm->display, panel->window, panel->x, panel->y,
+                              (unsigned)panel->width,
+                              (unsigned)panel->height);
+            draw_control_panel(wm);
+        }
+        remember_control_panel_placement(wm);
+    } else if (drag.kind == DRAG_MOVE_RUN) {
+        wm->run_dialog.x = drag.pending_x;
+        wm->run_dialog.y = drag.pending_y;
+        clamp_internal_geometry(wm, &wm->run_dialog.x, &wm->run_dialog.y,
+                                &wm->run_dialog.width,
+                                &wm->run_dialog.height);
+        set_monitor_anchor(
+            &wm->run_dialog.monitor,
+            monitor_at(wm, monitor_index_for_rectangle(
+                               wm, wm->run_dialog.x, wm->run_dialog.y,
+                               wm->run_dialog.width,
+                               wm->run_dialog.height)));
+        XMoveResizeWindow(wm->display, wm->run_dialog.window,
+                          wm->run_dialog.x, wm->run_dialog.y,
+                          (unsigned)wm->run_dialog.width,
+                          (unsigned)wm->run_dialog.height);
+        wm->run_dialog.positioned = true;
+        remember_run_dialog_placement(wm);
+        draw_run_dialog(wm);
+    }
 }
 
 static void handle_control_wifi_key(WindowManager *wm, XKeyEvent *event,
@@ -4243,9 +7583,89 @@ static void handle_control_wifi_key(WindowManager *wm, XKeyEvent *event,
     }
 }
 
+static void handle_run_key(WindowManager *wm, XKeyEvent *event, KeySym key)
+{
+    RunDialog *dialog = &wm->run_dialog;
+
+    if ((event->state & Mod1Mask) != 0U) {
+        if (key == XK_Tab)
+            focus_next(wm, event->time);
+        else if (key == XK_F2)
+            show_launcher(wm);
+        else if (key == XK_F4)
+            hide_run_dialog(wm);
+        return;
+    }
+    if (key == XK_Escape) {
+        hide_run_dialog(wm);
+        return;
+    }
+    if (key == XK_Return || key == XK_KP_Enter) {
+        execute_run_command(wm);
+        return;
+    }
+    if (key == XK_BackSpace) {
+        if (dialog->command_length > 0U) {
+            --dialog->command_length;
+            dialog->command[dialog->command_length] = '\0';
+        }
+        dialog->status[0] = '\0';
+        draw_run_dialog(wm);
+        return;
+    }
+    {
+        char input[32];
+        KeySym translated;
+        int length = XLookupString(event, input, (int)sizeof(input),
+                                   &translated, NULL);
+        int index;
+
+        for (index = 0; index < length; ++index) {
+            unsigned char character = (unsigned char)input[index];
+
+            if (character < 32U || character == 127U ||
+                dialog->command_length + 1U >= sizeof(dialog->command))
+                continue;
+            dialog->command[dialog->command_length++] = (char)character;
+            dialog->command[dialog->command_length] = '\0';
+        }
+        if (length > 0) {
+            dialog->status[0] = '\0';
+            draw_run_dialog(wm);
+        }
+    }
+}
+
 static void handle_key_press(WindowManager *wm, XKeyEvent *event)
 {
     KeySym key = XLookupKeysym(event, 0);
+
+    if (wm->session_confirmation.visible) {
+        if (event->send_event) {
+            refocus_session_confirmation(wm, event->time);
+            return;
+        }
+        if (handle_session_confirmation_key(wm, key, event->state,
+                                            event->time))
+            return;
+    }
+    if (wm->drag.kind != DRAG_NONE) {
+        if (key == XK_Escape)
+            cancel_drag_and_restore(wm, event->time);
+        return;
+    }
+    if (wm->desktop_menu.visible &&
+        handle_desktop_menu_key(wm, key, event->time))
+        return;
+    if (key == XK_r && key_event_has_super(wm, event)) {
+        show_run_dialog(wm);
+        return;
+    }
+
+    if (event->window == wm->run_dialog.window) {
+        handle_run_key(wm, event, key);
+        return;
+    }
 
     if (event->window == wm->control_panel.window) {
         if ((event->state & Mod1Mask) != 0U && key == XK_F2) {
@@ -4267,6 +7687,9 @@ static void handle_key_press(WindowManager *wm, XKeyEvent *event)
         }
         if (key == XK_Left && wm->control_panel.section > 0) {
             --wm->control_panel.section;
+            wm->settings.control_panel_section =
+                (Win31xControlPanelSection)wm->control_panel.section;
+            save_settings(wm);
             clear_control_password(&wm->control_panel);
             if (wm->control_panel.section == CONTROL_SECTION_WIFI)
                 start_wifi_scan(wm);
@@ -4276,6 +7699,9 @@ static void handle_key_press(WindowManager *wm, XKeyEvent *event)
         } else if (key == XK_Right &&
                    wm->control_panel.section + 1 < CONTROL_SECTION_COUNT) {
             ++wm->control_panel.section;
+            wm->settings.control_panel_section =
+                (Win31xControlPanelSection)wm->control_panel.section;
+            save_settings(wm);
             clear_control_password(&wm->control_panel);
             draw_control_panel(wm);
             return;
@@ -4361,14 +7787,134 @@ static void update_client_title(WindowManager *wm, Client *client)
         draw_desktop_icon(wm, client->icon);
 }
 
+static bool restore_late_client_identity(WindowManager *wm, Client *client,
+                                         bool preserve_initial_maximize)
+{
+    const Win31xDesktopClientRecord *record;
+    ClientLayout saved_layout;
+    ClientLayout saved_layout_before_maximize;
+    size_t monitor_index = 0U;
+
+    if (!client->state_persistable || client->state_identity == NULL)
+        return false;
+    record = win31x_desktop_state_find_client(&wm->desktop_state,
+                                               client->state_identity);
+    if (record == NULL || !record->placement.valid)
+        return false;
+
+    if (preserve_initial_maximize &&
+        client->layout == CLIENT_LAYOUT_MAXIMIZED) {
+        int current_x = client->x;
+        int current_y = client->y;
+        int current_width = client->width;
+        int current_height = client->height;
+        MonitorAnchor current_monitor = client->layout_monitor;
+
+        client->layout = CLIENT_LAYOUT_NORMAL;
+        client->layout_monitor.valid = false;
+        client->state_restored = false;
+        saved_layout = restore_client_placement(wm, client, &monitor_index);
+        saved_layout_before_maximize = client->layout_before_maximize;
+        if (!client->state_restored) {
+            client->x = current_x;
+            client->y = current_y;
+            client->width = current_width;
+            client->height = current_height;
+            client->layout = CLIENT_LAYOUT_MAXIMIZED;
+            client->layout_monitor = current_monitor;
+            return false;
+        }
+        client->restore_x = client->x;
+        client->restore_y = client->y;
+        client->restore_width = client->width;
+        client->restore_height = client->height;
+        client->restore_valid = true;
+        /* Match manage_window(): keep the application's maximize request, but
+         * anchor it to the now-known saved monitor and restore target. */
+        client->layout = CLIENT_LAYOUT_MAXIMIZED;
+        client->layout_before_maximize =
+            saved_layout == CLIENT_LAYOUT_MAXIMIZED
+                ? saved_layout_before_maximize
+                : saved_layout;
+        set_monitor_anchor(&client->layout_monitor,
+                           monitor_at(wm, monitor_index));
+        reapply_client_layout(wm, client);
+        return true;
+    }
+
+    normalize_client_layout(wm, client);
+    client->layout_before_maximize = CLIENT_LAYOUT_NORMAL;
+    client->restore_valid = false;
+    client->layout_monitor.valid = false;
+    client->state_restored = false;
+    saved_layout = restore_client_placement(wm, client, &monitor_index);
+    saved_layout_before_maximize = client->layout_before_maximize;
+    if (!client->state_restored)
+        return false;
+    if (saved_layout != CLIENT_LAYOUT_NORMAL) {
+        set_monitor_anchor(&client->layout_monitor,
+                           monitor_at(wm, monitor_index));
+        set_client_layout(wm, client, saved_layout);
+        if (saved_layout == CLIENT_LAYOUT_MAXIMIZED)
+            client->layout_before_maximize = saved_layout_before_maximize;
+    } else {
+        set_maximized_state(wm, client, false);
+        apply_client_geometry(wm, client);
+        send_configure_notify(wm, client);
+    }
+    return true;
+}
+
 static void update_client_class(WindowManager *wm, Client *client)
 {
     char *class_name = window_class(wm, client->window);
+    char *base_identity = window_state_identity(wm, client->window);
 
-    if (class_name == NULL)
+    if (class_name == NULL) {
+        free(base_identity);
         return;
+    }
     free(client->class_name);
     client->class_name = class_name;
+    if (base_identity != NULL) {
+        bool identity_changed = client->state_base_identity == NULL ||
+                                strcmp(client->state_base_identity,
+                                       base_identity) != 0;
+        bool identity_ready = !identity_changed;
+
+        if (identity_changed) {
+            char *identity;
+            unsigned int instance = 0U;
+
+            identity = client_state_identity(wm, client, base_identity,
+                                             &instance);
+            if (identity != NULL) {
+                free(client->state_base_identity);
+                free(client->state_identity);
+                client->state_base_identity = base_identity;
+                client->state_identity = identity;
+                client->state_instance = instance;
+                base_identity = NULL;
+                identity_ready = true;
+            }
+        }
+        free(base_identity);
+        client->state_persistable = identity_ready &&
+                                    client->transient_for == None &&
+                                    client->state_identity != NULL &&
+                                    client->state_identity[0] != '\0';
+        client->state_restored = false;
+        if (identity_ready &&
+            !(identity_changed &&
+              restore_late_client_identity(
+                  wm, client, client->initial_maximize_precedence))) {
+            if (identity_changed)
+                client->state_monitor_fallback = false;
+            capture_client_placement(wm, client, false);
+        }
+        if (identity_changed)
+            client->initial_maximize_precedence = false;
+    }
     draw_frame(wm, client);
     if (client->icon != NULL)
         draw_desktop_icon(wm, client->icon);
@@ -4415,27 +7961,36 @@ static void handle_client_message(WindowManager *wm, XClientMessageEvent *event)
                 set_client_layout(wm, client, CLIENT_LAYOUT_MAXIMIZED);
             else if ((action == 0 || action == 2) && maximized)
                 set_client_layout(wm, client, CLIENT_LAYOUT_NORMAL);
+            capture_client_placement(wm, client, true);
         }
     }
 }
 
-static void handle_root_resize(WindowManager *wm, int width, int height)
+static void publish_root_workarea(WindowManager *wm)
 {
-    long workarea[4];
-    Client *client;
+    long workarea[4] = {0, 0, wm->screen_width, wm->screen_height};
 
-    wm->screen_width = width;
-    wm->screen_height = height;
-    workarea[0] = 0;
-    workarea[1] = 0;
-    workarea[2] = wm->screen_width;
-    workarea[3] = wm->screen_height;
     XChangeProperty(wm->display, wm->root, wm->atoms.net_workarea, XA_CARDINAL,
                     32, PropModeReplace, (unsigned char *)workarea, 4);
+}
+
+static void reflow_monitor_layout(WindowManager *wm)
+{
+    Client *client;
+
+    cancel_drag(wm, CurrentTime);
+    dismiss_desktop_menu(wm);
+    if (wm->active_monitor.valid)
+        set_active_monitor(
+            wm, monitor_index_for_anchor(wm, &wm->active_monitor));
+    else
+        set_active_monitor(wm, pointer_monitor_index(wm));
     for (client = wm->clients; client != NULL; client = client->next) {
         int old_x = client->x;
         int old_y = client->y;
 
+        if (reflow_client_to_saved_placement(wm, client))
+            continue;
         if (client->layout != CLIENT_LAYOUT_NORMAL) {
             reapply_client_layout(wm, client);
             continue;
@@ -4447,6 +8002,10 @@ static void handle_root_resize(WindowManager *wm, int width, int height)
         }
     }
     reposition_icons(wm);
+    if (wm->desktop_state.launcher.valid &&
+        (ClientLayout)wm->desktop_state.launcher.layout ==
+            wm->launcher_layout)
+        restore_launcher_placement(wm);
     if (wm->launcher_visible) {
         if (wm->launcher_layout == CLIENT_LAYOUT_NORMAL) {
             clamp_internal_geometry(wm, &wm->launcher_x, &wm->launcher_y,
@@ -4461,6 +8020,10 @@ static void handle_root_resize(WindowManager *wm, int width, int height)
             apply_launcher_layout(wm, wm->launcher_layout);
         }
     }
+    if (wm->desktop_state.control_panel.valid &&
+        (ClientLayout)wm->desktop_state.control_panel.layout ==
+            wm->control_panel.layout)
+        restore_control_panel_placement(wm);
     if (wm->control_panel.visible) {
         if (wm->control_panel.layout == CLIENT_LAYOUT_NORMAL) {
             ControlPanel *panel = &wm->control_panel;
@@ -4477,6 +8040,54 @@ static void handle_root_resize(WindowManager *wm, int width, int height)
             apply_control_panel_layout(wm, wm->control_panel.layout);
         }
     }
+    if (wm->desktop_state.run_dialog.valid)
+        restore_run_dialog_placement(wm);
+    if (wm->run_dialog.visible) {
+        if (!wm->desktop_state.run_dialog.valid)
+            position_run_dialog(wm);
+        else
+            XMoveResizeWindow(wm->display, wm->run_dialog.window,
+                              wm->run_dialog.x, wm->run_dialog.y,
+                              (unsigned)wm->run_dialog.width,
+                              (unsigned)wm->run_dialog.height);
+        draw_run_dialog(wm);
+    }
+    if (wm->session_confirmation.visible) {
+        position_session_confirmation(wm);
+        draw_session_confirmation(wm);
+        refocus_session_confirmation(wm, CurrentTime);
+    }
+}
+
+static void handle_root_layout_change(WindowManager *wm, int width, int height)
+{
+    bool size_changed = false;
+    bool monitors_changed;
+
+    if (width > 0 && height > 0 &&
+        (width != wm->screen_width || height != wm->screen_height)) {
+        wm->screen_width = width;
+        wm->screen_height = height;
+        size_changed = true;
+        publish_root_workarea(wm);
+    }
+    monitors_changed = refresh_monitor_layout(wm);
+    if (size_changed || monitors_changed)
+        reflow_monitor_layout(wm);
+}
+
+static void handle_randr_event(WindowManager *wm, XEvent *event)
+{
+    XWindowAttributes attributes;
+
+    if (!wm->randr_available)
+        return;
+    if (event->type == wm->randr_event_base + RRScreenChangeNotify)
+        (void)XRRUpdateConfiguration(event);
+    if (XGetWindowAttributes(wm->display, wm->root, &attributes))
+        handle_root_layout_change(wm, attributes.width, attributes.height);
+    else
+        handle_root_layout_change(wm, wm->screen_width, wm->screen_height);
 }
 
 static void dispatch_event(WindowManager *wm, XEvent *event)
@@ -4484,8 +8095,16 @@ static void dispatch_event(WindowManager *wm, XEvent *event)
     Client *client;
     DesktopIcon *icon;
 
+    if (wm->randr_available &&
+        (event->type == wm->randr_event_base + RRScreenChangeNotify ||
+         event->type == wm->randr_event_base + RRNotify)) {
+        handle_randr_event(wm, event);
+        return;
+    }
+
     switch (event->type) {
     case MapRequest:
+        dismiss_desktop_menu(wm);
         XGrabServer(wm->display);
         client = client_for_client_window(wm, event->xmaprequest.window);
         if (client == NULL) {
@@ -4548,6 +8167,13 @@ static void dispatch_event(WindowManager *wm, XEvent *event)
             draw_launcher(wm);
         else if (event->xexpose.window == wm->control_panel.window)
             draw_control_panel(wm);
+        else if (event->xexpose.window == wm->run_dialog.window)
+            draw_run_dialog(wm);
+        else if (event->xexpose.window == wm->desktop_menu.window)
+            draw_desktop_menu(wm);
+        else if (event->xexpose.window ==
+                 wm->session_confirmation.window)
+            draw_session_confirmation(wm);
         else {
             icon = icon_for_window(wm, event->xexpose.window);
             if (icon != NULL)
@@ -4558,6 +8184,18 @@ static void dispatch_event(WindowManager *wm, XEvent *event)
         handle_button_press(wm, &event->xbutton);
         break;
     case ButtonRelease:
+        if (wm->session_confirmation.visible) {
+            if (event->xbutton.send_event)
+                refocus_session_confirmation(wm, event->xbutton.time);
+            else
+                handle_session_confirmation_button_release(
+                    wm, &event->xbutton);
+            break;
+        }
+        if (wm->desktop_menu.visible) {
+            handle_desktop_menu_button_release(wm, &event->xbutton);
+            break;
+        }
         if (wm->drag.kind != DRAG_NONE)
             finish_drag(wm, &event->xbutton);
         break;
@@ -4577,16 +8215,39 @@ static void dispatch_event(WindowManager *wm, XEvent *event)
              event->xproperty.atom == wm->atoms.net_wm_name ||
              event->xproperty.atom == wm->atoms.net_wm_icon_name))
             update_client_title(wm, client);
-        else if (client != NULL && event->xproperty.atom == XA_WM_CLASS)
+        else if (client != NULL &&
+                 (event->xproperty.atom == XA_WM_CLASS ||
+                  event->xproperty.atom == wm->atoms.gtk_application_id ||
+                  event->xproperty.atom == wm->atoms.net_wm_desktop_file ||
+                  event->xproperty.atom == wm->atoms.wm_window_role))
             update_client_class(wm, client);
+        else if (client != NULL &&
+                 event->xproperty.atom == wm->atoms.net_wm_icon)
+            refresh_client_icon(wm, client);
         else if (client != NULL &&
                  event->xproperty.atom == XA_WM_NORMAL_HINTS)
             handle_normal_hints_change(wm, client);
         else if (client != NULL &&
-                 event->xproperty.atom == XA_WM_TRANSIENT_FOR)
+                 event->xproperty.atom == XA_WM_TRANSIENT_FOR) {
+            bool was_persistable = client->state_persistable;
+
             refresh_client_transient_for(wm, client);
+            client->state_persistable =
+                client->transient_for == None &&
+                client->state_identity != NULL &&
+                client->state_identity[0] != '\0';
+            if (!was_persistable && client->state_persistable) {
+                client->state_monitor_fallback = false;
+                capture_client_placement(wm, client, false);
+            }
+        }
         break;
     case FocusIn:
+        if (wm->session_confirmation.visible) {
+            if (event->xfocus.window != wm->session_confirmation.window)
+                refocus_session_confirmation(wm, CurrentTime);
+            break;
+        }
         client = client_for_client_window(wm, event->xfocus.window);
         if (client != NULL && !client->minimized &&
             !event->xfocus.send_event && event->xfocus.mode != NotifyGrab &&
@@ -4600,12 +8261,15 @@ static void dispatch_event(WindowManager *wm, XEvent *event)
                 wm->internal_focus != INTERNAL_FOCUS_NONE;
 
             wm->internal_focus = INTERNAL_FOCUS_NONE;
+            set_active_monitor_from_client(wm, client);
             change_active_client(wm, client, true);
             if (leaving_internal) {
                 if (wm->launcher_visible)
                     draw_launcher(wm);
                 if (wm->control_panel.visible)
                     draw_control_panel(wm);
+                if (wm->run_dialog.visible)
+                    draw_run_dialog(wm);
             }
         }
         break;
@@ -4613,11 +8277,33 @@ static void dispatch_event(WindowManager *wm, XEvent *event)
         handle_client_message(wm, &event->xclient);
         break;
     case ConfigureNotify:
-        if (event->xconfigure.window == wm->root &&
-            (event->xconfigure.width != wm->screen_width ||
-             event->xconfigure.height != wm->screen_height))
-            handle_root_resize(wm, event->xconfigure.width,
-                                event->xconfigure.height);
+        if (event->xconfigure.window == wm->root)
+            handle_root_layout_change(wm, event->xconfigure.width,
+                                      event->xconfigure.height);
+        else if (wm->session_confirmation.visible &&
+                 event->xconfigure.event == wm->root &&
+                 event->xconfigure.window !=
+                     wm->session_confirmation.window &&
+                 event->xconfigure.window !=
+                     wm->session_confirmation.shield) {
+            if (session_confirmation_should_yield_to_window(
+                    wm, event->xconfigure.window))
+                dismiss_session_confirmation(wm, false, CurrentTime);
+            else
+                refocus_session_confirmation(wm, CurrentTime);
+        }
+        break;
+    case MapNotify:
+        if (wm->session_confirmation.visible &&
+            event->xmap.event == wm->root &&
+            event->xmap.window != wm->session_confirmation.window &&
+            event->xmap.window != wm->session_confirmation.shield) {
+            if (session_confirmation_should_yield_to_window(
+                    wm, event->xmap.window))
+                dismiss_session_confirmation(wm, false, CurrentTime);
+            else
+                refocus_session_confirmation(wm, CurrentTime);
+        }
         break;
     case MappingNotify:
         XRefreshKeyboardMapping(&event->xmapping);
@@ -4654,11 +8340,33 @@ static int initialize_window_manager(WindowManager *wm, const char *display_name
     wm->root = RootWindow(wm->display, wm->screen);
     wm->screen_width = DisplayWidth(wm->display, wm->screen);
     wm->screen_height = DisplayHeight(wm->display, wm->screen);
+    wm->randr_major = 1;
+    wm->randr_minor = 5;
+    if (XRRQueryExtension(wm->display, &wm->randr_event_base,
+                          &wm->randr_error_base) &&
+        XRRQueryVersion(wm->display, &wm->randr_major,
+                        &wm->randr_minor) &&
+        (wm->randr_major > 1 ||
+         (wm->randr_major == 1 && wm->randr_minor >= 5))) {
+        wm->randr_available = true;
+        XRRSelectInput(wm->display, wm->root,
+                       RRScreenChangeNotifyMask | RRCrtcChangeNotifyMask |
+                           RROutputChangeNotifyMask |
+                           RRProviderChangeNotifyMask |
+                           RRResourceChangeNotifyMask);
+    }
+    (void)refresh_monitor_layout(wm);
+    set_active_monitor(wm, pointer_monitor_index(wm));
     initialize_atoms(wm);
     if (win31x_settings_load(&wm->settings) < 0) {
         fprintf(stderr, "win31x: could not load settings: %s\n",
                 strerror(errno));
         win31x_settings_defaults(&wm->settings);
+    }
+    if (win31x_desktop_state_load(&wm->desktop_state) < 0) {
+        fprintf(stderr, "win31x: could not load desktop layout: %s\n",
+                strerror(errno));
+        win31x_desktop_state_defaults(&wm->desktop_state);
     }
     initialize_theme(wm);
     wm->font = XLoadQueryFont(wm->display, "-misc-fixed-*-*-*-*-13-*-*-*-*-*-*-*");
@@ -4679,7 +8387,8 @@ static int initialize_window_manager(WindowManager *wm, const char *display_name
     XSetErrorHandler(startup_error_handler);
     XSelectInput(wm->display, wm->root,
                  SubstructureRedirectMask | SubstructureNotifyMask |
-                 PropertyChangeMask | StructureNotifyMask | KeyPressMask);
+                 PropertyChangeMask | StructureNotifyMask | KeyPressMask |
+                 ButtonPressMask);
     XSync(wm->display, False);
     if (startup_bad_access) {
         fprintf(stderr, "win31x: another window manager is already running\n");
@@ -4735,10 +8444,18 @@ static int initialize_window_manager(WindowManager *wm, const char *display_name
         fprintf(stderr, "win31x: auto lock is unavailable: %s\n",
                 wm->auto_lock.status);
     }
+    if (win31x_session_actions_init(&wm->session_actions) < 0) {
+        fprintf(stderr, "win31x: restart and shut down are unavailable: %s\n",
+                wm->session_actions.status);
+    }
 
     adopt_existing_windows(wm);
     initialize_launcher(wm);
     initialize_control_panel(wm);
+    initialize_run_dialog(wm);
+    initialize_desktop_menu(wm);
+    initialize_session_confirmation(wm);
+    initialize_drag_outline(wm);
     wm->applications_icon = create_desktop_icon(wm, ICON_APPLICATIONS, NULL);
     wm->control_panel_icon =
         create_desktop_icon(wm, ICON_CONTROL_PANEL, NULL);
@@ -4759,6 +8476,8 @@ static void reap_children(WindowManager *wm)
                 &wm->wifi, pid, wait_status);
             bool lock_handled = win31x_auto_lock_handle_child_exit(
                 &wm->auto_lock, pid, wait_status);
+            bool session_handled = win31x_session_actions_handle_child_exit(
+                &wm->session_actions, pid, wait_status);
 
             if (wifi_handled && wm->control_panel.visible &&
                 wm->control_panel.section == CONTROL_SECTION_WIFI) {
@@ -4768,6 +8487,13 @@ static void reap_children(WindowManager *wm)
             if (lock_handled && wm->control_panel.visible &&
                 wm->control_panel.section == CONTROL_SECTION_AUTO_LOCK)
                 draw_control_panel(wm);
+            if ((lock_handled || session_handled) &&
+                wm->desktop_menu.visible)
+                draw_desktop_menu(wm);
+            if (session_handled &&
+                (!WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0))
+                fprintf(stderr, "win31x: %s\n",
+                        wm->session_actions.status);
             continue;
         }
         if (pid < 0 && errno == EINTR)
@@ -4805,8 +8531,14 @@ static void run_event_loop(WindowManager *wm)
     int connection = ConnectionNumber(wm->display);
 
     while (keep_running) {
+        flush_desktop_state(wm, false);
+        if (child_changed)
+            reap_children(wm);
         while (keep_running && XPending(wm->display) > 0) {
             XEvent event;
+
+            if (child_changed)
+                reap_children(wm);
             XNextEvent(wm->display, &event);
             dispatch_event(wm, &event);
         }
@@ -4827,22 +8559,42 @@ static void run_event_loop(WindowManager *wm)
             if (selected < 0 && errno != EINTR)
                 break;
             service_wifi_backend(wm, selected >= 0 ? &read_set : NULL);
+            flush_desktop_state(wm, false);
         }
     }
 }
 
 static void shut_down(WindowManager *wm)
 {
+    size_t index;
+
+    flush_desktop_state(wm, true);
+    cancel_drag(wm, CurrentTime);
+    dismiss_session_confirmation(wm, false, CurrentTime);
+    dismiss_desktop_menu(wm);
     wifi_backend_destroy(&wm->wifi);
     win31x_auto_lock_shutdown(&wm->auto_lock);
     while (wm->clients != NULL)
         remove_client(wm, wm->clients, false, true, false);
     while (wm->icons != NULL)
         destroy_desktop_icon(wm, wm->icons);
+    free_application_icons(wm);
     apps_free(&wm->applications);
     clear_control_password(&wm->control_panel);
     if (wm->control_panel.window != None)
         XDestroyWindow(wm->display, wm->control_panel.window);
+    if (wm->run_dialog.window != None)
+        XDestroyWindow(wm->display, wm->run_dialog.window);
+    if (wm->desktop_menu.window != None)
+        XDestroyWindow(wm->display, wm->desktop_menu.window);
+    if (wm->session_confirmation.window != None)
+        XDestroyWindow(wm->display, wm->session_confirmation.window);
+    if (wm->session_confirmation.shield != None)
+        XDestroyWindow(wm->display, wm->session_confirmation.shield);
+    for (index = 0U; index < DRAG_OUTLINE_WINDOW_COUNT; ++index) {
+        if (wm->drag_outline[index] != None)
+            XDestroyWindow(wm->display, wm->drag_outline[index]);
+    }
     if (wm->launcher != None)
         XDestroyWindow(wm->display, wm->launcher);
     if (wm->support_window != None)

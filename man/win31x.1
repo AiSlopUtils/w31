@@ -1,4 +1,4 @@
-.TH WIN31X 1 "July 17, 2026" "win31x 0.1.0" "User Commands"
+.TH WIN31X 1 "July 18, 2026" "win31x 0.1.0" "User Commands"
 .SH NAME
 win31x \- a minimal Windows 3.1-inspired window manager for X11
 .SH SYNOPSIS
@@ -14,7 +14,19 @@ applications on the desktop as clickable icons, and provides an Applications
 desktop icon backed by installed freedesktop desktop entries.  A Control Panel
 desktop icon provides Wi-Fi, color-scheme, and automatic screen-lock settings.
 Managed applications have maximize/restore controls and can be snapped to the
-left or right half of the screen by dragging their title bar to that edge.
+left or right half of a monitor by dragging their title bar to that edge.
+Title-bar moves show a classic rubber-band outline and move the real window
+only when the pointer button is released, reducing repaint tearing under Xorg
+and QEMU.
+Application entries and minimized clients use their real program icons when a
+usable desktop-entry Icon or _NET_WM_ICON value is available.
+Applications and Control Panel icon positions, Applications, Control Panel,
+and Run geometry,
+managed application geometry, colors, and the selected Control Panel section
+are restored between logins.
+Right-clicking unused desktop space opens a session menu for locking, logging
+out, restarting, or shutting down.  Lock starts immediately; the other three
+actions require confirmation in a classic dialog.
 .SH OPTIONS
 .TP
 .BR --display " " DISPLAY
@@ -38,20 +50,49 @@ NetworkManager networks, connect to a selected open or personal WPA/SAE
 network, and disconnect the active network.  Colors applies one of five desktop
 and active-title schemes immediately.  Auto Lock can enable or disable idle
 locking, select a 1, 5, 10, 15, 30, 60, or 120 minute preset, or lock
-immediately.  Color and auto-lock changes are saved automatically.
+immediately.  Color, auto-lock, and the selected Control Panel section are
+saved automatically.
+.PP
+Drag the Applications or Control Panel desktop icon to reposition it on any
+monitor.  A press and release without dragging still opens it.  The icon's
+monitor-relative position is saved automatically.
 .PP
 Applications and Control Panel can remain open at the same time.  They stay
 mapped when another window takes focus or a new application starts; Escape does
 not close them.  Use the window's X button, or the standard Alt+F4 binding, to
 close the active one explicitly.  Their maximize/restore buttons and title-bar
-edge snapping work like those on managed applications.
+edge snapping work like those on managed applications and remain within the
+selected monitor.
+.PP
+Right-click unused desktop space to open the session menu, then click Lock,
+Log Out, Restart, or Shut Down.  The menu does not open over an application or
+desktop icon and does not change the active application.  Clicking elsewhere
+dismisses it.  Lock starts the configured screen locker immediately.  Log Out
+opens a classic confirmation dialog before ending Win31 X and therefore ending
+a normal display-manager session.  Restart and Shut Down likewise require
+confirmation before requesting the corresponding action from systemd.  No,
+the confirmation dialog's X button, Escape, or Alt+F4 returns to the desktop
+without acting.  No is selected by default; click Yes or press Y to confirm,
+or move between Yes and No with Left, Right, or Tab and press Enter.  An
+automatic full-screen locker cancels and replaces an open confirmation so the
+lock screen always takes priority.  Local login policy determines whether a
+confirmed power request is authorized.
+.PP
+Press Windows+R (Super+R) to open Run.  Enter an executable name or path and
+optional arguments, then press Enter or click Run.  Run executes that argument
+vector directly; shell operators, redirection, pipelines, and substitutions
+are treated as literal text rather than evaluated.  Escape, Cancel, the X
+button, or Alt+F4 closes Run without affecting Applications or Control Panel.
 .PP
 Use the underscore button in a title bar to minimize a window.  Its desktop
-icon restores it with one click.  Use the maximize/restore title-bar button to
-fill the screen and return to the window's previous geometry.  Drag a title bar
-to move a window, or release it at the left or right screen edge to snap it to
-that half of the screen.  Drag an outer border to resize it, and use the X
-button to request that it close.
+icon appears on that window's monitor and restores it with one click.  Use the
+maximize/restore title-bar button to fill the window's current monitor and
+return to the window's previous geometry.  Drag a title bar to move a window:
+while the pointer button is held, the actual window remains stationary and a
+thin rubber-band outline follows the pointer.  Releasing the button commits the
+move, or snaps the window to the left or right half of the monitor at that
+edge.  Drag an outer border to resize it, and use the X button to request that
+it close.
 Clicking any inactive application focuses and raises it; transient dialogs
 remain above their owning application.  The activating pointer press is also
 delivered to the application.
@@ -64,14 +105,18 @@ Focus and raise the next visible application.
 Open the Applications window.
 .TP
 .B Alt+F4
-Close the active application, Applications window, or Control Panel.
+Close the active application, Applications window, Control Panel, or Run.
+.TP
+.B Windows+R, Super+R
+Open and focus the Run dialog.
 .SH ENVIRONMENT
 .TP
 .B DISPLAY
 X server to use.
 .TP
 .B XDG_DATA_HOME, XDG_DATA_DIRS
-Locations searched for application desktop entries.
+Locations searched for application desktop entries and their hicolor or
+pixmaps PNG/XPM icons.
 .TP
 .B WIN31X_TERMINAL
 Executable used to launch desktop entries marked Terminal=true.  It must
@@ -96,8 +141,17 @@ Absolute path to the xss-lock executable.  The installed default is
 Absolute path to the screen-locker executable.  The installed default is
 .IR /usr/bin/xsecurelock .
 .TP
+.B WIN31X_SYSTEMCTL
+Absolute path to the systemctl executable used by the Restart and Shut Down
+desktop-menu actions.  If unset, Win31 X searches
+.IR /usr/bin/systemctl
+and
+.IR /bin/systemctl .
+The override is primarily useful for tests or nonstandard local installations;
+an invalid override disables both actions.
+.TP
 .B XDG_CONFIG_HOME, HOME
-Determine the location of the per-user Win31 X settings file.
+Determine the location of the per-user Win31 X settings and layout files.
 .SH FILES
 .TP
 .I /usr/share/applications/*.desktop
@@ -106,6 +160,9 @@ System application entries.
 .I ~/.local/share/applications/*.desktop
 Per-user application entries.
 .TP
+.I /usr/share/icons/hicolor/*/apps/*, /usr/share/pixmaps/*
+Usual locations for application-provided launcher icons.
+.TP
 .I /usr/share/win31x/icons/*.png
 User-supplied application icon assets installed with Win31 X.
 .TP
@@ -113,10 +170,20 @@ User-supplied application icon assets installed with Win31 X.
 Supplied Applications artwork used by display managers for the Win31 X session.
 .TP
 .I $XDG_CONFIG_HOME/win31x/settings.conf
-Private per-user color and auto-lock settings.  When
+Private per-user color, auto-lock, and Control Panel section settings.  When
 .B XDG_CONFIG_HOME
 is unset, the path is
 .IR ~/.config/win31x/settings.conf .
+.TP
+.I $XDG_CONFIG_HOME/win31x/layout.conf
+Private, versioned desktop-icon, internal-window, and managed-application
+geometry.  When
+.B XDG_CONFIG_HOME
+is unset, the path is
+.IR ~/.config/win31x/layout.conf .
+Managed windows are identified by application ID, desktop-file ID, or
+WM_CLASS, with WM_WINDOW_ROLE used when available.  Otherwise-identical
+concurrent windows use best-effort ordinal slots.
 .SH CONTROL PANEL SERVICES
 Wi-Fi requires NetworkManager and
 .BR nmcli (1).
@@ -138,13 +205,59 @@ asterisk for each entered character on both idle and immediate locks.  This
 confirms keyboard input but intentionally reveals password length.
 Authentication remains entirely within xsecurelock and PAM; Win31 X does not
 handle the lock-screen password.
+.SH SESSION ACTIONS
+Lock is immediate.  Log Out, Restart, and Shut Down display a classic
+confirmation dialog and do nothing until explicitly confirmed.  No, the X
+button, Escape, and Alt+F4 dismiss the dialog without changing the session.
+No is selected by default.  The confirmation uses a modal input shield without
+holding active X keyboard or pointer grabs, allowing the screen locker to take
+priority at an idle timeout.  Once
+confirmed, Restart and Shut Down execute the validated systemctl path directly
+with the single fixed argument
+.B reboot
+or
+.BR poweroff .
+No shell or sudo command is involved.  Confirmed Log Out exits the window
+manager cleanly.  The display manager and systemd/logind retain responsibility
+for session teardown and authorization of power operations.
+.SH MULTI-MONITOR BEHAVIOR
+Win31 X prefers RandR 1.5 logical-monitor information, falls back to Xinerama
+heads when RandR does not report a usable multi-monitor layout, and otherwise
+treats the root window as one monitor.
+.PP
+An action started with the pointer uses the monitor under its click or release.
+A keyboard action uses the monitor containing the focused Applications,
+Control Panel, Run, or managed-client window.  If none supplies that context,
+the last active monitor is retained, followed by pointer and primary-monitor
+fallbacks.  The permanent Applications and Control Panel desktop icons begin
+on the primary monitor, but can be dragged to another monitor and retain that
+monitor-relative position.  A minimized application's icon appears on the
+monitor where that client was minimized.
+.PP
+Maximize fills only the monitor containing the window.  Releasing a title bar
+at a monitor's left or right edge snaps the window to that monitor's
+corresponding half; restore returns its exact previous geometry.  Applications,
+Control Panel, and Run initially open centered on the active monitor; their
+saved geometry takes precedence on later logins.  The desktop menu
+is constrained to the monitor where it was opened, and its Log Out, Restart,
+or Shut Down confirmation is centered on that monitor.
+.PP
+RandR hotplug and screen-layout notifications refresh the monitor list.
+Maximized and snapped windows are reapplied, ordinary windows are kept
+reachable, and desktop icons, internal windows, Run, and an open confirmation
+are reflowed.  An item anchored to a disconnected monitor moves to the nearest
+surviving monitor, with the primary monitor as the final fallback.
+This automatic rescue does not overwrite the saved preferred monitor.
 .SH DISPLAY REQUIREMENTS
-The supplied-color icon renderer requires a TrueColor X visual.  Standard
-modern Xorg configurations provide one.
+Multi-monitor discovery uses the XRandR and Xinerama extensions as described
+above.  The supplied-color icon renderer requires a TrueColor X visual.
+Standard modern Xorg configurations provide one.
 .SH SEE ALSO
 .BR Xorg (1),
+.BR xrandr (1),
 .BR nmcli (1),
 .BR xss-lock (1),
 .BR xsecurelock (1),
+.BR systemctl (1),
 .BR startx (1),
 .BR xterm (1)

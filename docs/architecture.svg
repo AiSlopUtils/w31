@@ -1,39 +1,50 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="940" height="300" viewBox="0 0 940 300" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="460" viewBox="0 0 940 460" role="img" aria-labelledby="title desc">
   <title id="title">Win31 X architecture</title>
-  <desc id="desc">The Xorg root desktop connects Win31 X to framed application clients, minimized desktop icons, the application launcher, and a Control Panel backed by NetworkManager, settings, and the screen locker.</desc>
-  <rect width="940" height="300" fill="#008080"/>
+  <desc id="desc">The Xorg root desktop connects Win31 X to framed application clients, minimized desktop icons, the Applications and Run windows, a focus-preserving desktop session menu, and a Control Panel. Native application artwork enters through client _NET_WM_ICON properties and XDG desktop-entry Icon values. Restart and Shut Down use direct fixed systemctl arguments.</desc>
+  <rect width="940" height="460" fill="#008080"/>
   <g font-family="monospace" font-size="16" text-anchor="middle">
-    <rect x="25" y="100" width="170" height="88" fill="#c0c0c0" stroke="#fff" stroke-width="3"/>
-    <rect x="29" y="104" width="162" height="23" fill="#000080"/>
-    <text x="110" y="121" fill="#fff">Xorg root</text>
-    <text x="110" y="156" fill="#000">desktop + input</text>
-    <text x="110" y="177" fill="#000">event source</text>
+    <rect x="25" y="186" width="170" height="88" fill="#c0c0c0" stroke="#fff" stroke-width="3"/>
+    <rect x="29" y="190" width="162" height="23" fill="#000080"/>
+    <text x="110" y="207" fill="#fff">Xorg root</text>
+    <text x="110" y="242" fill="#000">desktop + input</text>
+    <text x="110" y="263" fill="#000">event source</text>
 
-    <rect x="245" y="50" width="210" height="194" fill="#c0c0c0" stroke="#fff" stroke-width="3"/>
-    <rect x="249" y="54" width="202" height="25" fill="#000080"/>
-    <text x="350" y="72" fill="#fff">Win31 X</text>
-    <text x="350" y="108" fill="#000">reparent + decorate</text>
-    <text x="350" y="134" fill="#000">focus + lifecycle</text>
-    <text x="350" y="160" fill="#000">ICCCM / EWMH</text>
-    <text x="350" y="186" fill="#000">desktop UI</text>
-    <text x="350" y="212" fill="#000">async services</text>
+    <rect x="245" y="115" width="210" height="230" fill="#c0c0c0" stroke="#fff" stroke-width="3"/>
+    <rect x="249" y="119" width="202" height="25" fill="#000080"/>
+    <text x="350" y="137" fill="#fff">Win31 X</text>
+    <text x="350" y="175" fill="#000">reparent + decorate</text>
+    <text x="350" y="201" fill="#000">focus + lifecycle</text>
+    <text x="350" y="227" fill="#000">ICCCM / EWMH</text>
+    <text x="350" y="253" fill="#000">native icon routing</text>
+    <text x="350" y="279" fill="#000">desktop UI</text>
+    <text x="350" y="305" fill="#000">async services</text>
 
-    <rect x="505" y="15" width="405" height="52" fill="#fff" stroke="#000" stroke-width="2"/>
-    <text x="707" y="47" fill="#000">framed X11 application clients</text>
-    <rect x="505" y="78" width="405" height="52" fill="#ffff00" stroke="#000" stroke-width="2"/>
-    <text x="707" y="110" fill="#000">clickable minimized-window icons</text>
-    <rect x="505" y="141" width="405" height="58" fill="#c0c0c0" stroke="#000" stroke-width="2"/>
-    <text x="707" y="165" fill="#000">Applications window</text>
-    <text x="707" y="187" fill="#000" font-size="13">XDG .desktop entries</text>
-    <rect x="505" y="210" width="405" height="72" fill="#c0c0c0" stroke="#000" stroke-width="2"/>
-    <text x="707" y="237" fill="#000">Control Panel</text>
-    <text x="707" y="260" fill="#000" font-size="13">nmcli · settings.conf · xss-lock</text>
+    <rect x="505" y="10" width="405" height="60" fill="#fff" stroke="#000" stroke-width="2"/>
+    <text x="707" y="34" fill="#000">framed X11 application clients</text>
+    <text x="707" y="56" fill="#000" font-size="13">_NET_WM_ICON → native client artwork</text>
+    <rect x="505" y="80" width="405" height="60" fill="#ffff00" stroke="#000" stroke-width="2"/>
+    <text x="707" y="104" fill="#000">clickable minimized-window icons</text>
+    <text x="707" y="126" fill="#000" font-size="13">client artwork or supplied fallback</text>
+    <rect x="505" y="150" width="405" height="68" fill="#c0c0c0" stroke="#000" stroke-width="2"/>
+    <text x="707" y="176" fill="#000">Applications window</text>
+    <text x="707" y="199" fill="#000" font-size="13">XDG .desktop + Icon= PNG/XPM</text>
+    <rect x="505" y="228" width="405" height="56" fill="#c0c0c0" stroke="#000" stroke-width="2"/>
+    <text x="707" y="251" fill="#000">Run window</text>
+    <text x="707" y="272" fill="#000" font-size="13">direct argv · no shell</text>
+    <rect x="505" y="294" width="405" height="66" fill="#c0c0c0" stroke="#000" stroke-width="2"/>
+    <text x="707" y="319" fill="#000">right-click desktop menu</text>
+    <text x="707" y="342" fill="#000" font-size="13">lock · logout · fixed systemctl argv</text>
+    <rect x="505" y="370" width="405" height="80" fill="#c0c0c0" stroke="#000" stroke-width="2"/>
+    <text x="707" y="400" fill="#000">Control Panel</text>
+    <text x="707" y="425" fill="#000" font-size="13">nmcli · settings.conf · xss-lock</text>
   </g>
   <g stroke="#fff" stroke-width="3" fill="none">
-    <path d="M195 144 H245"/>
-    <path d="M455 88 H480 V41 H505"/>
-    <path d="M455 120 H490 V104 H505"/>
-    <path d="M455 166 H505"/>
-    <path d="M455 210 H480 V246 H505"/>
+    <path d="M195 230 H245"/>
+    <path d="M455 147 H480 V40 H505"/>
+    <path d="M455 185 H490 V110 H505"/>
+    <path d="M455 231 H505"/>
+    <path d="M455 270 H490 V256 H505"/>
+    <path d="M455 309 H490 V327 H505"/>
+    <path d="M455 310 H480 V410 H505"/>
   </g>
 </svg>

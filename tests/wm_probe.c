@@ -21,8 +21,11 @@ static Atom maximized_horz_atom;
 static Atom maximized_vert_atom;
 static Atom role_atom;
 static Atom client_atom;
+static Atom net_wm_name_atom;
+static int held_button_one;
 
 static int wait_until_unmanaged(Window window);
+static void report_frame_geometry(const char *message, Window frame);
 
 enum {
     TEST_NET_WM_STATE_REMOVE = 0,
@@ -31,7 +34,15 @@ enum {
     TEST_TITLE_BUTTON_GAP = 3,
     TEST_TITLE_BUTTON_RIGHT_INSET = 2,
     TEST_INTERNAL_CLOSE_INSET = 6,
-    TEST_TITLE_BUTTON_Y = 4
+    TEST_TITLE_BUTTON_Y = 4,
+    TEST_SESSION_CONFIRM_BUTTON_WIDTH = 78,
+    TEST_SESSION_CONFIRM_BUTTON_HEIGHT = 26,
+    TEST_SESSION_CONFIRM_BUTTON_GAP = 8,
+    TEST_SESSION_CONFIRM_BUTTON_MARGIN = 13,
+    TEST_DRAG_OUTLINE_THICKNESS = 3,
+    TEST_DRAG_OUTLINE_COUNT = 4,
+    TEST_DESKTOP_ICON_WIDTH = 112,
+    TEST_DESKTOP_ICON_HEIGHT = 80
 };
 
 typedef struct {
@@ -40,6 +51,13 @@ typedef struct {
     int width;
     int height;
 } FrameGeometry;
+
+typedef struct {
+    Window window;
+    FrameGeometry geometry;
+    int override_redirect;
+    unsigned int stack_index;
+} DragOutlineWindow;
 
 static Window root_window_property(Atom property)
 {
@@ -261,6 +279,95 @@ static int wait_for_file(const char *path)
     return -1;
 }
 
+static int file_remains_absent(const char *path)
+{
+    int attempt;
+
+    if (path == NULL || path[0] == '\0')
+        return -1;
+    for (attempt = 0; attempt < 20; ++attempt) {
+        if (access(path, F_OK) == 0)
+            return -1;
+        wait_a_bit();
+    }
+    return 0;
+}
+
+static int window_string_property_matches(Window window, Atom property,
+                                          const char *expected)
+{
+    Atom type;
+    int format;
+    unsigned long count;
+    unsigned long after;
+    unsigned char *data = NULL;
+    int matches = 0;
+
+    if (expected != NULL &&
+        XGetWindowProperty(display, window, property, 0, 128, False,
+                           AnyPropertyType, &type, &format, &count, &after,
+                           &data) == Success &&
+        format == 8 && data != NULL && strlen(expected) == count &&
+        memcmp(data, expected, count) == 0)
+        matches = 1;
+    if (data != NULL)
+        XFree(data);
+    return matches;
+}
+
+static int wait_for_window_name(Window window, const char *expected)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 150; ++attempt) {
+        XSync(display, False);
+        if (window_string_property_matches(window, net_wm_name_atom,
+                                           expected))
+            return 0;
+        wait_a_bit();
+    }
+    return -1;
+}
+
+static int file_contents_equal(const char *path, const char *expected)
+{
+    FILE *file;
+    char buffer[64];
+    size_t expected_length;
+    size_t length;
+    int extra;
+
+    if (path == NULL || path[0] == '\0' || expected == NULL)
+        return 0;
+    expected_length = strlen(expected);
+    if (expected_length >= sizeof(buffer))
+        return 0;
+    file = fopen(path, "rb");
+    if (file == NULL)
+        return 0;
+    length = fread(buffer, 1, sizeof(buffer), file);
+    extra = fgetc(file);
+    if (ferror(file)) {
+        fclose(file);
+        return 0;
+    }
+    fclose(file);
+    return length == expected_length && extra == EOF &&
+           memcmp(buffer, expected, expected_length) == 0;
+}
+
+static int wait_for_file_contents(const char *path, const char *expected)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 150; ++attempt) {
+        if (file_contents_equal(path, expected))
+            return 0;
+        wait_a_bit();
+    }
+    return -1;
+}
+
 static int internal_window_is_hidden(Window window)
 {
     int attempt;
@@ -285,6 +392,35 @@ static int internal_window_remains_viewable(Window window)
         XSync(display, False);
         if (!XGetWindowAttributes(display, window, &attributes) ||
             attributes.map_state != IsViewable)
+            return 0;
+        wait_a_bit();
+    }
+    return 1;
+}
+
+static int internal_window_remains_unmapped(Window window)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 30; ++attempt) {
+        XWindowAttributes attributes;
+
+        XSync(display, False);
+        if (!XGetWindowAttributes(display, window, &attributes) ||
+            attributes.map_state != IsUnmapped)
+            return 0;
+        wait_a_bit();
+    }
+    return 1;
+}
+
+static int role_remains_unmapped(const char *role)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 30; ++attempt) {
+        XSync(display, False);
+        if (find_role(role, None, 1) != None)
             return 0;
         wait_a_bit();
     }
@@ -426,7 +562,7 @@ static int wait_for_active_and_above(Window client, Window frame,
     return -1;
 }
 
-static int fake_click_at(int x, int y)
+static int fake_button_at(unsigned int button, int x, int y)
 {
     int event_base;
     int error_base;
@@ -438,14 +574,271 @@ static int fake_click_at(int x, int y)
         fprintf(stderr, "wm-probe: XTEST extension is unavailable\n");
         return -1;
     }
-    if (!XTestFakeMotionEvent(display, DefaultScreen(display), x, y, CurrentTime) ||
-        !XTestFakeButtonEvent(display, Button1, True, CurrentTime) ||
-        !XTestFakeButtonEvent(display, Button1, False, CurrentTime)) {
-        fprintf(stderr, "wm-probe: could not inject a pointer click\n");
+    if (!XTestFakeMotionEvent(display, DefaultScreen(display), x, y,
+                              CurrentTime)) {
+        fprintf(stderr, "wm-probe: could not inject pointer button %u\n",
+                button);
+        return -1;
+    }
+    XSync(display, False);
+    wait_a_bit();
+    if (!XTestFakeButtonEvent(display, button, True, CurrentTime)) {
+        fprintf(stderr, "wm-probe: could not press pointer button %u\n",
+                button);
+        return -1;
+    }
+    XSync(display, False);
+    wait_a_bit();
+    if (!XTestFakeButtonEvent(display, button, False, CurrentTime)) {
+        fprintf(stderr, "wm-probe: could not release pointer button %u\n",
+                button);
         return -1;
     }
     XFlush(display);
     return 0;
+}
+
+static int fake_click_at(int x, int y)
+{
+    return fake_button_at(Button1, x, y);
+}
+
+static int window_center_on_root(Window window, int *root_x, int *root_y)
+{
+    XWindowAttributes attributes;
+    Window child = None;
+
+    if (root_x == NULL || root_y == NULL ||
+        !XGetWindowAttributes(display, window, &attributes) ||
+        !XTranslateCoordinates(display, window, root,
+                               attributes.width / 2, attributes.height / 2,
+                               root_x, root_y, &child))
+        return -1;
+    return 0;
+}
+
+static int find_bare_root_near_bottom_right(int *root_x, int *root_y)
+{
+    int screen = DefaultScreen(display);
+    int width = DisplayWidth(display, screen);
+    int height = DisplayHeight(display, screen);
+    int minimum_x = width > 208 ? width - 208 : 0;
+    int minimum_y = height > 128 ? height - 128 : 0;
+    int y;
+
+    if (root_x == NULL || root_y == NULL || width < 1 || height < 1)
+        return -1;
+    for (y = height - 1; y >= minimum_y; y -= 8) {
+        int x;
+
+        for (x = width - 1; x >= minimum_x; x -= 8) {
+            Window root_return = None;
+            Window child_return = None;
+            int query_root_x;
+            int query_root_y;
+            int window_x;
+            int window_y;
+            unsigned int mask;
+
+            if (!XTestFakeMotionEvent(display, screen, x, y, CurrentTime))
+                return -1;
+            XSync(display, False);
+            if (XQueryPointer(display, root, &root_return, &child_return,
+                              &query_root_x, &query_root_y, &window_x,
+                              &window_y, &mask) && child_return == None) {
+                *root_x = x;
+                *root_y = y;
+                return 0;
+            }
+        }
+    }
+    fprintf(stderr,
+            "wm-probe: no bare desktop point was available near the bottom-right corner\n");
+    return -1;
+}
+
+static int fake_key_chord(KeySym modifier, KeySym key)
+{
+    KeyCode modifier_code = XKeysymToKeycode(display, modifier);
+    KeyCode key_code = XKeysymToKeycode(display, key);
+
+    if (modifier_code == 0 || key_code == 0 ||
+        !XTestFakeKeyEvent(display, modifier_code, True, CurrentTime) ||
+        !XTestFakeKeyEvent(display, key_code, True, CurrentTime) ||
+        !XTestFakeKeyEvent(display, key_code, False, CurrentTime) ||
+        !XTestFakeKeyEvent(display, modifier_code, False, CurrentTime)) {
+        fprintf(stderr, "wm-probe: could not inject keyboard chord\n");
+        return -1;
+    }
+    XFlush(display);
+    return 0;
+}
+
+static int fake_key(KeySym key)
+{
+    KeyCode code = XKeysymToKeycode(display, key);
+
+    if (code == 0 ||
+        !XTestFakeKeyEvent(display, code, True, CurrentTime)) {
+        fprintf(stderr, "wm-probe: could not inject keyboard key\n");
+        return -1;
+    }
+    XSync(display, False);
+    wait_a_bit();
+    if (!XTestFakeKeyEvent(display, code, False, CurrentTime)) {
+        fprintf(stderr, "wm-probe: could not release keyboard key\n");
+        return -1;
+    }
+    XSync(display, False);
+    wait_a_bit();
+    return 0;
+}
+
+static int fake_toggle_key(KeySym key)
+{
+    KeyCode code = XKeysymToKeycode(display, key);
+
+    if (code == 0)
+        return 1;
+    if (!XTestFakeKeyEvent(display, code, True, CurrentTime) ||
+        !XTestFakeKeyEvent(display, code, False, CurrentTime))
+        return -1;
+    XFlush(display);
+    return 0;
+}
+
+static unsigned int modifier_mask_for_keysym(KeySym symbol)
+{
+    KeyCode code = XKeysymToKeycode(display, symbol);
+    XModifierKeymap *mapping;
+    unsigned int mask = 0U;
+    int modifier;
+    int index;
+
+    if (code == 0)
+        return 0U;
+    mapping = XGetModifierMapping(display);
+    if (mapping == NULL)
+        return 0U;
+    for (modifier = 0; modifier < 8; ++modifier) {
+        for (index = 0; index < mapping->max_keypermod; ++index) {
+            if (mapping->modifiermap[
+                    modifier * mapping->max_keypermod + index] == code) {
+                mask = 1U << modifier;
+                break;
+            }
+        }
+        if (mask != 0U)
+            break;
+    }
+    XFreeModifiermap(mapping);
+    return mask;
+}
+
+static int begin_held_drag_at(int x, int y)
+{
+    int event_base;
+    int error_base;
+    int major_version;
+    int minor_version;
+
+    if (held_button_one) {
+        fprintf(stderr, "wm-probe: attempted to nest pointer drags\n");
+        return -1;
+    }
+    if (!XTestQueryExtension(display, &event_base, &error_base,
+                             &major_version, &minor_version)) {
+        fprintf(stderr, "wm-probe: XTEST extension is unavailable\n");
+        return -1;
+    }
+    if (!XTestFakeMotionEvent(display, DefaultScreen(display), x, y,
+                              CurrentTime)) {
+        fprintf(stderr, "wm-probe: could not position a held drag pointer\n");
+        return -1;
+    }
+    XSync(display, False);
+    wait_a_bit();
+    if (!XTestFakeButtonEvent(display, Button1, True, CurrentTime)) {
+        fprintf(stderr, "wm-probe: could not begin a held pointer drag\n");
+        return -1;
+    }
+    held_button_one = 1;
+    XSync(display, False);
+    wait_a_bit();
+    return 0;
+}
+
+static int move_held_drag_to(int x, int y)
+{
+    if (!held_button_one ||
+        !XTestFakeMotionEvent(display, DefaultScreen(display), x, y,
+                              CurrentTime)) {
+        fprintf(stderr, "wm-probe: could not move a held pointer drag\n");
+        return -1;
+    }
+    XSync(display, False);
+    return 0;
+}
+
+static int release_held_drag(void)
+{
+    if (!held_button_one) {
+        fprintf(stderr, "wm-probe: no held pointer drag was active\n");
+        return -1;
+    }
+    if (!XTestFakeButtonEvent(display, Button1, False, CurrentTime)) {
+        fprintf(stderr, "wm-probe: could not release a held pointer drag\n");
+        return -1;
+    }
+    held_button_one = 0;
+    XSync(display, False);
+    return 0;
+}
+
+static void abort_held_drag(void)
+{
+    if (!held_button_one)
+        return;
+    if (XTestFakeButtonEvent(display, Button1, False, CurrentTime))
+        held_button_one = 0;
+    XSync(display, False);
+}
+
+static int wait_for_pointer_available(void)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 150; ++attempt) {
+        int status = XGrabPointer(display, root, False, NoEventMask,
+                                  GrabModeAsync, GrabModeAsync, None, None,
+                                  CurrentTime);
+
+        if (status == GrabSuccess) {
+            XUngrabPointer(display, CurrentTime);
+            XSync(display, False);
+            return 0;
+        }
+        wait_a_bit();
+    }
+    return -1;
+}
+
+static int wait_for_keyboard_available(void)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 150; ++attempt) {
+        int status = XGrabKeyboard(display, root, False, GrabModeAsync,
+                                   GrabModeAsync, CurrentTime);
+
+        if (status == GrabSuccess) {
+            XUngrabKeyboard(display, CurrentTime);
+            XSync(display, False);
+            return 0;
+        }
+        wait_a_bit();
+    }
+    return -1;
 }
 
 static int fake_drag_at(int start_x, int start_y, int end_x, int end_y)
@@ -536,6 +929,91 @@ static int frame_geometry_equals(const FrameGeometry *left,
            left->width == right->width && left->height == right->height;
 }
 
+static int frame_geometry_inside(const FrameGeometry *geometry,
+                                 const FrameGeometry *bounds)
+{
+    long long right;
+    long long bottom;
+    long long bounds_right;
+    long long bounds_bottom;
+
+    if (geometry == NULL || bounds == NULL || geometry->width < 1 ||
+        geometry->height < 1 || bounds->width < 1 || bounds->height < 1)
+        return 0;
+    right = (long long)geometry->x + geometry->width;
+    bottom = (long long)geometry->y + geometry->height;
+    bounds_right = (long long)bounds->x + bounds->width;
+    bounds_bottom = (long long)bounds->y + bounds->height;
+    return geometry->x >= bounds->x && geometry->y >= bounds->y &&
+           right <= bounds_right && bottom <= bounds_bottom;
+}
+
+static int wait_for_frame_inside(Window window,
+                                 const FrameGeometry *bounds)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 150; ++attempt) {
+        FrameGeometry actual;
+
+        XSync(display, False);
+        if (get_frame_geometry(window, &actual) == 0 &&
+            frame_geometry_inside(&actual, bounds))
+            return 0;
+        wait_a_bit();
+    }
+    return -1;
+}
+
+static int move_pointer_to(int x, int y)
+{
+    if (!XTestFakeMotionEvent(display, DefaultScreen(display), x, y,
+                              CurrentTime))
+        return -1;
+    XSync(display, False);
+    wait_a_bit();
+    return 0;
+}
+
+static int wait_for_pointer_root_child(Window expected)
+{
+    Window root_return = None;
+    Window child_return = None;
+    int root_x;
+    int root_y;
+    int window_x;
+    int window_y;
+    unsigned int mask;
+    int attempt;
+
+    for (attempt = 0; attempt < 150; ++attempt) {
+        XSync(display, False);
+        if (XQueryPointer(display, root, &root_return, &child_return,
+                          &root_x, &root_y, &window_x, &window_y, &mask) &&
+            child_return == expected)
+            return 0;
+        wait_a_bit();
+    }
+    fprintf(stderr,
+            "wm-probe: pointer target did not become frame "
+            "(expected 0x%lx, actual 0x%lx)\n",
+            (unsigned long)expected, (unsigned long)child_return);
+    return -1;
+}
+
+static int fake_click_on_root_child(Window expected, int x, int y)
+{
+    if (wait_for_pointer_available() < 0) {
+        fprintf(stderr,
+                "wm-probe: pointer remained grabbed before frame click\n");
+        return -1;
+    }
+    if (move_pointer_to(x, y) < 0 ||
+        wait_for_pointer_root_child(expected) < 0)
+        return -1;
+    return fake_click_at(x, y);
+}
+
 static int wait_for_frame_geometry(Window frame,
                                    const FrameGeometry *expected)
 {
@@ -570,6 +1048,318 @@ static int frame_geometry_remains(Window frame,
     return 0;
 }
 
+static int collect_drag_outline_windows(
+    DragOutlineWindow outlines[TEST_DRAG_OUTLINE_COUNT],
+    size_t *total_count, size_t *viewable_count, int *topmost)
+{
+    Window root_return;
+    Window parent_return;
+    Window *children = NULL;
+    unsigned int child_count = 0U;
+    unsigned int index;
+    size_t total = 0U;
+    size_t viewable = 0U;
+
+    if (outlines == NULL || total_count == NULL || viewable_count == NULL ||
+        topmost == NULL ||
+        !XQueryTree(display, root, &root_return, &parent_return, &children,
+                    &child_count))
+        return -1;
+    for (index = 0U; index < child_count; ++index) {
+        XWindowAttributes attributes;
+
+        if (!role_matches(children[index], "drag-outline"))
+            continue;
+        ++total;
+        if (!XGetWindowAttributes(display, children[index], &attributes) ||
+            attributes.map_state != IsViewable)
+            continue;
+        if (viewable < (size_t)TEST_DRAG_OUTLINE_COUNT) {
+            DragOutlineWindow *outline = &outlines[viewable];
+
+            outline->window = children[index];
+            outline->geometry.x = attributes.x;
+            outline->geometry.y = attributes.y;
+            outline->geometry.width = attributes.width;
+            outline->geometry.height = attributes.height;
+            outline->override_redirect = attributes.override_redirect;
+            outline->stack_index = index;
+        }
+        ++viewable;
+    }
+    *topmost = viewable == (size_t)TEST_DRAG_OUTLINE_COUNT &&
+               child_count >= (unsigned int)TEST_DRAG_OUTLINE_COUNT;
+    if (*topmost) {
+        unsigned int first_top =
+            child_count - (unsigned int)TEST_DRAG_OUTLINE_COUNT;
+        size_t outline_index;
+
+        for (outline_index = 0U;
+             outline_index < (size_t)TEST_DRAG_OUTLINE_COUNT;
+             ++outline_index) {
+            if (outlines[outline_index].stack_index < first_top) {
+                *topmost = 0;
+                break;
+            }
+        }
+    }
+    if (children != NULL)
+        XFree(children);
+    *total_count = total;
+    *viewable_count = viewable;
+    return 0;
+}
+
+static void expected_drag_outline_geometries(
+    const FrameGeometry *bounds,
+    FrameGeometry expected[TEST_DRAG_OUTLINE_COUNT])
+{
+    int horizontal_thickness = TEST_DRAG_OUTLINE_THICKNESS;
+    int vertical_thickness = TEST_DRAG_OUTLINE_THICKNESS;
+    int middle_height;
+    int side_y;
+
+    if (horizontal_thickness > bounds->height)
+        horizontal_thickness = bounds->height;
+    if (vertical_thickness > bounds->width)
+        vertical_thickness = bounds->width;
+    middle_height = bounds->height - horizontal_thickness * 2;
+    if (middle_height < 1)
+        middle_height = 1;
+    side_y = bounds->y + (bounds->height - middle_height) / 2;
+    expected[0] = (FrameGeometry){
+        bounds->x, bounds->y, bounds->width, horizontal_thickness
+    };
+    expected[1] = (FrameGeometry){
+        bounds->x, bounds->y + bounds->height - horizontal_thickness,
+        bounds->width, horizontal_thickness
+    };
+    expected[2] = (FrameGeometry){
+        bounds->x, side_y, vertical_thickness, middle_height
+    };
+    expected[3] = (FrameGeometry){
+        bounds->x + bounds->width - vertical_thickness, side_y,
+        vertical_thickness, middle_height
+    };
+}
+
+static int drag_outline_geometries_match(
+    const DragOutlineWindow actual[TEST_DRAG_OUTLINE_COUNT],
+    const FrameGeometry expected[TEST_DRAG_OUTLINE_COUNT])
+{
+    int matched[TEST_DRAG_OUTLINE_COUNT] = {0, 0, 0, 0};
+    size_t actual_index;
+
+    for (actual_index = 0U;
+         actual_index < (size_t)TEST_DRAG_OUTLINE_COUNT; ++actual_index) {
+        size_t expected_index;
+        int found = 0;
+
+        if (!actual[actual_index].override_redirect)
+            return 0;
+        for (expected_index = 0U;
+             expected_index < (size_t)TEST_DRAG_OUTLINE_COUNT;
+             ++expected_index) {
+            if (!matched[expected_index] &&
+                frame_geometry_equals(&actual[actual_index].geometry,
+                                      &expected[expected_index])) {
+                matched[expected_index] = 1;
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
+            return 0;
+    }
+    return 1;
+}
+
+static int wait_for_drag_outline_bounds(Window target,
+                                        const FrameGeometry *stationary,
+                                        const FrameGeometry *bounds,
+                                        const char *label)
+{
+    FrameGeometry expected[TEST_DRAG_OUTLINE_COUNT];
+    int attempt;
+    size_t last_total = 0U;
+    size_t last_viewable = 0U;
+    int last_topmost = 0;
+
+    expected_drag_outline_geometries(bounds, expected);
+    for (attempt = 0; attempt < 150; ++attempt) {
+        DragOutlineWindow outlines[TEST_DRAG_OUTLINE_COUNT];
+        FrameGeometry actual = {0, 0, 0, 0};
+        XWindowAttributes attributes;
+
+        XSync(display, False);
+        if (get_frame_geometry(target, &actual) < 0 ||
+            !frame_geometry_equals(&actual, stationary)) {
+            fprintf(stderr,
+                    "wm-probe: %s moved before the held drag was released "
+                    "(expected %d,%d %dx%d, actual %d,%d %dx%d)\n",
+                    label, stationary->x, stationary->y,
+                    stationary->width, stationary->height,
+                    actual.x, actual.y, actual.width, actual.height);
+            return -1;
+        }
+        if (!XGetWindowAttributes(display, target, &attributes) ||
+            attributes.map_state != IsViewable) {
+            fprintf(stderr,
+                    "wm-probe: %s stopped being viewable during a held drag\n",
+                    label);
+            return -1;
+        }
+        if (collect_drag_outline_windows(outlines, &last_total,
+                                         &last_viewable,
+                                         &last_topmost) == 0 &&
+            last_total == (size_t)TEST_DRAG_OUTLINE_COUNT &&
+            last_viewable == (size_t)TEST_DRAG_OUTLINE_COUNT &&
+            last_topmost &&
+            drag_outline_geometries_match(outlines, expected))
+            return 0;
+        wait_a_bit();
+    }
+    fprintf(stderr,
+            "wm-probe: %s drag outline did not reach %d,%d %dx%d "
+            "(total %zu, viewable %zu, topmost %d)\n",
+            label, bounds->x, bounds->y, bounds->width, bounds->height,
+            last_total, last_viewable, last_topmost);
+    return -1;
+}
+
+static int wait_for_drag_outlines_hidden(const char *label)
+{
+    int attempt;
+    size_t last_total = 0U;
+    size_t last_viewable = 0U;
+
+    for (attempt = 0; attempt < 150; ++attempt) {
+        DragOutlineWindow outlines[TEST_DRAG_OUTLINE_COUNT];
+        int topmost;
+
+        XSync(display, False);
+        if (collect_drag_outline_windows(outlines, &last_total,
+                                         &last_viewable, &topmost) == 0 &&
+            last_total == (size_t)TEST_DRAG_OUTLINE_COUNT &&
+            last_viewable == 0U)
+            return 0;
+        wait_a_bit();
+    }
+    fprintf(stderr,
+            "wm-probe: %s left drag outlines mapped "
+            "(total %zu, viewable %zu)\n",
+            label, last_total, last_viewable);
+    return -1;
+}
+
+static int offset_internal_geometry(const FrameGeometry *original,
+                                    int delta_x, int delta_y,
+                                    FrameGeometry *result)
+{
+    int screen = DefaultScreen(display);
+    int screen_width = DisplayWidth(display, screen);
+    int screen_height = DisplayHeight(display, screen);
+    int maximum_x;
+    int maximum_y;
+
+    if (original == NULL || result == NULL || original->width < 1 ||
+        original->height < 1 || original->width > screen_width ||
+        original->height > screen_height)
+        return -1;
+    maximum_x = screen_width - original->width;
+    maximum_y = screen_height - original->height;
+    *result = *original;
+    result->x += delta_x;
+    result->y += delta_y;
+    if (result->x < 0)
+        result->x = 0;
+    if (result->x > maximum_x)
+        result->x = maximum_x;
+    if (result->y < 0)
+        result->y = 0;
+    if (result->y > maximum_y)
+        result->y = maximum_y;
+    return 0;
+}
+
+static int verify_internal_outline_drag(Window window, const char *label,
+                                        int first_dx, int first_dy,
+                                        int second_dx, int second_dy)
+{
+    FrameGeometry original;
+    FrameGeometry first;
+    FrameGeometry second;
+    int start_x;
+    int start_y;
+    int result = -1;
+
+    if (get_frame_geometry(window, &original) < 0 ||
+        offset_internal_geometry(&original, first_dx, first_dy, &first) < 0 ||
+        offset_internal_geometry(&original, second_dx, second_dy,
+                                 &second) < 0) {
+        fprintf(stderr,
+                "wm-probe: %s geometry could not support outline testing\n",
+                label);
+        return -1;
+    }
+    if (frame_geometry_equals(&original, &first) ||
+        frame_geometry_equals(&original, &second) ||
+        frame_geometry_equals(&first, &second)) {
+        fprintf(stderr,
+                "wm-probe: skipping %s outline motion on an immovable display\n",
+                label);
+        return 0;
+    }
+    if (wait_for_drag_outlines_hidden(label) < 0)
+        return -1;
+    start_x = original.x + original.width / 2;
+    start_y = original.y + TEST_TITLE_BUTTON_Y + TEST_TITLE_BUTTON / 2;
+    if (begin_held_drag_at(start_x, start_y) < 0)
+        goto cleanup;
+    if (move_held_drag_to(start_x + first.x - original.x,
+                          start_y + first.y - original.y) < 0 ||
+        wait_for_drag_outline_bounds(window, &original, &first, label) < 0 ||
+        frame_geometry_remains(window, &original) < 0 ||
+        !internal_window_remains_viewable(window)) {
+        fprintf(stderr,
+                "wm-probe: %s did not remain stationary at its first outline\n",
+                label);
+        goto cleanup;
+    }
+    if (move_held_drag_to(start_x + second.x - original.x,
+                          start_y + second.y - original.y) < 0 ||
+        wait_for_drag_outline_bounds(window, &original, &second, label) < 0 ||
+        frame_geometry_remains(window, &original) < 0 ||
+        !internal_window_remains_viewable(window)) {
+        fprintf(stderr,
+                "wm-probe: %s did not remain stationary at its second outline\n",
+                label);
+        goto cleanup;
+    }
+    if (release_held_drag() < 0)
+        goto cleanup;
+    if (wait_for_frame_geometry(window, &second) < 0) {
+        report_frame_geometry("outline drag did not commit on release", window);
+        goto cleanup;
+    }
+    if (wait_for_drag_outlines_hidden(label) < 0) {
+        fprintf(stderr,
+                "wm-probe: %s drag outlines remained after release\n", label);
+        goto cleanup;
+    }
+    if (wait_for_pointer_available() < 0) {
+        fprintf(stderr,
+                "wm-probe: %s drag left the pointer grabbed after release\n",
+                label);
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    abort_held_drag();
+    return result;
+}
+
 static int wait_for_restored_frame(Window frame,
                                    const FrameGeometry *original,
                                    int require_new_position)
@@ -602,9 +1392,9 @@ static int click_frame_maximize_button(Window frame)
     close_x = geometry.width - TEST_FRAME_RIGHT - TEST_TITLE_BUTTON -
               TEST_TITLE_BUTTON_RIGHT_INSET;
     maximize_x = close_x - TEST_TITLE_BUTTON - TEST_TITLE_BUTTON_GAP;
-    return fake_click_at(geometry.x + maximize_x + TEST_TITLE_BUTTON / 2,
-                         geometry.y + TEST_TITLE_BUTTON_Y +
-                             TEST_TITLE_BUTTON / 2);
+    return fake_click_on_root_child(
+        frame, geometry.x + maximize_x + TEST_TITLE_BUTTON / 2,
+        geometry.y + TEST_TITLE_BUTTON_Y + TEST_TITLE_BUTTON / 2);
 }
 
 static int click_internal_maximize_button(Window window)
@@ -1501,7 +2291,8 @@ static int verify_maximize_and_snap(void)
         return -1;
     }
     frame = client_frame(window);
-    if (frame == None || get_frame_geometry(frame, &original) < 0) {
+    if (frame == None || wait_for_map_state(frame, IsViewable) < 0 ||
+        get_frame_geometry(frame, &original) < 0) {
         fprintf(stderr, "wm-probe: maximize client frame was unavailable\n");
         return -1;
     }
@@ -1606,6 +2397,27 @@ static int wait_for_active_client(Window client)
         wait_a_bit();
     }
     return -1;
+}
+
+static int request_active_client(Window client)
+{
+    XEvent event;
+    Atom active_window = XInternAtom(display, "_NET_ACTIVE_WINDOW", False);
+
+    memset(&event, 0, sizeof(event));
+    event.xclient.type = ClientMessage;
+    event.xclient.display = display;
+    event.xclient.window = client;
+    event.xclient.message_type = active_window;
+    event.xclient.format = 32;
+    event.xclient.data.l[0] = 1L;
+    event.xclient.data.l[1] = CurrentTime;
+    if (!XSendEvent(display, root, False,
+                    SubstructureRedirectMask | SubstructureNotifyMask,
+                    &event))
+        return -1;
+    XFlush(display);
+    return wait_for_active_client(client);
 }
 
 static int verify_map_preserves_launcher(void)
@@ -1757,6 +2569,105 @@ static int wait_for_focus_window(Window expected)
         wait_a_bit();
     }
     return -1;
+}
+
+static int verify_run_dialog(const char *marker, Window client,
+                             Window launcher, Window panel)
+{
+    Window run;
+    int toggle_result;
+
+    if (marker == NULL || marker[0] == '\0')
+        return -1;
+    XSelectInput(display, client, KeyPressMask);
+    unlink(marker);
+    if (request_active_client(client) < 0) {
+        fprintf(stderr,
+                "wm-probe: client did not receive focus before Super+R\n");
+        return -1;
+    }
+    if (fake_key_chord(XK_Super_L, XK_r) < 0) {
+        fprintf(stderr, "wm-probe: could not inject Super+R\n");
+        return -1;
+    }
+    run = wait_for_role("run-window", None, 1);
+    if (run == None || wait_for_focus_window(run) < 0 ||
+        !internal_window_remains_viewable(launcher) ||
+        !internal_window_remains_viewable(panel)) {
+        fprintf(stderr,
+                "wm-probe: Super+R did not open a focused Run window without closing internal windows\n");
+        return -1;
+    }
+    send_text(run, "x");
+    send_key_sym(run, XK_BackSpace);
+    send_text(run, "/usr/bin/touch ");
+    send_text(run, marker);
+    send_key_sym(run, XK_Return);
+    if (wait_for_file(marker) < 0 || !internal_window_is_hidden(run) ||
+        wait_for_active_client(client) < 0 ||
+        !internal_window_remains_viewable(launcher) ||
+        !internal_window_remains_viewable(panel)) {
+        fprintf(stderr,
+                "wm-probe: Run did not execute and close independently\n");
+        return -1;
+    }
+
+    toggle_result = fake_toggle_key(XK_Caps_Lock);
+    if (toggle_result < 0 || request_active_client(client) < 0 ||
+        fake_key_chord(XK_Super_L, XK_r) < 0 ||
+        wait_for_role("run-window", None, 1) == None) {
+        fprintf(stderr, "wm-probe: Super+R failed with Caps Lock active\n");
+        return -1;
+    }
+    send_escape(run);
+    if (!internal_window_is_hidden(run) || wait_for_active_client(client) < 0)
+        return -1;
+    if (toggle_result == 0)
+        (void)fake_toggle_key(XK_Caps_Lock);
+
+    toggle_result = fake_toggle_key(XK_Num_Lock);
+    if (toggle_result < 0 || request_active_client(client) < 0 ||
+        fake_key_chord(XK_Super_L, XK_r) < 0 ||
+        wait_for_role("run-window", None, 1) == None) {
+        fprintf(stderr, "wm-probe: Super+R failed with Num Lock active\n");
+        return -1;
+    }
+    send_escape(run);
+    if (!internal_window_is_hidden(run) || wait_for_active_client(client) < 0)
+        return -1;
+    if (toggle_result == 0)
+        (void)fake_toggle_key(XK_Num_Lock);
+
+    if (modifier_mask_for_keysym(XK_Scroll_Lock) != 0U) {
+        toggle_result = fake_toggle_key(XK_Scroll_Lock);
+        if (toggle_result != 0 || request_active_client(client) < 0 ||
+            fake_key_chord(XK_Super_L, XK_r) < 0 ||
+            wait_for_role("run-window", None, 1) == None) {
+            fprintf(stderr,
+                    "wm-probe: Super+R failed with Scroll Lock active\n");
+            return -1;
+        }
+        send_escape(run);
+        if (!internal_window_is_hidden(run) ||
+            wait_for_active_client(client) < 0)
+            return -1;
+        (void)fake_toggle_key(XK_Scroll_Lock);
+    }
+
+    send_button_one_at(panel, 10, 30);
+    if (wait_for_focus_window(panel) < 0 ||
+        fake_key_chord(XK_Super_L, XK_r) < 0 ||
+        wait_for_focus_window(run) < 0) {
+        fprintf(stderr, "wm-probe: Run did not open from Control Panel\n");
+        return -1;
+    }
+    send_escape(run);
+    if (!internal_window_is_hidden(run) || wait_for_focus_window(panel) < 0) {
+        fprintf(stderr,
+                "wm-probe: Run did not restore Control Panel focus\n");
+        return -1;
+    }
+    return 0;
 }
 
 static int focus_window_remains(Window expected)
@@ -1988,6 +2899,22 @@ static int verify_internal_window_layouts(Window applications_icon,
         screen_height
     };
 
+    send_button_one(applications_icon);
+    if (wait_for_focus_window(launcher) < 0 ||
+        verify_internal_outline_drag(launcher, "Applications",
+                                     40, -60, 80, -30) < 0) {
+        fprintf(stderr,
+                "wm-probe: Applications outline drag verification failed\n");
+        return -1;
+    }
+    send_button_one(control_icon);
+    if (wait_for_focus_window(panel) < 0 ||
+        verify_internal_outline_drag(panel, "Control Panel",
+                                     -40, 60, -80, 30) < 0) {
+        fprintf(stderr,
+                "wm-probe: Control Panel outline drag verification failed\n");
+        return -1;
+    }
     if (get_frame_geometry(launcher, &launcher_original) < 0 ||
         get_frame_geometry(panel, &panel_original) < 0) {
         fprintf(stderr, "wm-probe: internal window geometry was unavailable\n");
@@ -2086,6 +3013,50 @@ static unsigned long root_pixel_at(int x, int y)
     return pixel;
 }
 
+static unsigned long window_pixel_at(Window window, int x, int y)
+{
+    XImage *image = XGetImage(display, window, x, y, 1U, 1U, AllPlanes,
+                              ZPixmap);
+    unsigned long pixel = 0UL;
+
+    if (image != NULL) {
+        pixel = XGetPixel(image, 0, 0);
+        XDestroyImage(image);
+    }
+    return pixel;
+}
+
+static unsigned long expected_rgb_pixel(unsigned char red,
+                                        unsigned char green,
+                                        unsigned char blue)
+{
+    XColor color;
+
+    memset(&color, 0, sizeof(color));
+    color.red = (unsigned short)((unsigned int)red * 257U);
+    color.green = (unsigned short)((unsigned int)green * 257U);
+    color.blue = (unsigned short)((unsigned int)blue * 257U);
+    color.flags = DoRed | DoGreen | DoBlue;
+    if (!XAllocColor(display, DefaultColormap(display, DefaultScreen(display)),
+                     &color))
+        return 0UL;
+    return color.pixel;
+}
+
+static int wait_for_window_pixel(Window window, int x, int y,
+                                 unsigned long expected)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 150; ++attempt) {
+        XSync(display, False);
+        if (window_pixel_at(window, x, y) == expected)
+            return 0;
+        wait_a_bit();
+    }
+    return -1;
+}
+
 static int wait_for_root_pixel_change(int x, int y, unsigned long previous)
 {
     int attempt;
@@ -2120,6 +3091,27 @@ static int wait_until_unmanaged(Window window)
         wait_a_bit();
     }
     return -1;
+}
+
+static int publish_test_window_icon(Window window)
+{
+    Atom property = XInternAtom(display, "_NET_WM_ICON", False);
+    const unsigned int width = 48U;
+    const unsigned int height = 48U;
+    const size_t count = 2U + (size_t)width * height;
+    unsigned long *values = calloc(count, sizeof(*values));
+    size_t index;
+
+    if (values == NULL)
+        return -1;
+    values[0] = width;
+    values[1] = height;
+    for (index = 2U; index < count; ++index)
+        values[index] = 0xff12ab34UL;
+    XChangeProperty(display, window, property, XA_CARDINAL, 32,
+                    PropModeReplace, (unsigned char *)values, (int)count);
+    free(values);
+    return 0;
 }
 
 static int verify_control_panel(Window client, const char *wifi_marker,
@@ -2212,7 +3204,1033 @@ static int verify_control_panel(Window client, const char *wifi_marker,
     return 0;
 }
 
-int main(void)
+static int focus_and_active_remain(Window expected_focus,
+                                   Window expected_active)
+{
+    Atom active_window = XInternAtom(display, "_NET_ACTIVE_WINDOW", False);
+    int attempt;
+
+    for (attempt = 0; attempt < 30; ++attempt) {
+        Window focused = None;
+        int revert_to;
+
+        XSync(display, False);
+        XGetInputFocus(display, &focused, &revert_to);
+        if (focused != expected_focus ||
+            root_window_property(active_window) != expected_active)
+            return -1;
+        wait_a_bit();
+    }
+    return 0;
+}
+
+static int wait_for_focus_and_active(Window expected_focus,
+                                     Window expected_active)
+{
+    Atom active_window = XInternAtom(display, "_NET_ACTIVE_WINDOW", False);
+    int attempt;
+
+    for (attempt = 0; attempt < 150; ++attempt) {
+        Window focused = None;
+        int revert_to;
+
+        XSync(display, False);
+        XGetInputFocus(display, &focused, &revert_to);
+        if (focused == expected_focus &&
+            root_window_property(active_window) == expected_active)
+            return 0;
+        wait_a_bit();
+    }
+    return -1;
+}
+
+static Window open_desktop_menu_near_bottom_right(FrameGeometry *geometry,
+                                                   int *request_x,
+                                                   int *request_y)
+{
+    Window menu;
+    int x;
+    int y;
+
+    if (find_bare_root_near_bottom_right(&x, &y) < 0 ||
+        fake_button_at(Button3, x, y) < 0)
+        return None;
+    menu = wait_for_role("desktop-menu", None, 1);
+    if (menu == None || get_frame_geometry(menu, geometry) < 0) {
+        fprintf(stderr,
+                "wm-probe: bare desktop right-click did not open the desktop menu\n");
+        return None;
+    }
+    if (request_x != NULL)
+        *request_x = x;
+    if (request_y != NULL)
+        *request_y = y;
+    return menu;
+}
+
+static int desktop_menu_click_row(int row_y)
+{
+    FrameGeometry geometry;
+    Window menu = open_desktop_menu_near_bottom_right(&geometry, NULL, NULL);
+
+    if (menu == None)
+        return -1;
+    if (fake_click_at(geometry.x + 15, geometry.y + row_y) < 0)
+        return -1;
+    if (!internal_window_is_hidden(menu)) {
+        fprintf(stderr,
+                "wm-probe: choosing a desktop-menu item did not dismiss the menu\n");
+        return -1;
+    }
+    return 0;
+}
+
+static Window open_session_confirmation(int menu_row_y,
+                                        const char *expected_title,
+                                        Window expected_active)
+{
+    int screen = DefaultScreen(display);
+    int screen_width = DisplayWidth(display, screen);
+    int screen_height = DisplayHeight(display, screen);
+    Atom active_window = XInternAtom(display, "_NET_ACTIVE_WINDOW", False);
+    FrameGeometry geometry;
+    FrameGeometry shield_geometry;
+    Window dialog;
+    Window shield;
+
+    if (desktop_menu_click_row(menu_row_y) < 0)
+        return None;
+    dialog = wait_for_role("session-confirmation", None, 1);
+    if (dialog == None || wait_for_focus_window(dialog) < 0 ||
+        wait_for_window_name(dialog, expected_title) < 0 ||
+        get_frame_geometry(dialog, &geometry) < 0) {
+        fprintf(stderr,
+                "wm-probe: %s confirmation did not open with its role, title, and focus\n",
+                expected_title);
+        return None;
+    }
+    if (root_window_property(active_window) != expected_active) {
+        fprintf(stderr,
+                "wm-probe: %s confirmation changed _NET_ACTIVE_WINDOW\n",
+                expected_title);
+        return None;
+    }
+    shield = wait_for_role("session-confirmation-shield", None, 1);
+    if (shield == None || get_frame_geometry(shield, &shield_geometry) < 0 ||
+        shield_geometry.x != 0 || shield_geometry.y != 0 ||
+        shield_geometry.width != screen_width ||
+        shield_geometry.height != screen_height ||
+        !window_is_above(dialog, shield)) {
+        fprintf(stderr,
+                "wm-probe: %s confirmation did not have a fullscreen shield below it\n",
+                expected_title);
+        return None;
+    }
+    if (geometry.width != 420 || geometry.height != 176 ||
+        geometry.x != (screen_width - geometry.width) / 2 ||
+        geometry.y != (screen_height - geometry.height) / 2 ||
+        geometry.x < 0 || geometry.y < 0 ||
+        geometry.x + geometry.width > screen_width ||
+        geometry.y + geometry.height > screen_height) {
+        fprintf(stderr,
+                "wm-probe: %s confirmation geometry was %d,%d %dx%d on %dx%d\n",
+                expected_title, geometry.x, geometry.y, geometry.width,
+                geometry.height, screen_width, screen_height);
+        return None;
+    }
+    return dialog;
+}
+
+static int click_session_confirmation_button(Window dialog, int yes)
+{
+    FrameGeometry geometry;
+    int no_x;
+    int yes_x;
+    int button_y;
+
+    if (get_frame_geometry(dialog, &geometry) < 0)
+        return -1;
+    no_x = geometry.x + geometry.width -
+           TEST_SESSION_CONFIRM_BUTTON_MARGIN -
+           TEST_SESSION_CONFIRM_BUTTON_WIDTH;
+    yes_x = no_x - TEST_SESSION_CONFIRM_BUTTON_GAP -
+            TEST_SESSION_CONFIRM_BUTTON_WIDTH;
+    button_y = geometry.y + geometry.height -
+               TEST_SESSION_CONFIRM_BUTTON_MARGIN -
+               TEST_SESSION_CONFIRM_BUTTON_HEIGHT;
+    return fake_click_at((yes ? yes_x : no_x) +
+                             TEST_SESSION_CONFIRM_BUTTON_WIDTH / 2,
+                         button_y + TEST_SESSION_CONFIRM_BUTTON_HEIGHT / 2);
+}
+
+static int click_session_confirmation_close(Window dialog)
+{
+    FrameGeometry geometry;
+
+    if (get_frame_geometry(dialog, &geometry) < 0)
+        return -1;
+    return fake_click_at(geometry.x + geometry.width -
+                             TEST_INTERNAL_CLOSE_INSET -
+                             TEST_TITLE_BUTTON / 2,
+                         geometry.y + TEST_TITLE_BUTTON_Y +
+                             TEST_TITLE_BUTTON / 2);
+}
+
+static int send_synthetic_session_confirmation_yes_click(Window dialog)
+{
+    FrameGeometry geometry;
+    XEvent event;
+    int no_x;
+    int yes_x;
+    int button_y;
+
+    if (get_frame_geometry(dialog, &geometry) < 0)
+        return -1;
+    no_x = geometry.width - TEST_SESSION_CONFIRM_BUTTON_MARGIN -
+           TEST_SESSION_CONFIRM_BUTTON_WIDTH;
+    yes_x = no_x - TEST_SESSION_CONFIRM_BUTTON_GAP -
+            TEST_SESSION_CONFIRM_BUTTON_WIDTH;
+    button_y = geometry.height - TEST_SESSION_CONFIRM_BUTTON_MARGIN -
+               TEST_SESSION_CONFIRM_BUTTON_HEIGHT;
+    memset(&event, 0, sizeof(event));
+    event.xbutton.type = ButtonPress;
+    event.xbutton.display = display;
+    event.xbutton.window = dialog;
+    event.xbutton.root = root;
+    event.xbutton.time = CurrentTime;
+    event.xbutton.x = yes_x + TEST_SESSION_CONFIRM_BUTTON_WIDTH / 2;
+    event.xbutton.y = button_y + TEST_SESSION_CONFIRM_BUTTON_HEIGHT / 2;
+    event.xbutton.x_root = geometry.x + event.xbutton.x;
+    event.xbutton.y_root = geometry.y + event.xbutton.y;
+    event.xbutton.button = Button1;
+    event.xbutton.same_screen = True;
+    if (!XSendEvent(display, dialog, False, ButtonPressMask, &event))
+        return -1;
+    event.xbutton.type = ButtonRelease;
+    event.xbutton.state = Button1Mask;
+    if (!XSendEvent(display, dialog, False, ButtonReleaseMask, &event))
+        return -1;
+    XFlush(display);
+    return 0;
+}
+
+static int session_confirmation_remains_safe(Window dialog,
+                                             const char *action_marker,
+                                             const char *label)
+{
+    Window shield;
+
+    if (!internal_window_remains_viewable(dialog) ||
+        find_role("session-confirmation", None, 1) != dialog ||
+        file_remains_absent(action_marker) < 0 ||
+        wait_for_focus_window(dialog) < 0) {
+        fprintf(stderr,
+                "wm-probe: synthetic %s dismissed or executed the session confirmation\n",
+                label);
+        return -1;
+    }
+    shield = find_role("session-confirmation-shield", None, 1);
+    if (shield == None || !internal_window_remains_viewable(shield)) {
+        fprintf(stderr,
+                "wm-probe: synthetic %s removed the session confirmation shield\n",
+                label);
+        return -1;
+    }
+    return 0;
+}
+
+static int fullscreen_locker_yields_session_confirmation(
+    Window dialog, Window expected_active, const char *action_marker)
+{
+    int screen = DefaultScreen(display);
+    int screen_width = DisplayWidth(display, screen);
+    int screen_height = DisplayHeight(display, screen);
+    XSetWindowAttributes attributes;
+    XWindowAttributes actual;
+    Window shield = find_role("session-confirmation-shield", None, 1);
+    Window locker = None;
+    int result = -1;
+
+    if (shield == None) {
+        fprintf(stderr,
+                "wm-probe: the confirmation shield was unavailable for the locker test\n");
+        return -1;
+    }
+    memset(&attributes, 0, sizeof(attributes));
+    attributes.override_redirect = True;
+    attributes.background_pixel = BlackPixel(display, screen);
+    attributes.event_mask = StructureNotifyMask;
+    locker = XCreateWindow(display, root, 0, 0,
+                           (unsigned)screen_width,
+                           (unsigned)screen_height, 0, CopyFromParent,
+                           InputOutput, CopyFromParent,
+                           CWOverrideRedirect | CWBackPixel | CWEventMask,
+                           &attributes);
+    if (locker == None) {
+        fprintf(stderr,
+                "wm-probe: could not create the fullscreen locker-like window\n");
+        return -1;
+    }
+    XStoreName(display, locker, "Win31 X Fullscreen Locker Probe");
+    XMapRaised(display, locker);
+    XSetInputFocus(display, locker, RevertToPointerRoot, CurrentTime);
+    XFlush(display);
+
+    if (!internal_window_is_hidden(dialog) ||
+        !internal_window_is_hidden(shield) ||
+        !internal_window_remains_unmapped(dialog) ||
+        !internal_window_remains_unmapped(shield) ||
+        find_role("session-confirmation", None, 1) != None ||
+        find_role("session-confirmation-shield", None, 1) != None) {
+        fprintf(stderr,
+                "wm-probe: a fullscreen locker did not dismiss both confirmation windows\n");
+        goto cleanup;
+    }
+    if (!XGetWindowAttributes(display, locker, &actual) ||
+        actual.map_state != IsViewable || !actual.override_redirect ||
+        actual.class != InputOutput || actual.x != 0 || actual.y != 0 ||
+        actual.width != screen_width || actual.height != screen_height ||
+        !window_is_above(locker, dialog) ||
+        !window_is_above(locker, shield)) {
+        fprintf(stderr,
+                "wm-probe: the fullscreen locker was covered or reconfigured\n");
+        goto cleanup;
+    }
+    if (focus_and_active_remain(locker, expected_active) < 0) {
+        fprintf(stderr,
+                "wm-probe: the confirmation stole focus back from the fullscreen locker\n");
+        goto cleanup;
+    }
+    if (wait_for_pointer_available() < 0 ||
+        wait_for_keyboard_available() < 0 ||
+        focus_and_active_remain(locker, expected_active) < 0) {
+        fprintf(stderr,
+                "wm-probe: dismissing for a fullscreen locker left an input grab or changed focus\n");
+        goto cleanup;
+    }
+    if (file_remains_absent(action_marker) < 0) {
+        fprintf(stderr,
+                "wm-probe: showing a fullscreen locker executed the pending action\n");
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    XDestroyWindow(display, locker);
+    XSync(display, False);
+    return result;
+}
+
+static int verify_session_confirmation_security(Window expected_active,
+                                                const char *action_marker)
+{
+    Window dialog;
+
+    (void)unlink(action_marker);
+    dialog = open_session_confirmation(76, "Confirm Restart",
+                                       expected_active);
+    if (dialog == None)
+        return -1;
+    send_key_sym(dialog, XK_y);
+    if (session_confirmation_remains_safe(dialog, action_marker,
+                                          "XSendEvent Y") < 0)
+        return -1;
+    send_key_sym(dialog, XK_Return);
+    if (session_confirmation_remains_safe(dialog, action_marker,
+                                          "XSendEvent Enter") < 0)
+        return -1;
+    if (send_synthetic_session_confirmation_yes_click(dialog) < 0 ||
+        session_confirmation_remains_safe(dialog, action_marker,
+                                          "XSendEvent Yes click") < 0)
+        return -1;
+    return fullscreen_locker_yields_session_confirmation(
+        dialog, expected_active, action_marker);
+}
+
+static int verify_session_confirmation_dismissed(
+    Window dialog, Window expected_focus, Window expected_active,
+    const char *label)
+{
+    if (!internal_window_is_hidden(dialog) ||
+        find_role("session-confirmation", None, 1) != None) {
+        fprintf(stderr,
+                "wm-probe: %s did not dismiss the session confirmation\n",
+                label);
+        return -1;
+    }
+    if (wait_for_focus_and_active(expected_focus, expected_active) < 0 ||
+        focus_and_active_remain(expected_focus, expected_active) < 0) {
+        fprintf(stderr,
+                "wm-probe: %s did not restore the previous focus and active window\n",
+                label);
+        return -1;
+    }
+    if (wait_for_pointer_available() < 0 ||
+        wait_for_keyboard_available() < 0) {
+        fprintf(stderr,
+                "wm-probe: %s left an input grab active\n", label);
+        return -1;
+    }
+    if (find_role("desktop-menu", None, 1) != None) {
+        fprintf(stderr,
+                "wm-probe: %s left the desktop menu mapped\n", label);
+        return -1;
+    }
+    return 0;
+}
+
+static int wm_check_remains_owned(Atom supporting)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 20; ++attempt) {
+        XSync(display, False);
+        if (root_window_property(supporting) == None)
+            return -1;
+        wait_a_bit();
+    }
+    return 0;
+}
+
+static int verify_desktop_menu(Window client, Window applications_icon,
+                               Window launcher, Window panel,
+                               const char *lock_marker,
+                               const char *system_action_marker)
+{
+    int screen = DefaultScreen(display);
+    int screen_width = DisplayWidth(display, screen);
+    int screen_height = DisplayHeight(display, screen);
+    Atom active_window = XInternAtom(display, "_NET_ACTIVE_WINDOW", False);
+    FrameGeometry menu_geometry;
+    Window menu;
+    Window focused = None;
+    Window active;
+    int revert_to;
+    int x;
+    int y;
+    int request_x;
+    int request_y;
+    int attempt;
+    Atom supporting = XInternAtom(display, "_NET_SUPPORTING_WM_CHECK", False);
+    Window confirmation;
+
+    if (lock_marker == NULL || lock_marker[0] == '\0' ||
+        system_action_marker == NULL || system_action_marker[0] == '\0') {
+        fprintf(stderr,
+                "wm-probe: desktop-menu marker paths were not configured\n");
+        return -1;
+    }
+    if (request_active_client(client) < 0 ||
+        window_center_on_root(client, &x, &y) < 0 ||
+        fake_button_at(Button3, x, y) < 0 ||
+        !role_remains_unmapped("desktop-menu")) {
+        fprintf(stderr,
+                "wm-probe: right-clicking a client opened the desktop menu\n");
+        return -1;
+    }
+    if (window_center_on_root(applications_icon, &x, &y) < 0 ||
+        fake_button_at(Button3, x, y) < 0 ||
+        !role_remains_unmapped("desktop-menu")) {
+        fprintf(stderr,
+                "wm-probe: right-clicking a desktop icon opened the desktop menu\n");
+        return -1;
+    }
+    if (request_active_client(client) < 0)
+        return -1;
+    XGetInputFocus(display, &focused, &revert_to);
+    active = root_window_property(active_window);
+    if (focused != client || active != client) {
+        fprintf(stderr,
+                "wm-probe: desktop-menu focus precondition was not met\n");
+        return -1;
+    }
+
+    menu = open_desktop_menu_near_bottom_right(
+        &menu_geometry, &request_x, &request_y);
+    if (menu == None)
+        return -1;
+    if (menu_geometry.x < 0 || menu_geometry.y < 0 ||
+        menu_geometry.x + menu_geometry.width > screen_width ||
+        menu_geometry.y + menu_geometry.height > screen_height ||
+        (menu_geometry.x == request_x && menu_geometry.y == request_y)) {
+        fprintf(stderr,
+                "wm-probe: bottom-right desktop menu was not clamped onscreen "
+                "(request %d,%d actual %d,%d %dx%d screen %dx%d)\n",
+                request_x, request_y, menu_geometry.x, menu_geometry.y,
+                menu_geometry.width, menu_geometry.height,
+                screen_width, screen_height);
+        return -1;
+    }
+    if (focus_and_active_remain(focused, active) < 0) {
+        fprintf(stderr,
+                "wm-probe: opening the desktop menu changed focus or _NET_ACTIVE_WINDOW\n");
+        return -1;
+    }
+    if (fake_click_at(1, screen_height - 1) < 0 ||
+        !internal_window_is_hidden(menu)) {
+        fprintf(stderr,
+                "wm-probe: an outside click did not dismiss the desktop menu\n");
+        return -1;
+    }
+
+    (void)unlink(lock_marker);
+    if (desktop_menu_click_row(17) < 0 || wait_for_file(lock_marker) < 0) {
+        fprintf(stderr,
+                "wm-probe: desktop-menu Lock did not invoke the configured locker\n");
+        return -1;
+    }
+    if (!role_remains_unmapped("session-confirmation")) {
+        fprintf(stderr,
+                "wm-probe: desktop-menu Lock opened a confirmation dialog\n");
+        return -1;
+    }
+    if (!internal_window_remains_viewable(launcher) ||
+        !internal_window_remains_viewable(panel)) {
+        fprintf(stderr,
+                "wm-probe: desktop-menu Lock closed an internal window\n");
+        return -1;
+    }
+
+    (void)unlink(system_action_marker);
+    send_button_one_at(launcher, 10, 30);
+    if (wait_for_focus_and_active(launcher, None) < 0) {
+        fprintf(stderr,
+                "wm-probe: could not establish Applications focus before Log Out confirmation\n");
+        return -1;
+    }
+    confirmation = open_session_confirmation(50, "Confirm Log Out", None);
+    if (confirmation == None || file_remains_absent(system_action_marker) < 0 ||
+        wm_check_remains_owned(supporting) < 0 ||
+        fake_key(XK_Escape) < 0 ||
+        verify_session_confirmation_dismissed(
+            confirmation, launcher, None, "Escape on Log Out") < 0) {
+        fprintf(stderr,
+                "wm-probe: Escape did not safely cancel Log Out\n");
+        return -1;
+    }
+
+    confirmation = open_session_confirmation(50, "Confirm Log Out", None);
+    if (confirmation == None || click_session_confirmation_close(confirmation) < 0 ||
+        verify_session_confirmation_dismissed(
+            confirmation, launcher, None, "close button on Log Out") < 0 ||
+        wm_check_remains_owned(supporting) < 0) {
+        fprintf(stderr,
+                "wm-probe: the close button did not safely cancel Log Out\n");
+        return -1;
+    }
+
+    confirmation = open_session_confirmation(50, "Confirm Log Out", None);
+    if (confirmation == None || fake_key_chord(XK_Alt_L, XK_F4) < 0 ||
+        verify_session_confirmation_dismissed(
+            confirmation, launcher, None, "Alt+F4 on Log Out") < 0 ||
+        wm_check_remains_owned(supporting) < 0) {
+        fprintf(stderr,
+                "wm-probe: Alt+F4 did not safely cancel Log Out\n");
+        return -1;
+    }
+
+    confirmation = open_session_confirmation(50, "Confirm Log Out", None);
+    if (confirmation == None || fake_key(XK_Return) < 0 ||
+        verify_session_confirmation_dismissed(
+            confirmation, launcher, None,
+            "default Enter on Log Out") < 0 ||
+        wm_check_remains_owned(supporting) < 0) {
+        fprintf(stderr,
+                "wm-probe: the safe default did not cancel Log Out on Enter\n");
+        return -1;
+    }
+
+    if (request_active_client(client) < 0 ||
+        wait_for_focus_and_active(client, client) < 0)
+        return -1;
+    (void)unlink(system_action_marker);
+    confirmation = open_session_confirmation(76, "Confirm Restart", client);
+    if (confirmation == None || file_remains_absent(system_action_marker) < 0 ||
+        click_session_confirmation_button(confirmation, 0) < 0 ||
+        verify_session_confirmation_dismissed(
+            confirmation, client, client, "No button on Restart") < 0 ||
+        file_remains_absent(system_action_marker) < 0) {
+        fprintf(stderr,
+                "wm-probe: the No button did not safely cancel Restart\n");
+        return -1;
+    }
+
+    if (verify_session_confirmation_security(client,
+                                             system_action_marker) < 0 ||
+        request_active_client(client) < 0 ||
+        wait_for_focus_and_active(client, client) < 0) {
+        fprintf(stderr,
+                "wm-probe: session confirmation security verification failed\n");
+        return -1;
+    }
+
+    confirmation = open_session_confirmation(76, "Confirm Restart", client);
+    if (confirmation == None || file_remains_absent(system_action_marker) < 0 ||
+        fake_key(XK_y) < 0 ||
+        wait_for_file_contents(system_action_marker, "reboot\n") < 0 ||
+        verify_session_confirmation_dismissed(
+            confirmation, client, client, "Y on Restart") < 0) {
+        fprintf(stderr,
+                "wm-probe: Y did not confirm exactly one reboot request\n");
+        return -1;
+    }
+    for (attempt = 0; attempt < 10; ++attempt)
+        wait_a_bit();
+
+    (void)unlink(system_action_marker);
+    send_button_one_at(panel, 10, 30);
+    if (wait_for_focus_and_active(panel, None) < 0) {
+        fprintf(stderr,
+                "wm-probe: could not establish Control Panel focus before Shut Down confirmation\n");
+        return -1;
+    }
+    confirmation = open_session_confirmation(102, "Confirm Shut Down", None);
+    if (confirmation == None || file_remains_absent(system_action_marker) < 0 ||
+        fake_key(XK_n) < 0 ||
+        verify_session_confirmation_dismissed(
+            confirmation, panel, None, "N on Shut Down") < 0 ||
+        file_remains_absent(system_action_marker) < 0) {
+        fprintf(stderr,
+                "wm-probe: N did not safely cancel Shut Down\n");
+        return -1;
+    }
+
+    confirmation = open_session_confirmation(102, "Confirm Shut Down", None);
+    if (confirmation == None || fake_key(XK_Left) < 0 ||
+        wait_for_focus_window(confirmation) < 0 || fake_key(XK_Right) < 0 ||
+        wait_for_focus_window(confirmation) < 0 || fake_key(XK_Return) < 0 ||
+        verify_session_confirmation_dismissed(
+            confirmation, panel, None,
+            "Left, Right, and Enter on Shut Down") < 0 ||
+        file_remains_absent(system_action_marker) < 0) {
+        fprintf(stderr,
+                "wm-probe: keyboard navigation did not return to No before Enter\n");
+        return -1;
+    }
+
+    confirmation = open_session_confirmation(102, "Confirm Shut Down", None);
+    if (confirmation == None || file_remains_absent(system_action_marker) < 0 ||
+        click_session_confirmation_button(confirmation, 1) < 0 ||
+        wait_for_file_contents(system_action_marker, "poweroff\n") < 0 ||
+        verify_session_confirmation_dismissed(
+            confirmation, panel, None, "Yes button on Shut Down") < 0) {
+        fprintf(stderr,
+                "wm-probe: the Yes button did not confirm exactly one poweroff request\n");
+        return -1;
+    }
+    if (!internal_window_remains_viewable(launcher) ||
+        !internal_window_remains_viewable(panel)) {
+        fprintf(stderr,
+                "wm-probe: desktop-menu actions closed an internal window\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int verify_desktop_menu_logout(Atom supporting)
+{
+    Atom active_window = XInternAtom(display, "_NET_ACTIVE_WINDOW", False);
+    Window active = root_window_property(active_window);
+    Window confirmation;
+    int attempt;
+
+    confirmation = open_session_confirmation(50, "Confirm Log Out", active);
+    if (confirmation == None || wm_check_remains_owned(supporting) < 0) {
+        fprintf(stderr,
+                "wm-probe: selecting Log Out did not wait for confirmation\n");
+        return -1;
+    }
+    if (fake_key(XK_Tab) < 0 || wait_for_focus_window(confirmation) < 0 ||
+        fake_key(XK_Return) < 0)
+        return -1;
+    for (attempt = 0; attempt < 150; ++attempt) {
+        XSync(display, False);
+        if (root_window_property(supporting) == None &&
+            find_role("desktop-menu", None, 1) == None &&
+            find_role("session-confirmation", None, 1) == None) {
+            if (wait_for_pointer_available() < 0 ||
+                wait_for_keyboard_available() < 0) {
+                fprintf(stderr,
+                        "wm-probe: Log Out left an input grab active\n");
+                return -1;
+            }
+            return 0;
+        }
+        wait_a_bit();
+    }
+    fprintf(stderr,
+            "wm-probe: confirmed Log Out did not release WM ownership\n");
+    return -1;
+}
+
+static int verify_multi_monitor_static_icons(Window *applications_icon,
+                                             Window *control_icon)
+{
+    const FrameGeometry expected_applications = {
+        12, 12, TEST_DESKTOP_ICON_WIDTH, TEST_DESKTOP_ICON_HEIGHT
+    };
+    const FrameGeometry expected_control = {
+        12, 100, TEST_DESKTOP_ICON_WIDTH, TEST_DESKTOP_ICON_HEIGHT
+    };
+
+    *applications_icon = wait_for_role("applications-icon", None, 1);
+    *control_icon = wait_for_role("control-panel-icon", None, 1);
+    if (*applications_icon == None || *control_icon == None) {
+        fprintf(stderr,
+                "wm-probe: multi-monitor desktop icons were unavailable\n");
+        return -1;
+    }
+    if (wait_for_frame_geometry(*applications_icon,
+                                &expected_applications) < 0) {
+        report_frame_geometry(
+            "Applications icon was not anchored to the primary monitor",
+            *applications_icon);
+        return -1;
+    }
+    if (wait_for_frame_geometry(*control_icon, &expected_control) < 0) {
+        report_frame_geometry(
+            "Control Panel icon was not anchored to the primary monitor",
+            *control_icon);
+        return -1;
+    }
+    return 0;
+}
+
+static int verify_multi_monitor_client(Atom change_state, Window *client_out)
+{
+    const FrameGeometry right_monitor = {800, 100, 800, 600};
+    const FrameGeometry maximized = {800, 100, 800, 600};
+    const FrameGeometry snapped_left = {800, 100, 400, 600};
+    const FrameGeometry snapped_right = {1200, 100, 400, 600};
+    const FrameGeometry expected_icon = {
+        812, 608, TEST_DESKTOP_ICON_WIDTH, TEST_DESKTOP_ICON_HEIGHT
+    };
+    int screen = DefaultScreen(display);
+    unsigned long black = BlackPixel(display, screen);
+    unsigned long white = WhitePixel(display, screen);
+    Window client;
+    Window frame;
+    Window icon;
+    FrameGeometry original;
+    FrameGeometry restored;
+    int icon_x;
+    int icon_y;
+
+    client = XCreateSimpleWindow(display, root, 950, 220, 260, 140, 0,
+                                 black, white);
+    XStoreName(display, client, "Win31 X Multi-Monitor Client");
+    XMapWindow(display, client);
+    XFlush(display);
+    if (wait_for_state(client, NormalState) < 0) {
+        fprintf(stderr,
+                "wm-probe: multi-monitor client was not managed\n");
+        return -1;
+    }
+    frame = client_frame(client);
+    if (frame == None || get_frame_geometry(frame, &original) < 0 ||
+        !frame_geometry_inside(&original, &right_monitor)) {
+        fprintf(stderr,
+                "wm-probe: multi-monitor client did not begin on the right monitor\n");
+        return -1;
+    }
+
+    if (click_frame_maximize_button(frame) < 0 ||
+        wait_for_frame_geometry(frame, &maximized) < 0 ||
+        wait_for_maximized_state(client, 1) < 0) {
+        report_frame_geometry(
+            "client maximize did not use the active right monitor", frame);
+        return -1;
+    }
+    if (click_frame_maximize_button(frame) < 0 ||
+        wait_for_frame_geometry(frame, &original) < 0 ||
+        wait_for_maximized_state(client, 0) < 0) {
+        report_frame_geometry(
+            "right-monitor maximize did not restore exact client geometry",
+            frame);
+        return -1;
+    }
+
+    /* Exercise the inter-monitor seam just inside the offset monitor's snap
+     * threshold so this cannot be mistaken for the root screen's left edge. */
+    if (drag_frame_title_to(frame, 801, 350) < 0 ||
+        wait_for_frame_geometry(frame, &snapped_left) < 0 ||
+        wait_for_maximized_state(client, 0) < 0) {
+        report_frame_geometry(
+            "client did not snap left at the inter-monitor seam", frame);
+        return -1;
+    }
+    if (click_frame_maximize_button(frame) < 0 ||
+        wait_for_frame_geometry(frame, &maximized) < 0 ||
+        click_frame_maximize_button(frame) < 0 ||
+        wait_for_frame_geometry(frame, &snapped_left) < 0) {
+        report_frame_geometry(
+            "maximizing a right-monitor snapped client lost its snap", frame);
+        return -1;
+    }
+    /* Exercise the offset monitor's right edge, not the root-sized layout. */
+    if (drag_frame_title_to(frame, 1598, 350) < 0 ||
+        wait_for_frame_geometry(frame, &snapped_right) < 0 ||
+        wait_for_maximized_state(client, 0) < 0) {
+        report_frame_geometry(
+            "client did not snap right on the offset monitor", frame);
+        return -1;
+    }
+    if (drag_frame_title_to(frame, 1101, 350) < 0 ||
+        wait_for_restored_frame(frame, &original, 0) < 0 ||
+        get_frame_geometry(frame, &restored) < 0 ||
+        !frame_geometry_inside(&restored, &right_monitor)) {
+        report_frame_geometry(
+            "dragging out of right-monitor snap did not restore on that monitor",
+            frame);
+        return -1;
+    }
+
+    send_iconify(client, change_state);
+    if (wait_for_state(client, IconicState) < 0) {
+        fprintf(stderr,
+                "wm-probe: right-monitor client did not minimize\n");
+        return -1;
+    }
+    icon = wait_for_role("minimized-icon", client, 1);
+    if (icon == None || wait_for_frame_geometry(icon, &expected_icon) < 0) {
+        if (icon != None)
+            report_frame_geometry(
+                "minimized icon was not placed at the right monitor's bottom edge",
+                icon);
+        else
+            fprintf(stderr,
+                    "wm-probe: right-monitor minimized icon was unavailable\n");
+        return -1;
+    }
+    if (window_center_on_root(icon, &icon_x, &icon_y) < 0 ||
+        fake_click_at(icon_x, icon_y) < 0 ||
+        wait_for_state(client, NormalState) < 0 ||
+        wait_for_active_client(client) < 0) {
+        fprintf(stderr,
+                "wm-probe: right-monitor minimized icon did not restore its client\n");
+        return -1;
+    }
+    *client_out = client;
+    return 0;
+}
+
+static int verify_multi_monitor_internal_windows(Window client,
+                                                 Window applications_icon,
+                                                 Window control_icon)
+{
+    const FrameGeometry right_monitor = {800, 100, 800, 600};
+    const FrameGeometry applications_normal = {860, 170, 680, 460};
+    const FrameGeometry control_normal = {60, 70, 680, 460};
+    const FrameGeometry maximized = {800, 100, 800, 600};
+    const FrameGeometry snapped_left = {800, 100, 400, 600};
+    Window launcher;
+    Window panel;
+    FrameGeometry moved_panel;
+    int icon_x;
+    int icon_y;
+
+    if (request_active_client(client) < 0 ||
+        fake_key_chord(XK_Alt_L, XK_F2) < 0) {
+        fprintf(stderr,
+                "wm-probe: could not open Applications on the active monitor\n");
+        return -1;
+    }
+    launcher = wait_for_role("applications-window", None, 1);
+    if (launcher == None || wait_for_focus_window(launcher) < 0 ||
+        wait_for_frame_geometry(launcher, &applications_normal) < 0) {
+        if (launcher != None)
+            report_frame_geometry(
+                "Applications was not centered on the active right monitor",
+                launcher);
+        return -1;
+    }
+    if (click_internal_maximize_button(launcher) < 0 ||
+        wait_for_frame_geometry(launcher, &maximized) < 0 ||
+        click_internal_maximize_button(launcher) < 0 ||
+        wait_for_frame_geometry(launcher, &applications_normal) < 0) {
+        report_frame_geometry(
+            "Applications maximize did not stay on the active monitor",
+            launcher);
+        return -1;
+    }
+    if (drag_frame_title_to(launcher, 801, 350) < 0 ||
+        wait_for_frame_geometry(launcher, &snapped_left) < 0 ||
+        click_internal_maximize_button(launcher) < 0 ||
+        wait_for_frame_geometry(launcher, &maximized) < 0 ||
+        click_internal_maximize_button(launcher) < 0 ||
+        wait_for_frame_geometry(launcher, &snapped_left) < 0) {
+        report_frame_geometry(
+            "Applications snap/maximize did not use the right monitor",
+            launcher);
+        return -1;
+    }
+    if (drag_internal_back_to_geometry(launcher, &applications_normal) < 0 ||
+        click_internal_close_button(launcher) < 0 ||
+        !internal_window_is_hidden(launcher)) {
+        fprintf(stderr,
+                "wm-probe: Applications did not restore and close after multi-monitor layout tests\n");
+        return -1;
+    }
+
+    if (window_center_on_root(control_icon, &icon_x, &icon_y) < 0 ||
+        fake_click_at(icon_x, icon_y) < 0) {
+        fprintf(stderr,
+                "wm-probe: could not open Control Panel from its desktop icon\n");
+        return -1;
+    }
+    panel = wait_for_role("control-panel-window", None, 1);
+    if (panel == None || wait_for_focus_window(panel) < 0 ||
+        wait_for_frame_geometry(panel, &control_normal) < 0) {
+        if (panel != None)
+            report_frame_geometry(
+                "Control Panel did not open on its primary-monitor icon",
+                panel);
+        return -1;
+    }
+    if (drag_frame_title_to(panel, 1200, 112) < 0 ||
+        wait_for_frame_inside(panel, &right_monitor) < 0 ||
+        get_frame_geometry(panel, &moved_panel) < 0) {
+        report_frame_geometry(
+            "Control Panel could not be moved onto the offset monitor", panel);
+        return -1;
+    }
+    if (click_internal_maximize_button(panel) < 0 ||
+        wait_for_frame_geometry(panel, &maximized) < 0 ||
+        click_internal_maximize_button(panel) < 0 ||
+        wait_for_frame_geometry(panel, &moved_panel) < 0) {
+        report_frame_geometry(
+            "Control Panel maximize did not use its current monitor", panel);
+        return -1;
+    }
+    if (click_internal_close_button(panel) < 0 ||
+        !internal_window_is_hidden(panel)) {
+        fprintf(stderr,
+                "wm-probe: Control Panel did not close after multi-monitor layout tests\n");
+        return -1;
+    }
+    if (!role_remains_unmapped("applications-window") ||
+        !role_remains_unmapped("control-panel-window")) {
+        fprintf(stderr,
+                "wm-probe: an internal window reopened unexpectedly\n");
+        return -1;
+    }
+    (void)applications_icon;
+    return 0;
+}
+
+static int verify_multi_monitor_dialogs(Window client)
+{
+    const FrameGeometry root_geometry = {0, 0, 1600, 700};
+    const FrameGeometry run_geometry = {965, 312, 470, 176};
+    const FrameGeometry menu_geometry = {1404, 581, 196, 119};
+    const FrameGeometry confirmation_geometry = {990, 312, 420, 176};
+    Atom active_window = XInternAtom(display, "_NET_ACTIVE_WINDOW", False);
+    Window run;
+    Window menu;
+    Window confirmation;
+    Window shield;
+    FrameGeometry actual;
+
+    if (request_active_client(client) < 0 || move_pointer_to(100, 300) < 0 ||
+        fake_key_chord(XK_Super_L, XK_r) < 0) {
+        fprintf(stderr,
+                "wm-probe: could not open Run for the active-monitor test\n");
+        return -1;
+    }
+    run = wait_for_role("run-window", None, 1);
+    if (run == None || wait_for_focus_window(run) < 0 ||
+        wait_for_frame_geometry(run, &run_geometry) < 0) {
+        if (run != None)
+            report_frame_geometry(
+                "Run was not centered on the focused client's monitor", run);
+        return -1;
+    }
+    if (fake_key(XK_Escape) < 0 || !internal_window_is_hidden(run) ||
+        wait_for_active_client(client) < 0) {
+        fprintf(stderr,
+                "wm-probe: closing multi-monitor Run did not restore client focus\n");
+        return -1;
+    }
+
+    if (fake_button_at(Button3, 1599, 699) < 0) {
+        fprintf(stderr,
+                "wm-probe: could not open the right-monitor context menu\n");
+        return -1;
+    }
+    menu = wait_for_role("desktop-menu", None, 1);
+    if (menu == None || wait_for_frame_geometry(menu, &menu_geometry) < 0 ||
+        wait_for_focus_and_active(client, client) < 0) {
+        if (menu != None)
+            report_frame_geometry(
+                "desktop menu was not clamped to the offset monitor", menu);
+        return -1;
+    }
+    if (fake_click_at(menu_geometry.x + 15, menu_geometry.y + 76) < 0 ||
+        !internal_window_is_hidden(menu)) {
+        fprintf(stderr,
+                "wm-probe: could not select Restart from the right-monitor menu\n");
+        return -1;
+    }
+    confirmation = wait_for_role("session-confirmation", None, 1);
+    shield = wait_for_role("session-confirmation-shield", None, 1);
+    if (confirmation == None || shield == None ||
+        wait_for_focus_window(confirmation) < 0 ||
+        wait_for_window_name(confirmation, "Confirm Restart") < 0 ||
+        wait_for_frame_geometry(confirmation, &confirmation_geometry) < 0 ||
+        wait_for_frame_geometry(shield, &root_geometry) < 0 ||
+        !window_is_above(confirmation, shield) ||
+        root_window_property(active_window) != client) {
+        if (confirmation != None &&
+            get_frame_geometry(confirmation, &actual) == 0)
+            fprintf(stderr,
+                    "wm-probe: right-monitor confirmation geometry was %d,%d %dx%d\n",
+                    actual.x, actual.y, actual.width, actual.height);
+        else
+            fprintf(stderr,
+                    "wm-probe: right-monitor confirmation was unavailable\n");
+        return -1;
+    }
+    if (fake_key(XK_Escape) < 0 ||
+        verify_session_confirmation_dismissed(
+            confirmation, client, client,
+            "Escape on the right-monitor confirmation") < 0) {
+        fprintf(stderr,
+                "wm-probe: right-monitor confirmation did not cancel safely\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int verify_multi_monitor(Atom change_state)
+{
+    const FrameGeometry expected_root = {0, 0, 1600, 700};
+    Window applications_icon;
+    Window control_icon;
+    Window client = None;
+    FrameGeometry actual_root = {0, 0, 0, 0};
+
+    if (get_frame_geometry(root, &actual_root) < 0 ||
+        !frame_geometry_equals(&actual_root, &expected_root)) {
+        fprintf(stderr,
+                "wm-probe: multi-monitor mode requires a 1600x700 X screen "
+                "(got %d,%d %dx%d)\n",
+                actual_root.x, actual_root.y, actual_root.width,
+                actual_root.height);
+        return -1;
+    }
+    if (verify_multi_monitor_static_icons(&applications_icon,
+                                          &control_icon) < 0 ||
+        verify_multi_monitor_client(change_state, &client) < 0 ||
+        verify_multi_monitor_internal_windows(client, applications_icon,
+                                              control_icon) < 0 ||
+        verify_multi_monitor_dialogs(client) < 0)
+        return -1;
+    XDestroyWindow(display, client);
+    XSync(display, False);
+    return 0;
+}
+
+int main(int argc, char **argv)
 {
     Window client;
     Window icon;
@@ -2220,12 +4238,27 @@ int main(void)
     Window launcher;
     Window control_panel;
     Atom supporting;
+    Atom net_supported;
+    Atom net_wm_icon;
     Atom delete_window;
     Atom change_state;
     XEvent event;
     const char *launch_marker = getenv("WIN31X_SMOKE_MARKER");
+    const char *run_marker = getenv("WIN31X_RUN_MARKER");
     const char *wifi_marker = getenv("WIN31X_WIFI_SECRET_MARKER");
     const char *lock_marker = getenv("WIN31X_LOCKER_MARKER");
+    const char *system_action_marker =
+        getenv("WIN31X_SYSTEM_ACTION_MARKER");
+    int logout_mode = argc == 2 &&
+                      strcmp(argv[1], "--desktop-menu-logout") == 0;
+    int multi_monitor_mode = argc == 2 &&
+                             strcmp(argv[1], "--multi-monitor") == 0;
+
+    if (argc != 1 && !logout_mode && !multi_monitor_mode) {
+        fprintf(stderr,
+                "usage: wm-probe [--desktop-menu-logout|--multi-monitor]\n");
+        return 2;
+    }
 
     display = XOpenDisplay(NULL);
     if (display == NULL) {
@@ -2242,11 +4275,36 @@ int main(void)
         XInternAtom(display, "_NET_WM_STATE_MAXIMIZED_VERT", False);
     role_atom = XInternAtom(display, "_WIN31X_ROLE", False);
     client_atom = XInternAtom(display, "_WIN31X_CLIENT", False);
+    net_wm_name_atom = XInternAtom(display, "_NET_WM_NAME", False);
     supporting = XInternAtom(display, "_NET_SUPPORTING_WM_CHECK", False);
+    net_supported = XInternAtom(display, "_NET_SUPPORTED", False);
+    net_wm_icon = XInternAtom(display, "_NET_WM_ICON", False);
     delete_window = XInternAtom(display, "WM_DELETE_WINDOW", False);
     change_state = XInternAtom(display, "WM_CHANGE_STATE", False);
     if (wait_for_wm_check(supporting) < 0) {
         fprintf(stderr, "wm-probe: Win31 X did not publish its WM check\n");
+        return 1;
+    }
+    if (logout_mode) {
+        int result = verify_desktop_menu_logout(supporting);
+
+        XCloseDisplay(display);
+        if (result < 0)
+            return 1;
+        puts("X11 desktop-menu logout test passed");
+        return 0;
+    }
+    if (multi_monitor_mode) {
+        int result = verify_multi_monitor(change_state);
+
+        XCloseDisplay(display);
+        if (result < 0)
+            return 1;
+        puts("X11 multi-monitor window-manager test passed");
+        return 0;
+    }
+    if (!window_atom_property_contains(root, net_supported, net_wm_icon)) {
+        fprintf(stderr, "wm-probe: _NET_WM_ICON was not advertised\n");
         return 1;
     }
     if (verify_preexisting_client() < 0)
@@ -2277,6 +4335,10 @@ int main(void)
                                  WhitePixel(display, DefaultScreen(display)));
     XStoreName(display, client, "Win31 X Probe");
     XSetWMProtocols(display, client, &delete_window, 1);
+    if (publish_test_window_icon(client) < 0) {
+        fprintf(stderr, "wm-probe: could not publish test window icon\n");
+        return 1;
+    }
     XMapWindow(display, client);
     XFlush(display);
     if (wait_for_state(client, NormalState) < 0) {
@@ -2303,6 +4365,12 @@ int main(void)
         fprintf(stderr, "wm-probe: no desktop icon appeared for minimized client\n");
         return 1;
     }
+    if (wait_for_window_pixel(icon, 56, 29,
+                              expected_rgb_pixel(0x12U, 0xabU, 0x34U)) < 0) {
+        fprintf(stderr,
+                "wm-probe: minimized client did not use its _NET_WM_ICON\n");
+        return 1;
+    }
     send_button_one(icon);
     if (wait_for_state(client, NormalState) < 0) {
         fprintf(stderr, "wm-probe: clicking the desktop icon did not restore client\n");
@@ -2323,6 +4391,35 @@ int main(void)
                 "wm-probe: internal windows did not remain open for launch test\n");
         return 1;
     }
+    send_button_one(applications_icon);
+    if (wait_for_focus_window(launcher) < 0) {
+        fprintf(stderr,
+                "wm-probe: Applications did not refocus for icon test\n");
+        return 1;
+    }
+    {
+        unsigned long expected_icon_pixel =
+            expected_rgb_pixel(0xffU, 0xffU, 0x99U);
+
+        if (wait_for_window_pixel(launcher, 72, 63,
+                                  expected_icon_pixel) < 0) {
+            XWindowAttributes launcher_attributes;
+
+            memset(&launcher_attributes, 0, sizeof(launcher_attributes));
+            (void)XGetWindowAttributes(display, launcher,
+                                       &launcher_attributes);
+        fprintf(stderr,
+                    "wm-probe: Applications did not render the desktop entry's real icon (got 0x%lx, expected 0x%lx, size %dx%d, map %d)\n",
+                    window_pixel_at(launcher, 72, 63), expected_icon_pixel,
+                    launcher_attributes.width, launcher_attributes.height,
+                    launcher_attributes.map_state);
+            return 1;
+        }
+    }
+    if (verify_run_dialog(run_marker, client, launcher, control_panel) < 0) {
+        fprintf(stderr, "wm-probe: Run dialog verification failed\n");
+        return 1;
+    }
     send_button_one_at(launcher, 50, 50);
     send_button_one_at(launcher, 50, 50);
     if (wait_for_file(launch_marker) < 0) {
@@ -2340,6 +4437,12 @@ int main(void)
     if (!internal_window_remains_viewable(launcher) ||
         !internal_window_remains_viewable(control_panel)) {
         fprintf(stderr, "wm-probe: Escape closed an internal window\n");
+        return 1;
+    }
+    if (verify_desktop_menu(client, applications_icon, launcher,
+                            control_panel, lock_marker,
+                            system_action_marker) < 0) {
+        fprintf(stderr, "wm-probe: desktop menu verification failed\n");
         return 1;
     }
 

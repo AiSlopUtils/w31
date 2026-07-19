@@ -2,7 +2,7 @@ CC ?= cc
 PKG_CONFIG ?= pkg-config
 BUILD_DIR ?= build
 
-override WIN31X_REQUIRED_PACKAGES := x11 libpng
+override WIN31X_REQUIRED_PACKAGES := x11 xrandr xinerama libpng
 override WIN31X_XTST_PACKAGE := xtst
 
 prefix ?= /usr/local
@@ -32,29 +32,32 @@ override WIN31X_CFLAGS += -O1 -fno-omit-frame-pointer \
 override WIN31X_LDFLAGS += -fsanitize=address,undefined
 endif
 
-WM_SOURCES = src/win31x.c src/applications.c src/auto_lock.c \
-	src/icon_assets.c src/settings.c src/wifi_backend.c
-WM_HEADERS = src/applications.h src/auto_lock.h src/icon_assets.h src/settings.h \
+WM_SOURCES = src/win31x.c src/applications.c src/app_icons.c src/auto_lock.c \
+	src/desktop_state.c src/icon_assets.c src/session_actions.c src/settings.c \
+	src/wifi_backend.c
+WM_HEADERS = src/applications.h src/app_icons.h src/auto_lock.h \
+	src/desktop_state.h src/icon_assets.h src/session_actions.h src/settings.h \
 	src/wifi_backend.h
 ICON_FILES = $(notdir $(wildcard assets/icons/*.png))
 ICON_DIR_STAMP = $(BUILD_DIR)/.icon-dir
 
 .PHONY: all check check-build-deps check-xtst-deps check-xvfb-deps smoke \
-	smoke-xvfb install uninstall clean FORCE
+	smoke-xvfb smoke-multimon-xvfb smoke-persistence-xvfb install uninstall \
+	clean FORCE
 
 all: $(BUILD_DIR)/win31x
 
 check-build-deps:
 	@if ! $(PKG_CONFIG) --version >/dev/null 2>&1; then \
-		echo "win31x: pkg-config is required to locate X11 and libpng." >&2; \
-		echo "Debian/Ubuntu: sudo apt install build-essential pkg-config libx11-dev libpng-dev" >&2; \
+		echo "win31x: pkg-config is required to locate X11, XRandR, Xinerama, and libpng." >&2; \
+		echo "Debian/Ubuntu: sudo apt install build-essential pkg-config libx11-dev libxrandr-dev libxinerama-dev libpng-dev" >&2; \
 		exit 2; \
 	fi
 	@if ! $(PKG_CONFIG) --exists $(WIN31X_REQUIRED_PACKAGES); then \
 		$(PKG_CONFIG) --print-errors --exists \
 			$(WIN31X_REQUIRED_PACKAGES) 2>&1 || true; \
 		echo "win31x: required pkg-config modules are unavailable: $(WIN31X_REQUIRED_PACKAGES)" >&2; \
-		echo "Debian/Ubuntu: sudo apt install build-essential pkg-config libx11-dev libpng-dev" >&2; \
+		echo "Debian/Ubuntu: sudo apt install build-essential pkg-config libx11-dev libxrandr-dev libxinerama-dev libpng-dev" >&2; \
 		exit 2; \
 	fi
 
@@ -101,15 +104,32 @@ $(BUILD_DIR)/test-icon-assets: tests/test_icon_assets.c src/icon_assets.c src/ic
 		$(LDFLAGS) $(WIN31X_LDFLAGS) tests/test_icon_assets.c \
 		src/icon_assets.c -o $@ $(LDLIBS) $(WIN31X_LDLIBS)
 
+$(BUILD_DIR)/test-app-icons: tests/test_app_icons.c src/app_icons.c src/app_icons.h | \
+		$(BUILD_DIR)
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) $(WIN31X_CFLAGS) $(LDFLAGS) \
+		$(WIN31X_LDFLAGS) tests/test_app_icons.c src/app_icons.c -o $@
+
 $(BUILD_DIR)/test-settings: tests/test_settings.c src/settings.c src/settings.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) $(WIN31X_CFLAGS) $(LDFLAGS) \
 		$(WIN31X_LDFLAGS) tests/test_settings.c src/settings.c -o $@
+
+$(BUILD_DIR)/test-desktop-state: tests/test_desktop_state.c \
+		src/desktop_state.c src/desktop_state.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) $(WIN31X_CFLAGS) $(LDFLAGS) \
+		$(WIN31X_LDFLAGS) tests/test_desktop_state.c src/desktop_state.c -o $@
 
 $(BUILD_DIR)/test-auto-lock: tests/test_auto_lock.c src/auto_lock.c src/auto_lock.h | \
 	$(BUILD_DIR) check-build-deps
 	$(CC) $(CPPFLAGS) $(WIN31X_CPPFLAGS) $(CFLAGS) $(WIN31X_CFLAGS) \
 		$(LDFLAGS) $(WIN31X_LDFLAGS) tests/test_auto_lock.c \
 		src/auto_lock.c -o $@ $(LDLIBS) $(WIN31X_LDLIBS)
+
+$(BUILD_DIR)/test-session-actions: tests/test_session_actions.c \
+		src/session_actions.c src/session_actions.h src/applications.c \
+		src/applications.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) -Isrc $(CFLAGS) $(WIN31X_CFLAGS) $(LDFLAGS) \
+		$(WIN31X_LDFLAGS) tests/test_session_actions.c \
+		src/session_actions.c src/applications.c -o $@
 
 $(BUILD_DIR)/test-wifi-backend: tests/test_wifi_backend.c src/wifi_backend.c \
 		src/wifi_backend.h | $(BUILD_DIR)
@@ -122,30 +142,59 @@ $(BUILD_DIR)/wm-probe: tests/wm_probe.c | $(BUILD_DIR) check-xtst-deps
 		tests/wm_probe.c -o $@ $(LDLIBS) $(WIN31X_LDLIBS) \
 		$(WIN31X_XTST_LDLIBS)
 
+$(BUILD_DIR)/persistence-probe: tests/persistence_probe.c | \
+		$(BUILD_DIR) check-xtst-deps
+	$(CC) $(CPPFLAGS) $(WIN31X_CPPFLAGS) $(WIN31X_XTST_CPPFLAGS) \
+		$(CFLAGS) $(WIN31X_CFLAGS) $(LDFLAGS) $(WIN31X_LDFLAGS) \
+		tests/persistence_probe.c -o $@ $(LDLIBS) $(WIN31X_LDLIBS) \
+		$(WIN31X_XTST_LDLIBS)
+
 $(BUILD_DIR)/preexisting-client: tests/preexisting_client.c | \
 	$(BUILD_DIR) check-build-deps
 	$(CC) $(CPPFLAGS) $(WIN31X_CPPFLAGS) $(CFLAGS) $(WIN31X_CFLAGS) \
 		$(LDFLAGS) $(WIN31X_LDFLAGS) tests/preexisting_client.c \
 		-o $@ $(LDLIBS) $(WIN31X_LDLIBS)
 
-check: $(BUILD_DIR)/test-applications $(BUILD_DIR)/test-icon-assets \
-	$(BUILD_DIR)/test-settings $(BUILD_DIR)/test-auto-lock \
+check: $(BUILD_DIR)/test-applications $(BUILD_DIR)/test-app-icons \
+	$(BUILD_DIR)/test-icon-assets \
+	$(BUILD_DIR)/test-settings $(BUILD_DIR)/test-desktop-state \
+	$(BUILD_DIR)/test-auto-lock \
+	$(BUILD_DIR)/test-session-actions \
 	$(BUILD_DIR)/test-wifi-backend
 	$(BUILD_DIR)/test-applications
+	$(BUILD_DIR)/test-app-icons
 	WIN31X_ICON_DIR=assets/icons $(BUILD_DIR)/test-icon-assets
 	$(BUILD_DIR)/test-settings
+	$(BUILD_DIR)/test-desktop-state
 	$(BUILD_DIR)/test-auto-lock
+	$(BUILD_DIR)/test-session-actions
 	$(BUILD_DIR)/test-wifi-backend
 	./tests/check-icon-provenance.sh
 
 smoke: all $(BUILD_DIR)/wm-probe $(BUILD_DIR)/preexisting-client \
-	$(BUILD_DIR)/test-auto-lock $(BUILD_DIR)/test-wifi-backend
+	$(BUILD_DIR)/test-auto-lock $(BUILD_DIR)/test-session-actions \
+	$(BUILD_DIR)/test-wifi-backend
 	./tests/smoke-x11.sh
 
 smoke-xvfb: all $(BUILD_DIR)/wm-probe $(BUILD_DIR)/preexisting-client \
-	$(BUILD_DIR)/test-auto-lock $(BUILD_DIR)/test-wifi-backend \
+	$(BUILD_DIR)/persistence-probe \
+	$(BUILD_DIR)/test-auto-lock $(BUILD_DIR)/test-session-actions \
+	$(BUILD_DIR)/test-wifi-backend \
 	check-xvfb-deps
 	xvfb-run -a -s "-screen 0 1024x768x24" ./tests/smoke-x11.sh
+	WIN31X_TEST_MONITORS='800x600+0+0,800x600+800+100' \
+		xvfb-run -a -s "-screen 0 1600x700x24" ./tests/smoke-x11.sh
+	./tests/persistence-x11.sh
+
+smoke-multimon-xvfb: all $(BUILD_DIR)/wm-probe \
+	$(BUILD_DIR)/test-auto-lock $(BUILD_DIR)/test-session-actions \
+	$(BUILD_DIR)/test-wifi-backend \
+	check-xvfb-deps
+	WIN31X_TEST_MONITORS='800x600+0+0,800x600+800+100' \
+		xvfb-run -a -s "-screen 0 1600x700x24" ./tests/smoke-x11.sh
+
+smoke-persistence-xvfb: all $(BUILD_DIR)/persistence-probe check-xvfb-deps
+	./tests/persistence-x11.sh
 
 install: all
 	install -d "$(DESTDIR)$(bindir)"

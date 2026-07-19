@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static int failures;
 
@@ -95,10 +96,82 @@ static void test_classification(void)
           ICON_CATEGORY_EXECUTABLE);
 }
 
+static void test_application_image_loading(void)
+{
+    IconImage png = {0};
+    IconImage scaled = {0};
+    IconImage xpm = {0};
+    char temporary[] = "/tmp/win31x-icon-image-XXXXXX";
+    int descriptor;
+    FILE *file;
+
+    CHECK(icon_image_load_file("assets/icons/settings-48.png", &png) == 0);
+    CHECK(png.width == 48U);
+    CHECK(png.height == 48U);
+    CHECK(icon_image_scale_fit(&png, 16U, 16U, &scaled) == 0);
+    CHECK(scaled.width == 16U);
+    CHECK(scaled.height == 16U);
+    icon_image_free(&scaled);
+    icon_image_free(&png);
+
+    descriptor = mkstemp(temporary);
+    CHECK(descriptor >= 0);
+    if (descriptor < 0)
+        return;
+    file = fdopen(descriptor, "w");
+    CHECK(file != NULL);
+    if (file == NULL) {
+        close(descriptor);
+        unlink(temporary);
+        return;
+    }
+    CHECK(fputs("/* XPM */\nstatic char *icon[] = {\n"
+                "\"2 2 2 1\",\n\". c None\",\n"
+                "\"X c #12ab34 m black\",\n\"XX\",\n\"X.\"\n};\n",
+                file) != EOF);
+    CHECK(fclose(file) == 0);
+    CHECK(icon_image_load_file(temporary, &xpm) == 0);
+    CHECK(xpm.width == 2U);
+    CHECK(xpm.height == 2U);
+    if (xpm.rgba != NULL) {
+        CHECK(xpm.rgba[0] == 0x12U);
+        CHECK(xpm.rgba[1] == 0xabU);
+        CHECK(xpm.rgba[2] == 0x34U);
+        CHECK(xpm.rgba[3] == 0xffU);
+        CHECK(xpm.rgba[15] == 0U);
+    }
+    icon_image_free(&xpm);
+
+    file = fopen(temporary, "w");
+    CHECK(file != NULL);
+    if (file != NULL) {
+        CHECK(fputs("/* XPM *x\nstatic char *icon[] = {\n"
+                    "\"1 1 1 1\",\n\"X c #ffffff\",\n\"X\"\n};\n",
+                    file) != EOF);
+        CHECK(fclose(file) == 0);
+        CHECK(icon_image_load_file(temporary, &xpm) == -1);
+        CHECK(xpm.rgba == NULL);
+    }
+
+    file = fopen(temporary, "w");
+    CHECK(file != NULL);
+    if (file != NULL) {
+        CHECK(fputs("/* XPM */\nstatic char *icon[] = {\n"
+                    "\"999999999999999999999 1 1 1\",\n"
+                    "\"X c #ffffff\",\n\"X\"\n};\n",
+                    file) != EOF);
+        CHECK(fclose(file) == 0);
+        CHECK(icon_image_load_file(temporary, &xpm) == -1);
+        CHECK(xpm.rgba == NULL);
+    }
+    unlink(temporary);
+}
+
 int main(void)
 {
     test_loaded_assets();
     test_classification();
+    test_application_image_loading();
     if (failures != 0) {
         fprintf(stderr, "%d icon asset test(s) failed\n", failures);
         return 1;

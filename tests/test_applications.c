@@ -204,6 +204,200 @@ static void test_empty_quoted_argument(void)
     CHECK(argv == NULL);
 }
 
+static void check_command_arguments(const char *command,
+                                    const char *const *expected)
+{
+    char **argv = NULL;
+    size_t index;
+
+    CHECK(app_command_build_argv(command, &argv) == 0);
+    if (argv == NULL)
+        return;
+    for (index = 0U; expected[index] != NULL; ++index) {
+        CHECK(argv[index] != NULL);
+        if (argv[index] == NULL)
+            break;
+        CHECK(strcmp(argv[index], expected[index]) == 0);
+    }
+    if (expected[index] == NULL)
+        CHECK(argv[index] == NULL);
+    app_argv_free(argv);
+}
+
+static void test_run_command_parsing(void)
+{
+    static const char *const grouped[] = {
+        "program",
+        "plain",
+        "two words",
+        "single quoted",
+        "escaped whitespace",
+        "double ' quote",
+        "single \" quote",
+        "100%",
+        "%f",
+        "\\literal",
+        NULL
+    };
+    static const char *const empty_and_joined[] = {
+        "program",
+        "",
+        "",
+        "prefixjoinedagain",
+        "quoted\"mark",
+        "outside'quote",
+        "single\\backslash",
+        NULL
+    };
+    static const char *const no_shell_syntax[] = {
+        "program",
+        "one;",
+        "other",
+        "$(literal)",
+        "100%complete",
+        NULL
+    };
+
+    check_command_arguments(
+        " \tprogram plain \"two words\" 'single quoted' "
+        "escaped\\ whitespace \"double ' quote\" 'single \" quote' "
+        "100% %f \\\\literal\n",
+        grouped);
+    check_command_arguments(
+        "program \"\" '' prefix\"joined\"'again' "
+        "\"quoted\\\"mark\" outside\\'quote 'single\\backslash'",
+        empty_and_joined);
+    check_command_arguments(
+        "program one; other '$(literal)' 100%complete",
+        no_shell_syntax);
+}
+
+static void test_invalid_run_commands(void)
+{
+    static const char *const invalid[] = {
+        "",
+        " \t\r\n",
+        "\"\" argument",
+        "'' argument",
+        "program \"unterminated",
+        "program 'unterminated",
+        "program trailing\\",
+        "program \"trailing\\",
+        NULL
+    };
+    size_t index;
+    char *sentinel[1] = {NULL};
+    char **argv = sentinel;
+
+    errno = 0;
+    CHECK(app_command_build_argv(NULL, &argv) < 0);
+    CHECK(errno == EINVAL);
+    errno = 0;
+    CHECK(app_command_build_argv("program", NULL) < 0);
+    CHECK(errno == EINVAL);
+    for (index = 0U; invalid[index] != NULL; ++index) {
+        argv = sentinel;
+        errno = 0;
+        CHECK(app_command_build_argv(invalid[index], &argv) < 0);
+        CHECK(argv == NULL);
+        CHECK(errno == EINVAL);
+    }
+}
+
+static void test_run_command_launch(void)
+{
+    char marker[] = "/tmp/win31x-run-command-XXXXXX";
+    char not_executable[] = "/tmp/win31x-not-executable-XXXXXX";
+    char broken_interpreter[] = "/tmp/win31x-broken-interpreter-XXXXXX";
+    char command[1024];
+    int descriptor;
+    int status = 0;
+    pid_t pid;
+    pid_t waited;
+    const char *path_environment = getenv("PATH");
+    char *saved_path = path_environment != NULL ? strdup(path_environment) : NULL;
+
+    if (path_environment != NULL && saved_path == NULL) {
+        CHECK(0);
+        return;
+    }
+
+    descriptor = mkstemp(marker);
+    CHECK(descriptor >= 0);
+    if (descriptor < 0)
+        return;
+    CHECK(close(descriptor) == 0);
+    CHECK(unlink(marker) == 0);
+    CHECK(snprintf(command, sizeof(command), "touch '%s'", marker) <
+          (int)sizeof(command));
+    pid = app_launch_command(command);
+    CHECK(pid > 0);
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    CHECK(waited == pid);
+    if (waited == pid) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status))
+            CHECK(WEXITSTATUS(status) == 0);
+    }
+    CHECK(access(marker, F_OK) == 0);
+    unlink(marker);
+
+    CHECK(unsetenv("PATH") == 0);
+    pid = app_launch_command("true");
+    CHECK(pid > 0);
+    if (pid > 0) {
+        do {
+            waited = waitpid(pid, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        CHECK(waited == pid);
+        CHECK(waited == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    if (saved_path != NULL)
+        CHECK(setenv("PATH", saved_path, 1) == 0);
+    else
+        CHECK(unsetenv("PATH") == 0);
+    free(saved_path);
+
+    descriptor = mkstemp(not_executable);
+    CHECK(descriptor >= 0);
+    if (descriptor >= 0) {
+        CHECK(close(descriptor) == 0);
+        CHECK(chmod(not_executable, 0600) == 0);
+        errno = 0;
+        CHECK(app_launch_command(not_executable) < 0);
+        CHECK(errno == EACCES);
+        unlink(not_executable);
+    }
+
+    descriptor = mkstemp(broken_interpreter);
+    CHECK(descriptor >= 0);
+    if (descriptor >= 0) {
+        static const char script[] =
+            "#!/tmp/win31x-interpreter-that-does-not-exist\nexit 0\n";
+
+        CHECK(write(descriptor, script, sizeof(script) - 1U) ==
+              (ssize_t)(sizeof(script) - 1U));
+        CHECK(close(descriptor) == 0);
+        CHECK(chmod(broken_interpreter, 0700) == 0);
+        errno = 0;
+        CHECK(app_launch_command(broken_interpreter) < 0);
+        CHECK(errno == ENOENT);
+        unlink(broken_interpreter);
+    }
+
+    errno = 0;
+    CHECK(app_launch_command("/tmp/win31x-command-that-does-not-exist") < 0);
+    CHECK(errno == ENOENT);
+    errno = 0;
+    CHECK(app_launch_command("program 'unterminated") < 0);
+    CHECK(errno == EINVAL);
+    errno = 0;
+    CHECK(app_launch_command(NULL) < 0);
+    CHECK(errno == EINVAL);
+}
+
 static void test_launch_working_directory(void)
 {
     char directory_template[] = "/tmp/win31x-working-directory-XXXXXX";
@@ -392,6 +586,9 @@ int main(void)
     test_exec_expansion();
     test_escaped_values();
     test_empty_quoted_argument();
+    test_run_command_parsing();
+    test_invalid_run_commands();
+    test_run_command_launch();
     test_launch_working_directory();
     test_invalid_exec();
     test_xdg_hidden_override();

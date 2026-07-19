@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <signal.h>
@@ -13,11 +14,15 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
+
+#define APP_LAUNCH_MAX_ARGUMENTS 4096U
+#define APP_LAUNCH_MAX_ARGUMENT_BYTES (1024U * 1024U)
 
 typedef struct {
     char **items;
@@ -498,6 +503,95 @@ fail:
     return -1;
 }
 
+int app_command_build_argv(const char *command, char ***argv_out)
+{
+    StringVector vector = {0};
+    char *token = NULL;
+    size_t token_length = 0;
+    size_t token_capacity = 0;
+    char quote = '\0';
+    bool escaped = false;
+    bool token_started = false;
+    const char *cursor;
+    char **argv;
+    int saved_errno;
+
+    if (command == NULL || argv_out == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    *argv_out = NULL;
+    if (append_char(&token, &token_length, &token_capacity, '\0') < 0)
+        return -1;
+    token_length = 0;
+    token[0] = '\0';
+
+    for (cursor = command;; ++cursor) {
+        char ch = *cursor;
+
+        if (escaped) {
+            if (ch == '\0') {
+                errno = EINVAL;
+                goto fail;
+            }
+            if (append_char(&token, &token_length, &token_capacity, ch) < 0)
+                goto fail;
+            escaped = false;
+            token_started = true;
+            continue;
+        }
+        if (ch == '\\' && quote != '\'') {
+            escaped = true;
+            token_started = true;
+            continue;
+        }
+        if (quote == '\0' && (ch == '\'' || ch == '"')) {
+            quote = ch;
+            token_started = true;
+            continue;
+        }
+        if (quote != '\0' && ch == quote) {
+            quote = '\0';
+            continue;
+        }
+        if (ch == '\0' && quote != '\0') {
+            errno = EINVAL;
+            goto fail;
+        }
+        if (ch == '\0' || (quote == '\0' && isspace((unsigned char)ch))) {
+            if (token_started && vector_push(&vector, token) < 0)
+                goto fail;
+            token_length = 0;
+            token[0] = '\0';
+            token_started = false;
+            if (ch == '\0')
+                break;
+            continue;
+        }
+        if (append_char(&token, &token_length, &token_capacity, ch) < 0)
+            goto fail;
+        token_started = true;
+    }
+    if (escaped || vector.len == 0 || vector.items[0][0] == '\0') {
+        errno = EINVAL;
+        goto fail;
+    }
+    argv = realloc(vector.items, (vector.len + 1U) * sizeof(*argv));
+    if (argv == NULL)
+        goto fail;
+    argv[vector.len] = NULL;
+    free(token);
+    *argv_out = argv;
+    return 0;
+
+fail:
+    saved_errno = errno;
+    free(token);
+    app_argv_free(vector.items);
+    errno = saved_errno;
+    return -1;
+}
+
 void app_argv_free(char **argv)
 {
     size_t index;
@@ -543,6 +637,78 @@ static bool executable_in_path(const char *name)
         start = end + 1;
     }
     return false;
+}
+
+static int executable_candidate(const char *path)
+{
+    struct stat status;
+
+    if (access(path, X_OK) < 0)
+        return -1;
+    if (stat(path, &status) < 0)
+        return -1;
+    if (!S_ISREG(status.st_mode)) {
+        errno = EACCES;
+        return -1;
+    }
+    return 0;
+}
+
+static int resolve_command_executable(const char *name, char **path_out)
+{
+    const char *path;
+    const char *start;
+    int result_errno = ENOENT;
+
+    if (path_out == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    *path_out = NULL;
+    if (name == NULL || name[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    if (strchr(name, '/') != NULL) {
+        if (executable_candidate(name) < 0)
+            return -1;
+        *path_out = strdup(name);
+        return *path_out != NULL ? 0 : -1;
+    }
+    path = getenv("PATH");
+    if (path == NULL)
+        path = "/usr/local/bin:/usr/bin:/bin";
+    start = path;
+    for (;;) {
+        const char *end = strchr(start, ':');
+        char candidate[PATH_MAX];
+        size_t directory_length =
+            end == NULL ? strlen(start) : (size_t)(end - start);
+        int length;
+
+        if (directory_length > (size_t)INT_MAX) {
+            length = (int)sizeof(candidate);
+        } else if (directory_length == 0U) {
+            length = snprintf(candidate, sizeof(candidate), "./%s", name);
+        } else {
+            length = snprintf(candidate, sizeof(candidate), "%.*s/%s",
+                              (int)directory_length, start, name);
+        }
+        if (length < 0 || length >= (int)sizeof(candidate)) {
+            if (result_errno == ENOENT)
+                result_errno = ENAMETOOLONG;
+        } else if (executable_candidate(candidate) == 0) {
+            *path_out = strdup(candidate);
+            return *path_out != NULL ? 0 : -1;
+        } else if (errno == EACCES) {
+            result_errno = EACCES;
+        }
+        if (end == NULL)
+            break;
+        start = end + 1;
+    }
+    errno = result_errno;
+    return -1;
 }
 
 static void launch_terminal(char **application_argv)
@@ -620,6 +786,167 @@ pid_t app_launch(const AppEntry *entry)
     }
     app_argv_free(argv);
     return pid;
+}
+
+static pid_t launch_owned_argv(char **argv)
+{
+    char *executable_path = NULL;
+    int error_pipe[2] = {-1, -1};
+    int descriptor_flags;
+    int child_errno = 0;
+    size_t received = 0U;
+    pid_t pid;
+    int saved_errno;
+
+    if (resolve_command_executable(argv[0], &executable_path) < 0) {
+        saved_errno = errno;
+        app_argv_free(argv);
+        errno = saved_errno;
+        return -1;
+    }
+    if (pipe(error_pipe) < 0) {
+        saved_errno = errno;
+        free(executable_path);
+        app_argv_free(argv);
+        errno = saved_errno;
+        return -1;
+    }
+    descriptor_flags = fcntl(error_pipe[1], F_GETFD);
+    if (descriptor_flags < 0 ||
+        fcntl(error_pipe[1], F_SETFD, descriptor_flags | FD_CLOEXEC) < 0) {
+        saved_errno = errno;
+        close(error_pipe[0]);
+        close(error_pipe[1]);
+        free(executable_path);
+        app_argv_free(argv);
+        errno = saved_errno;
+        return -1;
+    }
+    pid = fork();
+    if (pid == 0) {
+        struct sigaction action;
+        int launch_errno;
+        const unsigned char *error_bytes;
+        size_t written = 0U;
+
+        close(error_pipe[0]);
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = SIG_DFL;
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGCHLD, &action, NULL);
+        sigaction(SIGPIPE, &action, NULL);
+        if (setsid() < 0) {
+            launch_errno = errno;
+        } else {
+            execv(executable_path, argv);
+            launch_errno = errno;
+        }
+        error_bytes = (const unsigned char *)&launch_errno;
+        while (written < sizeof(launch_errno)) {
+            ssize_t count = write(error_pipe[1], error_bytes + written,
+                                  sizeof(launch_errno) - written);
+
+            if (count > 0)
+                written += (size_t)count;
+            else if (count < 0 && errno == EINTR)
+                continue;
+            else
+                break;
+        }
+        _exit(127);
+    }
+    saved_errno = errno;
+    close(error_pipe[1]);
+    error_pipe[1] = -1;
+    free(executable_path);
+    app_argv_free(argv);
+    if (pid < 0) {
+        close(error_pipe[0]);
+        errno = saved_errno;
+        return -1;
+    }
+    while (received < sizeof(child_errno)) {
+        ssize_t count = read(error_pipe[0],
+                             (unsigned char *)&child_errno + received,
+                             sizeof(child_errno) - received);
+
+        if (count > 0)
+            received += (size_t)count;
+        else if (count < 0 && errno == EINTR)
+            continue;
+        else if (count == 0)
+            break;
+        else {
+            saved_errno = errno;
+            close(error_pipe[0]);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    close(error_pipe[0]);
+    if (received != 0U) {
+        int status;
+
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+            ;
+        errno = received == sizeof(child_errno) && child_errno != 0
+                    ? child_errno
+                    : EIO;
+        return -1;
+    }
+    return pid;
+}
+
+pid_t app_launch_command(const char *command)
+{
+    char **argv = NULL;
+
+    if (app_command_build_argv(command, &argv) < 0)
+        return -1;
+    return launch_owned_argv(argv);
+}
+
+pid_t app_launch_argv(const char *const arguments[])
+{
+    char **copy;
+    size_t count = 0U;
+    size_t total = 0U;
+    size_t index;
+
+    if (arguments == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    while (arguments[count] != NULL) {
+        size_t length;
+
+        if (count >= APP_LAUNCH_MAX_ARGUMENTS) {
+            errno = E2BIG;
+            return -1;
+        }
+        length = strlen(arguments[count]) + 1U;
+        if (length > APP_LAUNCH_MAX_ARGUMENT_BYTES - total) {
+            errno = E2BIG;
+            return -1;
+        }
+        total += length;
+        ++count;
+    }
+    if (count == 0U || arguments[0][0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    copy = calloc(count + 1U, sizeof(*copy));
+    if (copy == NULL)
+        return -1;
+    for (index = 0U; index < count; ++index) {
+        copy[index] = strdup(arguments[index]);
+        if (copy[index] == NULL) {
+            app_argv_free(copy);
+            return -1;
+        }
+    }
+    return launch_owned_argv(copy);
 }
 
 static int add_application(AppList *list, const char *path)

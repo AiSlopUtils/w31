@@ -421,6 +421,9 @@ int main(int argc, char **argv)
 
     if (strcmp(program_name, "fake-xss-lock") == 0)
         return run_fake_child("WIN31X_TEST_SUPERVISOR_MARKER", argc, argv);
+    if (strcmp(program_name, "fake-locker") == 0 &&
+        getenv("WIN31X_TEST_LOCKER_ONESHOT") != NULL)
+        return write_fake_marker("WIN31X_TEST_LOCKER_MARKER", argc, argv);
     if (strcmp(program_name, "fake-locker") == 0)
         return run_fake_child("WIN31X_TEST_LOCKER_MARKER", argc, argv);
 

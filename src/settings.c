@@ -45,6 +45,7 @@ void win31x_settings_defaults(Win31xSettings *settings)
     settings->color_scheme = 0U;
     settings->auto_lock_enabled = false;
     settings->auto_lock_minutes = 10U;
+    settings->control_panel_section = WIN31X_CONTROL_PANEL_SECTION_WIFI;
 }
 
 static int format_path(char *destination, size_t capacity, const char *format,
@@ -190,6 +191,46 @@ static bool parse_color_scheme(const char *value, size_t *index)
     return false;
 }
 
+static bool parse_control_panel_section(
+    const char *value, Win31xControlPanelSection *section)
+{
+    static const char *const identifiers[WIN31X_CONTROL_PANEL_SECTION_COUNT] = {
+        "wifi", "colors", "auto-lock"
+    };
+    uintmax_t numeric;
+    size_t candidate;
+
+    for (candidate = 0U; candidate < WIN31X_CONTROL_PANEL_SECTION_COUNT;
+         ++candidate) {
+        if (strcmp(value, identifiers[candidate]) == 0) {
+            *section = (Win31xControlPanelSection)candidate;
+            return true;
+        }
+    }
+    if (parse_decimal(value, &numeric) &&
+        numeric < (uintmax_t)WIN31X_CONTROL_PANEL_SECTION_COUNT) {
+        *section = (Win31xControlPanelSection)numeric;
+        return true;
+    }
+    return false;
+}
+
+static const char *control_panel_section_identifier(
+    Win31xControlPanelSection section)
+{
+    switch (section) {
+    case WIN31X_CONTROL_PANEL_SECTION_WIFI:
+        return "wifi";
+    case WIN31X_CONTROL_PANEL_SECTION_COLORS:
+        return "colors";
+    case WIN31X_CONTROL_PANEL_SECTION_AUTO_LOCK:
+        return "auto-lock";
+    case WIN31X_CONTROL_PANEL_SECTION_COUNT:
+        break;
+    }
+    return "wifi";
+}
+
 static unsigned int clamp_lock_minutes(uintmax_t minutes)
 {
     if (minutes < (uintmax_t)WIN31X_AUTO_LOCK_MINUTES_MIN)
@@ -229,6 +270,11 @@ static void parse_setting_line(Win31xSettings *settings, char *line)
 
         if (parse_decimal(value, &minutes))
             settings->auto_lock_minutes = clamp_lock_minutes(minutes);
+    } else if (strcmp(key, "control_panel_section") == 0) {
+        Win31xControlPanelSection section;
+
+        if (parse_control_panel_section(value, &section))
+            settings->control_panel_section = section;
     }
 }
 
@@ -418,6 +464,10 @@ static Win31xSettings normalized_settings(const Win31xSettings *settings)
         normalized.color_scheme = 0U;
     normalized.auto_lock_minutes = clamp_lock_minutes(
         (uintmax_t)normalized.auto_lock_minutes);
+    if ((unsigned int)normalized.control_panel_section >=
+        (unsigned int)WIN31X_CONTROL_PANEL_SECTION_COUNT) {
+        normalized.control_panel_section = WIN31X_CONTROL_PANEL_SECTION_WIFI;
+    }
     return normalized;
 }
 
@@ -425,6 +475,7 @@ int win31x_settings_save(const Win31xSettings *settings)
 {
     Win31xSettings normalized;
     const Win31xColorScheme *scheme;
+    const char *control_panel_section;
     char contents[256];
     char temporary_name[96] = "";
     int content_length;
@@ -443,14 +494,17 @@ int win31x_settings_save(const Win31xSettings *settings)
         errno = EINVAL;
         return -1;
     }
+    control_panel_section = control_panel_section_identifier(
+        normalized.control_panel_section);
     content_length = snprintf(
         contents, sizeof(contents),
         "# Win31 X settings\n"
         "color_scheme=%s\n"
         "auto_lock_enabled=%s\n"
-        "auto_lock_minutes=%u\n",
+        "auto_lock_minutes=%u\n"
+        "control_panel_section=%s\n",
         scheme->id, normalized.auto_lock_enabled ? "true" : "false",
-        normalized.auto_lock_minutes);
+        normalized.auto_lock_minutes, control_panel_section);
     if (content_length < 0 || (size_t)content_length >= sizeof(contents)) {
         errno = EOVERFLOW;
         return -1;

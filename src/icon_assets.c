@@ -4,18 +4,26 @@
 
 #include <png.h>
 
+#include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #ifndef WIN31X_ICON_DIR
 #define WIN31X_ICON_DIR ""
 #endif
+
+#define APPLICATION_ICON_MAX_DIMENSION 2048U
+#define APPLICATION_ICON_MAX_PIXELS (APPLICATION_ICON_MAX_DIMENSION * \
+                                     APPLICATION_ICON_MAX_DIMENSION)
 
 typedef struct {
     FILE *file;
@@ -199,8 +207,10 @@ static bool size_multiplication_overflows(size_t count, size_t item_size)
     return item_size != 0 && count > SIZE_MAX / item_size;
 }
 
-static int load_png(const char *path, const IconAssetDescriptor *descriptor,
-                    IconImage *image)
+static int load_png(FILE *input, const char *path,
+                    unsigned int expected_width,
+                    unsigned int expected_height, IconImage *image,
+                    bool required_asset)
 {
     PngLoadState *state;
     unsigned char signature[8];
@@ -215,19 +225,27 @@ static int load_png(const char *path, const IconAssetDescriptor *descriptor,
 
     state = calloc(1, sizeof(*state));
     if (state == NULL) {
+        if (input != NULL)
+            fclose(input);
         fprintf(stderr, "win31x: cannot allocate PNG loader for %s\n", path);
+        errno = ENOMEM;
         return -1;
     }
-    state->file = fopen(path, "rb");
+    state->file = input != NULL ? input : fopen(path, "rb");
     if (state->file == NULL) {
-        fprintf(stderr, "win31x: required icon asset %s cannot be opened: %s\n",
-                path, strerror(errno));
+        if (required_asset)
+            fprintf(stderr,
+                    "win31x: required icon asset %s cannot be opened: %s\n",
+                    path, strerror(errno));
         png_state_destroy(state);
         return -1;
     }
     if (fread(signature, 1, sizeof(signature), state->file) != sizeof(signature) ||
         png_sig_cmp(signature, 0, sizeof(signature)) != 0) {
-        fprintf(stderr, "win31x: required icon asset %s is not a valid PNG\n", path);
+        if (required_asset)
+            fprintf(stderr,
+                    "win31x: required icon asset %s is not a valid PNG\n",
+                    path);
         errno = EINVAL;
         png_state_destroy(state);
         return -1;
@@ -235,21 +253,28 @@ static int load_png(const char *path, const IconAssetDescriptor *descriptor,
     state->png = png_create_read_struct(PNG_LIBPNG_VER_STRING, state,
                                         png_error_handler, png_warning_handler);
     if (state->png == NULL) {
-        fprintf(stderr, "win31x: libpng initialization failed for %s\n", path);
+        if (required_asset)
+            fprintf(stderr, "win31x: libpng initialization failed for %s\n",
+                    path);
         errno = ENOMEM;
         png_state_destroy(state);
         return -1;
     }
     state->info = png_create_info_struct(state->png);
     if (state->info == NULL) {
-        fprintf(stderr, "win31x: libpng metadata allocation failed for %s\n", path);
+        if (required_asset)
+            fprintf(stderr,
+                    "win31x: libpng metadata allocation failed for %s\n",
+                    path);
         errno = ENOMEM;
         png_state_destroy(state);
         return -1;
     }
     if (setjmp(png_jmpbuf(state->png)) != 0) {
-        fprintf(stderr, "win31x: invalid icon asset %s: %s\n", path,
-                state->png_error[0] != '\0' ? state->png_error : "PNG decoding failed");
+        if (required_asset)
+            fprintf(stderr, "win31x: invalid icon asset %s: %s\n", path,
+                    state->png_error[0] != '\0' ? state->png_error
+                                                : "PNG decoding failed");
         errno = EINVAL;
         png_state_destroy(state);
         return -1;
@@ -260,12 +285,24 @@ static int load_png(const char *path, const IconAssetDescriptor *descriptor,
     png_read_info(state->png, state->info);
     png_get_IHDR(state->png, state->info, &width, &height, &bit_depth,
                  &color_type, &interlace_type, NULL, NULL);
-    if (width != descriptor->width || height != descriptor->height) {
+    if ((expected_width != 0U && width != expected_width) ||
+        (expected_height != 0U && height != expected_height)) {
         fprintf(stderr,
                 "win31x: icon asset %s has size %ux%u; expected %ux%u\n",
-                path, (unsigned)width, (unsigned)height, descriptor->width,
-                descriptor->height);
+                path, (unsigned)width, (unsigned)height, expected_width,
+                expected_height);
         errno = EINVAL;
+        png_state_destroy(state);
+        return -1;
+    }
+    if (width == 0U || height == 0U ||
+        width > APPLICATION_ICON_MAX_DIMENSION ||
+        height > APPLICATION_ICON_MAX_DIMENSION ||
+        (uint64_t)width * (uint64_t)height > APPLICATION_ICON_MAX_PIXELS) {
+        if (required_asset)
+            fprintf(stderr, "win31x: icon asset %s has unreasonable dimensions\n",
+                    path);
+        errno = EFBIG;
         png_state_destroy(state);
         return -1;
     }
@@ -293,8 +330,10 @@ static int load_png(const char *path, const IconAssetDescriptor *descriptor,
                                       sizeof(*state->rows)) ||
         size_multiplication_overflows((size_t)height,
                                       (size_t)row_bytes)) {
-        fprintf(stderr, "win31x: icon asset %s has an unsupported pixel layout\n",
-                path);
+        if (required_asset)
+            fprintf(stderr,
+                    "win31x: icon asset %s has an unsupported pixel layout\n",
+                    path);
         errno = EINVAL;
         png_state_destroy(state);
         return -1;
@@ -303,7 +342,10 @@ static int load_png(const char *path, const IconAssetDescriptor *descriptor,
     state->pixels = malloc(pixel_bytes);
     state->rows = malloc((size_t)height * sizeof(*state->rows));
     if (state->pixels == NULL || state->rows == NULL) {
-        fprintf(stderr, "win31x: cannot allocate pixels for icon asset %s\n", path);
+        if (required_asset)
+            fprintf(stderr,
+                    "win31x: cannot allocate pixels for icon asset %s\n",
+                    path);
         errno = ENOMEM;
         png_state_destroy(state);
         return -1;
@@ -318,6 +360,634 @@ static int load_png(const char *path, const IconAssetDescriptor *descriptor,
     image->rgba = state->pixels;
     state->pixels = NULL;
     png_state_destroy(state);
+    return 0;
+}
+
+typedef struct {
+    char *key;
+    unsigned char rgba[4];
+} XpmColor;
+
+static int xpm_append_character(char **text, size_t *length, size_t *capacity,
+                                unsigned char character)
+{
+    char *grown;
+    size_t next_capacity;
+
+    if (*length + 1U >= *capacity) {
+        next_capacity = *capacity == 0U ? 128U : *capacity * 2U;
+        if (next_capacity > 4U * 1024U * 1024U) {
+            errno = EFBIG;
+            return -1;
+        }
+        grown = realloc(*text, next_capacity);
+        if (grown == NULL)
+            return -1;
+        *text = grown;
+        *capacity = next_capacity;
+    }
+    (*text)[(*length)++] = (char)character;
+    (*text)[*length] = '\0';
+    return 0;
+}
+
+/* Return one decoded C string from an XPM3 source stream. */
+static int xpm_read_string(FILE *file, char **text_out)
+{
+    char *text = NULL;
+    size_t length = 0U;
+    size_t capacity = 0U;
+    int character;
+
+    *text_out = NULL;
+    do {
+        character = fgetc(file);
+        if (character == EOF)
+            return ferror(file) ? -1 : 0;
+    } while (character != '"');
+
+    for (;;) {
+        character = fgetc(file);
+        if (character == EOF) {
+            free(text);
+            errno = EINVAL;
+            return -1;
+        }
+        if (character == '"')
+            break;
+        if (character == '\\') {
+            unsigned int value;
+            int escaped = fgetc(file);
+
+            if (escaped == EOF) {
+                free(text);
+                errno = EINVAL;
+                return -1;
+            }
+            if (escaped == '\n')
+                continue;
+            if (escaped == 'n')
+                character = '\n';
+            else if (escaped == 'r')
+                character = '\r';
+            else if (escaped == 't')
+                character = '\t';
+            else if (escaped >= '0' && escaped <= '7') {
+                int count;
+
+                value = (unsigned int)(escaped - '0');
+                for (count = 1; count < 3; ++count) {
+                    int next = fgetc(file);
+
+                    if (next < '0' || next > '7') {
+                        if (next != EOF)
+                            ungetc(next, file);
+                        break;
+                    }
+                    value = value * 8U + (unsigned int)(next - '0');
+                }
+                character = (int)(value & 0xffU);
+            } else {
+                character = escaped;
+            }
+        }
+        if (character == '\0' ||
+            xpm_append_character(&text, &length, &capacity,
+                                 (unsigned char)character) < 0) {
+            free(text);
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    if (text == NULL) {
+        text = strdup("");
+        if (text == NULL)
+            return -1;
+    }
+    *text_out = text;
+    return 1;
+}
+
+static int hex_digit_value(unsigned char character)
+{
+    if (character >= '0' && character <= '9')
+        return character - '0';
+    if (character >= 'a' && character <= 'f')
+        return character - 'a' + 10;
+    if (character >= 'A' && character <= 'F')
+        return character - 'A' + 10;
+    return -1;
+}
+
+static bool parse_hex_component(const char *text, size_t digits,
+                                unsigned char *component)
+{
+    size_t index;
+    unsigned int value = 0U;
+    unsigned int maximum = 0U;
+
+    for (index = 0U; index < digits; ++index) {
+        int digit = hex_digit_value((unsigned char)text[index]);
+
+        if (digit < 0)
+            return false;
+        value = value * 16U + (unsigned int)digit;
+        maximum = maximum * 16U + 15U;
+    }
+    *component = (unsigned char)((value * 255U + maximum / 2U) / maximum);
+    return true;
+}
+
+static bool xpm_named_color(const char *name, unsigned char rgba[4])
+{
+    static const struct {
+        const char *name;
+        unsigned char red;
+        unsigned char green;
+        unsigned char blue;
+    } colors[] = {
+        {"black", 0, 0, 0},       {"white", 255, 255, 255},
+        {"red", 255, 0, 0},       {"green", 0, 128, 0},
+        {"blue", 0, 0, 255},      {"yellow", 255, 255, 0},
+        {"cyan", 0, 255, 255},    {"magenta", 255, 0, 255},
+        {"gray", 128, 128, 128},  {"grey", 128, 128, 128},
+        {"darkgray", 169, 169, 169}, {"darkgrey", 169, 169, 169},
+        {"lightgray", 211, 211, 211}, {"lightgrey", 211, 211, 211},
+        {"navy", 0, 0, 128},      {"maroon", 128, 0, 0},
+        {"olive", 128, 128, 0},   {"purple", 128, 0, 128},
+        {"teal", 0, 128, 128},    {"silver", 192, 192, 192},
+        {"orange", 255, 165, 0},  {"brown", 165, 42, 42},
+    };
+    size_t index;
+
+    if (strcasecmp(name, "none") == 0) {
+        memset(rgba, 0, 4U);
+        return true;
+    }
+    if ((strncasecmp(name, "gray", 4U) == 0 ||
+         strncasecmp(name, "grey", 4U) == 0) &&
+        isdigit((unsigned char)name[4])) {
+        char *end = NULL;
+        long percentage = strtol(name + 4, &end, 10);
+
+        if (end != name + 4 && *end == '\0' && percentage >= 0 &&
+            percentage <= 100) {
+            unsigned char value =
+                (unsigned char)((percentage * 255L + 50L) / 100L);
+
+            rgba[0] = value;
+            rgba[1] = value;
+            rgba[2] = value;
+            rgba[3] = 255U;
+            return true;
+        }
+    }
+    for (index = 0U; index < sizeof(colors) / sizeof(colors[0]); ++index) {
+        if (strcasecmp(name, colors[index].name) == 0) {
+            rgba[0] = colors[index].red;
+            rgba[1] = colors[index].green;
+            rgba[2] = colors[index].blue;
+            rgba[3] = 255U;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool xpm_parse_color_value(const char *value, unsigned char rgba[4])
+{
+    size_t length;
+    size_t digits;
+
+    while (isspace((unsigned char)*value))
+        ++value;
+    length = strlen(value);
+    while (length > 0U && isspace((unsigned char)value[length - 1U]))
+        --length;
+    if (length == 0U)
+        return false;
+    if (value[0] != '#') {
+        char name[64];
+
+        if (length >= sizeof(name))
+            return false;
+        memcpy(name, value, length);
+        name[length] = '\0';
+        return xpm_named_color(name, rgba);
+    }
+    if (length != 4U && length != 7U && length != 13U)
+        return false;
+    digits = (length - 1U) / 3U;
+    if (!parse_hex_component(value + 1U, digits, &rgba[0]) ||
+        !parse_hex_component(value + 1U + digits, digits, &rgba[1]) ||
+        !parse_hex_component(value + 1U + digits * 2U, digits, &rgba[2]))
+        return false;
+    rgba[3] = 255U;
+    return true;
+}
+
+static bool xpm_is_color_field(const char *field, size_t length)
+{
+    return (length == 1U &&
+            (field[0] == 's' || field[0] == 'm' || field[0] == 'g' ||
+             field[0] == 'c')) ||
+           (length == 2U && field[0] == 'g' && field[1] == '4');
+}
+
+static const char *xpm_color_value(char *line, unsigned int characters_per_pixel)
+{
+    char *cursor = line + characters_per_pixel;
+
+    while (*cursor != '\0') {
+        char *field;
+
+        while (isspace((unsigned char)*cursor))
+            ++cursor;
+        if (*cursor == '\0')
+            break;
+        field = cursor;
+        while (*cursor != '\0' && !isspace((unsigned char)*cursor))
+            ++cursor;
+        if ((size_t)(cursor - field) == 1U && field[0] == 'c') {
+            char *value;
+
+            while (isspace((unsigned char)*cursor))
+                ++cursor;
+            value = cursor;
+            while (*cursor != '\0') {
+                char *separator;
+
+                while (*cursor != '\0' &&
+                       !isspace((unsigned char)*cursor))
+                    ++cursor;
+                separator = cursor;
+                while (isspace((unsigned char)*cursor))
+                    ++cursor;
+                if (*cursor == '\0')
+                    break;
+                field = cursor;
+                while (*cursor != '\0' &&
+                       !isspace((unsigned char)*cursor))
+                    ++cursor;
+                if (xpm_is_color_field(field, (size_t)(cursor - field))) {
+                    while (separator > value &&
+                           isspace((unsigned char)separator[-1]))
+                        --separator;
+                    *separator = '\0';
+                    break;
+                }
+            }
+            return value;
+        }
+    }
+    return NULL;
+}
+
+static uint64_t xpm_key_hash(const char *key, unsigned int length)
+{
+    uint64_t hash = 1469598103934665603ULL;
+    unsigned int index;
+
+    for (index = 0U; index < length; ++index) {
+        hash ^= (unsigned char)key[index];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static bool xpm_header_number(const char **cursor, unsigned int *value)
+{
+    const char *start = *cursor;
+    char *end;
+    unsigned long parsed;
+
+    while (isspace((unsigned char)*start))
+        ++start;
+    if (!isdigit((unsigned char)*start))
+        return false;
+    errno = 0;
+    parsed = strtoul(start, &end, 10);
+    if (errno == ERANGE || end == start || parsed > UINT_MAX)
+        return false;
+    *cursor = end;
+    *value = (unsigned int)parsed;
+    return true;
+}
+
+static bool xpm_parse_header(const char *line, unsigned int *width,
+                             unsigned int *height,
+                             unsigned int *color_count,
+                             unsigned int *characters_per_pixel)
+{
+    const char *cursor = line;
+
+    if (!xpm_header_number(&cursor, width) ||
+        !xpm_header_number(&cursor, height) ||
+        !xpm_header_number(&cursor, color_count) ||
+        !xpm_header_number(&cursor, characters_per_pixel))
+        return false;
+    return *cursor == '\0' || isspace((unsigned char)*cursor);
+}
+
+static int load_xpm(FILE *file, IconImage *image)
+{
+    char *line = NULL;
+    XpmColor *colors = NULL;
+    size_t *table = NULL;
+    size_t table_size = 1U;
+    unsigned char *pixels = NULL;
+    unsigned int width;
+    unsigned int height;
+    unsigned int color_count;
+    unsigned int cpp;
+    unsigned int index;
+    int result = -1;
+
+    if (file == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (xpm_read_string(file, &line) != 1 ||
+        !xpm_parse_header(line, &width, &height, &color_count, &cpp) ||
+        width == 0U || height == 0U || color_count == 0U || cpp == 0U ||
+        cpp > 16U || color_count > 65536U ||
+        width > APPLICATION_ICON_MAX_DIMENSION ||
+        height > APPLICATION_ICON_MAX_DIMENSION ||
+        (uint64_t)width * height > APPLICATION_ICON_MAX_PIXELS ||
+        (uint64_t)width * cpp > 4U * 1024U * 1024U) {
+        errno = EINVAL;
+        goto done;
+    }
+    free(line);
+    line = NULL;
+    colors = calloc(color_count, sizeof(*colors));
+    while (table_size < (size_t)color_count * 2U)
+        table_size *= 2U;
+    table = calloc(table_size, sizeof(*table));
+    if (colors == NULL || table == NULL)
+        goto done;
+    for (index = 0U; index < color_count; ++index) {
+        const char *value;
+        size_t slot;
+
+        if (xpm_read_string(file, &line) != 1 || strlen(line) < cpp) {
+            errno = EINVAL;
+            goto done;
+        }
+        colors[index].key = malloc((size_t)cpp + 1U);
+        if (colors[index].key == NULL)
+            goto done;
+        memcpy(colors[index].key, line, cpp);
+        colors[index].key[cpp] = '\0';
+        value = xpm_color_value(line, cpp);
+        if (value == NULL || !xpm_parse_color_value(value, colors[index].rgba)) {
+            /* Unknown X11 color names are uncommon in application XPMs.  A
+             * neutral opaque pixel preserves the icon's silhouette safely. */
+            colors[index].rgba[0] = 128U;
+            colors[index].rgba[1] = 128U;
+            colors[index].rgba[2] = 128U;
+            colors[index].rgba[3] = 255U;
+        }
+        slot = (size_t)xpm_key_hash(colors[index].key, cpp) & (table_size - 1U);
+        while (table[slot] != 0U) {
+            if (memcmp(colors[table[slot] - 1U].key, colors[index].key,
+                       cpp) == 0) {
+                errno = EINVAL;
+                goto done;
+            }
+            slot = (slot + 1U) & (table_size - 1U);
+        }
+        table[slot] = (size_t)index + 1U;
+        free(line);
+        line = NULL;
+    }
+    pixels = malloc((size_t)width * height * 4U);
+    if (pixels == NULL)
+        goto done;
+    for (index = 0U; index < height; ++index) {
+        unsigned int x;
+
+        if (xpm_read_string(file, &line) != 1 ||
+            strlen(line) < (size_t)width * cpp) {
+            errno = EINVAL;
+            goto done;
+        }
+        for (x = 0U; x < width; ++x) {
+            const char *key = line + (size_t)x * cpp;
+            size_t slot = (size_t)xpm_key_hash(key, cpp) & (table_size - 1U);
+            size_t probes = 0U;
+            size_t color_index;
+
+            while (table[slot] != 0U &&
+                   memcmp(colors[table[slot] - 1U].key, key, cpp) != 0) {
+                slot = (slot + 1U) & (table_size - 1U);
+                if (++probes >= table_size)
+                    break;
+            }
+            if (table[slot] == 0U || probes >= table_size) {
+                errno = EINVAL;
+                goto done;
+            }
+            color_index = table[slot] - 1U;
+            memcpy(pixels + ((size_t)index * width + x) * 4U,
+                   colors[color_index].rgba, 4U);
+        }
+        free(line);
+        line = NULL;
+    }
+    image->width = width;
+    image->height = height;
+    image->rgba = pixels;
+    pixels = NULL;
+    result = 0;
+
+done:
+    free(line);
+    free(pixels);
+    free(table);
+    if (colors != NULL) {
+        for (index = 0U; index < color_count; ++index)
+            free(colors[index].key);
+    }
+    free(colors);
+    fclose(file);
+    return result;
+}
+
+int icon_image_load_file(const char *path, IconImage *image)
+{
+    struct stat info;
+    const char *extension;
+    FILE *file = NULL;
+    int descriptor;
+    int flags = O_RDONLY | O_NONBLOCK;
+    unsigned char signature[64];
+    ssize_t signature_length;
+    bool is_png;
+    bool is_xpm = false;
+    size_t offset = 0U;
+    static const unsigned char xpm_signature[] = "/* XPM */";
+
+    if (path == NULL || path[0] == '\0' || image == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(image, 0, sizeof(*image));
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    descriptor = open(path, flags);
+    if (descriptor < 0)
+        return -1;
+    if (fstat(descriptor, &info) < 0) {
+        int saved_errno = errno;
+
+        close(descriptor);
+        errno = saved_errno;
+        return -1;
+    }
+    if (!S_ISREG(info.st_mode) || info.st_size <= 0 ||
+        (uint64_t)info.st_size > 64U * 1024U * 1024U) {
+        close(descriptor);
+        errno = !S_ISREG(info.st_mode) ? EINVAL : EFBIG;
+        return -1;
+    }
+    signature_length = read(descriptor, signature, sizeof(signature));
+    if (signature_length < 0 || lseek(descriptor, 0, SEEK_SET) < 0) {
+        int saved_errno = errno;
+
+        close(descriptor);
+        errno = saved_errno;
+        return -1;
+    }
+    file = fdopen(descriptor, "rb");
+    if (file == NULL) {
+        int saved_errno = errno;
+
+        close(descriptor);
+        errno = saved_errno;
+        return -1;
+    }
+    is_png = signature_length >= 8 && png_sig_cmp(signature, 0, 8U) == 0;
+    while (offset < (size_t)signature_length &&
+           isspace((unsigned char)signature[offset]))
+        ++offset;
+    if ((size_t)signature_length - offset >= sizeof(xpm_signature) - 1U &&
+        memcmp(signature + offset, xpm_signature,
+               sizeof(xpm_signature) - 1U) == 0)
+        is_xpm = true;
+    extension = strrchr(path, '.');
+    if (is_png)
+        return load_png(file, path, 0U, 0U, image, false);
+    if (is_xpm &&
+        (extension == NULL || strcasecmp(extension, ".xpm") == 0))
+        return load_xpm(file, image);
+    fclose(file);
+    errno = ENOTSUP;
+    return -1;
+}
+
+void icon_image_free(IconImage *image)
+{
+    if (image == NULL)
+        return;
+    free(image->rgba);
+    memset(image, 0, sizeof(*image));
+}
+
+static unsigned char scale_channel(unsigned int value)
+{
+    return (unsigned char)(value > 255U ? 255U : value);
+}
+
+int icon_image_scale_fit(const IconImage *source, unsigned int max_width,
+                         unsigned int max_height, IconImage *scaled)
+{
+    unsigned int width;
+    unsigned int height;
+    unsigned int x;
+    unsigned int y;
+    unsigned char *pixels;
+
+    if (source == NULL || source->rgba == NULL || source->width == 0U ||
+        source->height == 0U || max_width == 0U || max_height == 0U ||
+        scaled == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(scaled, 0, sizeof(*scaled));
+    if (source->width <= max_width && source->height <= max_height) {
+        width = source->width;
+        height = source->height;
+    } else if ((uint64_t)max_width * source->height <=
+               (uint64_t)max_height * source->width) {
+        width = max_width;
+        height = (unsigned int)(((uint64_t)source->height * max_width +
+                                 source->width / 2U) /
+                                source->width);
+    } else {
+        height = max_height;
+        width = (unsigned int)(((uint64_t)source->width * max_height +
+                                source->height / 2U) /
+                               source->height);
+    }
+    if (width == 0U)
+        width = 1U;
+    if (height == 0U)
+        height = 1U;
+    if ((uint64_t)width * height > SIZE_MAX / 4U) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    pixels = malloc((size_t)width * height * 4U);
+    if (pixels == NULL)
+        return -1;
+
+    /* Bilinear filtering gives large desktop icons a clean 48-pixel result. */
+    for (y = 0U; y < height; ++y) {
+        uint64_t source_y_fixed = height == 1U
+                                      ? 0U
+                                      : (uint64_t)y * (source->height - 1U) *
+                                            65536U / (height - 1U);
+        unsigned int y0 = (unsigned int)(source_y_fixed >> 16);
+        unsigned int y1 = y0 + 1U < source->height ? y0 + 1U : y0;
+        unsigned int fy = (unsigned int)(source_y_fixed & 0xffffU);
+
+        for (x = 0U; x < width; ++x) {
+            uint64_t source_x_fixed = width == 1U
+                                          ? 0U
+                                          : (uint64_t)x *
+                                                (source->width - 1U) * 65536U /
+                                                (width - 1U);
+            unsigned int x0 = (unsigned int)(source_x_fixed >> 16);
+            unsigned int x1 = x0 + 1U < source->width ? x0 + 1U : x0;
+            unsigned int fx = (unsigned int)(source_x_fixed & 0xffffU);
+            size_t destination = ((size_t)y * width + x) * 4U;
+            unsigned int channel;
+
+            for (channel = 0U; channel < 4U; ++channel) {
+                unsigned int p00 = source->rgba[
+                    ((size_t)y0 * source->width + x0) * 4U + channel];
+                unsigned int p10 = source->rgba[
+                    ((size_t)y0 * source->width + x1) * 4U + channel];
+                unsigned int p01 = source->rgba[
+                    ((size_t)y1 * source->width + x0) * 4U + channel];
+                unsigned int p11 = source->rgba[
+                    ((size_t)y1 * source->width + x1) * 4U + channel];
+                uint64_t top = (uint64_t)p00 * (65536U - fx) +
+                               (uint64_t)p10 * fx;
+                uint64_t bottom = (uint64_t)p01 * (65536U - fx) +
+                                  (uint64_t)p11 * fx;
+                uint64_t value = top * (65536U - fy) + bottom * fy;
+
+                pixels[destination + channel] =
+                    scale_channel((unsigned int)((value + (1ULL << 31)) >> 32));
+            }
+        }
+    }
+    scaled->width = width;
+    scaled->height = height;
+    scaled->rgba = pixels;
     return 0;
 }
 
@@ -386,7 +1056,8 @@ static int load_directory(IconAssets *assets, const char *directory)
                 icon_assets_free(&loaded);
                 return -1;
             }
-            if (load_png(path, descriptor, &loaded.images[category][size]) < 0) {
+            if (load_png(NULL, path, descriptor->width, descriptor->height,
+                         &loaded.images[category][size], true) < 0) {
                 free(path);
                 icon_assets_free(&loaded);
                 return -1;

@@ -8,6 +8,13 @@
 #define WIN31X_AUTO_LOCK_MINUTES_MIN 1U
 #define WIN31X_AUTO_LOCK_MINUTES_MAX 120U
 
+typedef enum {
+    WIN31X_CONTROL_PANEL_SECTION_WIFI = 0,
+    WIN31X_CONTROL_PANEL_SECTION_COLORS,
+    WIN31X_CONTROL_PANEL_SECTION_AUTO_LOCK,
+    WIN31X_CONTROL_PANEL_SECTION_COUNT
+} Win31xControlPanelSection;
+
 typedef struct {
     const char *id;
     const char *name;
@@ -19,6 +26,7 @@ typedef struct {
     size_t color_scheme;
     bool auto_lock_enabled;
     unsigned int auto_lock_minutes;
+    Win31xControlPanelSection control_panel_section;
 } Win31xSettings;
 
 extern const Win31xColorScheme
